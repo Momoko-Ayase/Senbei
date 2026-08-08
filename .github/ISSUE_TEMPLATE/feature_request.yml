@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest an improvement or support for a new layout
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a new Crackproof layout, attaching a sample protected file helps
+        us better understand the request. Please only attach files you are
+        authorized to share.
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: The problem it solves for you, and any layout details you can share.
+    validations:
+      required: true
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Confirmation
+      options:
+        - label: This request is for lawful research/interoperability use, and I am authorized to share any file I attach.
+          required: true

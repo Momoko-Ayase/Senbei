@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    # The test suite exercises Windows path semantics, so it runs on Windows.
+    # The golden corpus (samples/) is user-managed and absent on CI; the
+    # samples test is a no-op pass there by design.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release
+
+  check-portable:
+    # Build-only portability gate: non-Windows host and the wasm target the
+    # web build uses. Clippy runs here too, not just on Windows: the platform
+    # `cfg` branches (the POSIX `localtime_r` path, the non-Windows stubs) are
+    # invisible to the Windows clippy job, so without this they are never
+    # linted at all.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --target wasm32-unknown-unknown
+
+  cli:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: senbei.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: senbei
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+      - name: Package senbei-<version>-<target>
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          name="senbei-$version-${{ matrix.target }}"
+          mkdir -p "stage/$name"
+          cp "target/release/${{ matrix.bin }}" "stage/$name/"
+          cp LICENSE "stage/$name/"
+          awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
+            README.md > "stage/$name/LEGAL-NOTICE.md"
+          echo "package=$name" >> "$GITHUB_ENV"
+      # upload-artifact always wraps the upload in its own zip, so the staged
+      # directory is uploaded loose — pre-compressing here would nest archives.
+      # The download is already <package>.zip with the folder inside.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.package }}
+          path: stage/
+          retention-days: 14
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install wasm-pack --locked
+      # `-- --locked` forwards to cargo: web/Cargo.lock is committed on
+      # purpose, so the wasm build must be pinned by it rather than silently
+      # re-resolving (which is how it drifted out of sync with the manifest).
+      - run: wasm-pack build --target web --release -- --locked
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: senbei-web
+          path: |
+            web/index.html
+            web/app.js
+            web/worker.js
+            web/style.css
+            web/pkg/
+          retention-days: 14

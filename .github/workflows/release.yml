@@ -1,0 +1,79 @@
+name: Release
+
+# Publishing a GitHub release:
+#  - cli-assets builds the Windows and Linux CLI binaries and attaches
+#    senbei-<version>-<target>.zip (binary + LICENSE + the legal
+#    notice extracted from README.md) to the release.
+#  - deploy-web rebuilds the browser app and pushes it to Cloudflare Pages
+#    (https://senbei.pages.dev). Requires two repository secrets:
+#    CLOUDFLARE_API_TOKEN (Pages:Edit) and CLOUDFLARE_ACCOUNT_ID. The Pages
+#    project is `senbei`; direct-upload projects default to `main` as the
+#    production branch, which `--branch=main` targets.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  cli-assets:
+    permissions:
+      contents: write # attach assets to the release
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: senbei.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: senbei
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+      - name: Package senbei-<version>-<target>
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          name="senbei-$version-${{ matrix.target }}"
+          mkdir -p "stage/$name"
+          cp "target/release/${{ matrix.bin }}" "stage/$name/"
+          cp LICENSE "stage/$name/"
+          awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
+            README.md > "stage/$name/LEGAL-NOTICE.md"
+          # Release assets are served as-is (unlike CI artifacts, which the
+          # upload action always re-zips), so the archive is created here.
+          # Zip on every OS, matching the CI artifacts; 7z is preinstalled on
+          # both windows-latest and ubuntu-latest.
+          (cd stage && 7z a "$name.zip" "$name" > /dev/null)
+          echo "package=$name" >> "$GITHUB_ENV"
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "stage/${{ env.package }}".* --clobber
+
+  deploy-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install wasm-pack --locked
+      # `-- --locked` forwards to cargo: web/Cargo.lock is committed on
+      # purpose, so the wasm build must be pinned by it rather than silently
+      # re-resolving (which is how it drifted out of sync with the manifest).
+      - run: wasm-pack build --target web --release -- --locked
+        working-directory: web
+      - name: Stage static site
+        run: |
+          mkdir dist
+          cp web/index.html web/app.js web/worker.js web/style.css dist/
+          cp -r web/pkg dist/pkg
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=senbei --branch=main

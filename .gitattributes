@@ -1,0 +1,52 @@
+# Default: detect text, store LF, check out LF.
+* text=auto eol=lf
+
+# Explicit text types (defense in depth over the auto detector).
+*.rs            text eol=lf diff=rust
+*.toml          text eol=lf diff=toml
+*.lock          text eol=lf -diff
+*.md            text eol=lf diff=markdown linguist-detectable
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.js            text eol=lf
+*.css           text eol=lf diff=css
+*.html          text eol=lf diff=html
+*.svg           text eol=lf
+*.txt           text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+LICENSE         text eol=lf
+
+# Shell scripts must stay LF even on Windows checkouts.
+*.sh            text eol=lf
+
+# Windows-native scripts.
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+# Binaries — never subject to line-ending conversion.
+*.exe           binary
+*.dll           binary
+*.sys           binary
+*.pdb           binary
+*.wasm          binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+*.otf           binary
+*.eot           binary
+*.zip           binary
+*.7z            binary
+*.gz            binary
+*.xz            binary
+*.dat           binary
+
+# wasm-pack output is generated.
+web/pkg/**      linguist-generated=true
