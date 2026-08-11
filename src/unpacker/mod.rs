@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 pub use dll::{unpack_dll, unpack_dll_v};
 pub use exe::{
-    BufferOperation, BytecodeStage, DecompressionStage, DescriptorTable, SectionPipeline,
-    UnpackError, unpack as unpack_exe, unpack_v as unpack_exe_v,
+    BufferOperation, BytecodeStage, DecompressionFailure, DecompressionStage, DescriptorTable,
+    SectionPipeline, UnpackError, unpack as unpack_exe, unpack_v as unpack_exe_v,
 };
 pub use integrity::{IntegrityReport, check as check_integrity};
 
@@ -332,10 +332,12 @@ pub fn unpack_auto_v(input: &[u8], verbose: bool) -> Result<(Kind, Vec<u8>), Unp
                 Ok(out) => out,
                 Err(dll_err) => match exe::unpack_v(input, verbose) {
                     Ok(out) => out,
-                    // Surface the DLL-pipeline error, not the EXE one: for a
-                    // genuinely corrupt DLL the DLL error is the more relevant
-                    // diagnostic, and the EXE fallback is best-effort.
-                    Err(_) => return Err(dll_err),
+                    Err(exe_err) => {
+                        return Err(UnpackError::PipelineFallbackFailed {
+                            dll: Box::new(dll_err),
+                            exe: Box::new(exe_err),
+                        });
+                    }
                 },
             }
         }

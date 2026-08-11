@@ -93,6 +93,15 @@ Several protected stages are themselves little bytecode programs. The core
 includes a small VM (`bytecode.rs`) that generates and interprets those
 programs rather than hardcoding each variant's constants.
 
+The PE32+ configuration block has two observed anchor-relative alignments.
+Senbei selects between them by validating the stage1 `(RVA, length)`
+descriptor against the image, rather than relying on a version-like word whose
+value is not stable across build families. Stage3 seed advancement also varies:
+the usual four-round result is tried first, then bounded alternatives are
+replayed from the untouched ciphertext and accepted only when decompression
+writes the exact target size and the recovered stage has its expected function
+tail structure.
+
 ## Integrity check
 
 Every produced image passes through `integrity::check` — a static, execution-
@@ -125,7 +134,10 @@ payload. The capture context is propagated into section worker threads; panics
 outside an active unpack continue through the previously installed panic hook.
 Expected validation failures use structured variants carrying the failed stage,
 block index, table kind, or invalid range instead of collapsing unrelated causes
-into a generic corruption error.
+into a generic corruption error. Huffman/LZ failures distinguish invalid code
+lengths, tree traversal, pending-length overflow, invalid back-references,
+output overflow, and size mismatch. When both DLL parsing and the EXE-layout
+fallback fail, the returned error retains both pipeline errors.
 Size requests are bounds-checked against a 1 GiB `MAX_IMAGE_SIZE` before
 allocation so a crafted header cannot abort the process with a huge
 allocation. In folder mode each file is isolated: one file's failure is logged

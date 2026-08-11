@@ -27,6 +27,7 @@
 mod common;
 use common::samples_dir;
 use std::path::Path;
+use walkdir::WalkDir;
 
 /// An input is a `.exe`/`.dll`/`.dat` whose name doesn't carry the `.golden.`
 /// marker — those are goldens, not inputs. External companions (`<name>._`)
@@ -85,10 +86,19 @@ fn samples_unpack_against_goldens() {
         return;
     }
 
-    let mut inputs: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file() && is_input(p))
+    let mut inputs: Vec<_> = WalkDir::new(&dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("unpack"))
+        })
+        .map(|entry| entry.unwrap_or_else(|e| panic!("walk {}: {e}", dir.display())))
+        .filter(|entry| entry.file_type().is_file() && is_input(entry.path()))
+        .map(|entry| entry.into_path())
         .collect();
     inputs.sort();
 
@@ -107,7 +117,11 @@ fn samples_unpack_against_goldens() {
     let mut failures: Vec<String> = Vec::new();
 
     for input in &inputs {
-        let name = input.file_name().unwrap().to_string_lossy().to_string();
+        let name = input
+            .strip_prefix(&dir)
+            .unwrap_or(input)
+            .to_string_lossy()
+            .to_string();
         let bytes = match std::fs::read(input) {
             Ok(b) => b,
             Err(e) => {

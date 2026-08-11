@@ -88,19 +88,17 @@ fn decrypt_data4(
         OpsLut::new(ops).map_region(d, addr as usize, size as usize);
     }
 
-    if size != decompressed_size {
-        // decompress reports corruption (after partial writes) via its bool;
-        // surface it instead of shipping a garbage block.
-        if !decompress(
+    if size != decompressed_size
+        && let Err(reason) = primitives::decompress_detailed(
             d,
             addr as u32,
             compressed_addr as u32,
             decomp_params[1] as u32,
             size as u32,
             decompressed_size as u32,
-        ) {
-            return Err(UnpackError::StageDecompressionFailed(stage));
-        }
+        )
+    {
+        return Err(UnpackError::StageDecompressionFailed { stage, reason });
     }
     Ok(())
 }
@@ -468,6 +466,16 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         println!("  xor_accumulator = 0x{:08X}", xor_accumulator);
         println!("  checksum1       = 0x{:08X}", checksum1 as u32);
         println!("  decrypted_addr1 = 0x{:08X}", decrypted_addr1 as u32);
+    }
+    let primary_end = decrypted_addr1.checked_add(3856);
+    if decrypted_addr1 < keys[3]
+        || primary_end.is_none_or(|end| end < 0 || end as usize > out.len())
+    {
+        return Err(UnpackError::InvalidDllPrimaryDescriptor {
+            address: decrypted_addr1 as u32,
+            minimum: keys[3] as u32,
+            image_len: out.len(),
+        });
     }
     let import_offset = get_i32(&out, decrypted_addr1 + 3444);
     let decrypted_addr2_size = get_i32(&out, decrypted_addr1 + 3632);

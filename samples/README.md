@@ -8,7 +8,8 @@ committed.
 
 ## What to put here
 
-Place protected inputs directly in this folder:
+Place protected inputs in this folder, either directly or grouped in
+subdirectories:
 
 - `*.exe` — Crackproof-protected executables (PE32 or PE32+)
 - `*.dll` — Crackproof-protected DLLs (native or managed)
@@ -18,6 +19,9 @@ For an **external-companion** module, copy the `<name>._` payload in as well,
 keeping the exact `._` suffix on the full file name. The test splices it the
 same way the CLI does; without it the loader stub alone is meaningless and the
 splice / export-overlay / TLS-restore code is never exercised.
+
+The corpus scan is recursive and skips directories named `unpack`, matching the
+CLI's output-directory rule.
 
 Optionally, place a **golden** next to each input — the known-good unpacked
 output, named `<base>.golden.<ext>`:

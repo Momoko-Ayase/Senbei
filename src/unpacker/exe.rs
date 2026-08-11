@@ -35,6 +35,42 @@ impl std::fmt::Display for DecompressionStage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DecompressionFailure {
+    #[error("compressed source size {size} exceeds limit {max}")]
+    SourceTooLarge { size: u32, max: u64 },
+    #[error("Huffman code length {bits} is invalid")]
+    InvalidCodeLength { bits: u8 },
+    #[error("Huffman tree traversal exceeded 64 levels")]
+    HuffmanTraversalLimit,
+    #[error("pending length accumulator overflowed at {pending}")]
+    PendingLengthOverflow { pending: u32 },
+    #[error("output step {step} at byte {written} exceeds expected size {expected}")]
+    OutputOverflow {
+        written: u32,
+        step: u32,
+        expected: u32,
+    },
+    #[error("run-fill width {width} reads before output offset 0x{destination:08X}")]
+    RunFillBeforeOutput { width: u32, destination: u32 },
+    #[error("run-fill width {width} is unsupported")]
+    InvalidRunFillWidth { width: u32 },
+    #[error("back-reference distance {distance} exceeds {written} written bytes")]
+    InvalidBackReference { distance: u32, written: u32 },
+    #[error("Huffman symbol consumed no input and produced no output")]
+    NoProgress,
+    #[error(
+        "output size mismatch (wrote {written}/{expected} bytes after consuming {consumed}/{source_size})"
+    )]
+    OutputSizeMismatch {
+        written: u32,
+        expected: u32,
+        consumed: u32,
+        source_size: u32,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BytecodeStage {
     ExeStage4,
@@ -121,6 +157,9 @@ pub enum UnpackError {
     #[error("anchor field not found — corrupt data or wrong offset")]
     AnchorNotFound,
 
+    #[error("stage1 descriptor not found near anchor 0x{anchor:08X}")]
+    Stage1DescriptorNotFound { anchor: u32 },
+
     #[error("stage2 field not found — corrupt data or wrong offset")]
     Stage2NotFound,
 
@@ -144,6 +183,15 @@ pub enum UnpackError {
 
     #[error("DLL pipeline requires PE32+ optional-header magic, got 0x{found:04X}")]
     UnsupportedDllPeMagic { found: u16 },
+
+    #[error(
+        "DLL primary descriptor address 0x{address:08X} is below layout base 0x{minimum:08X} or outside {image_len}-byte image"
+    )]
+    InvalidDllPrimaryDescriptor {
+        address: u32,
+        minimum: u32,
+        image_len: usize,
+    },
 
     #[error("invalid SizeOfImage {size}; expected 1..={max}")]
     InvalidImageSize { size: i64, max: u64 },
@@ -182,8 +230,11 @@ pub enum UnpackError {
     #[error("PE32 file LFSR not found in eighthStage")]
     Pe32FileLfsrNotFound,
 
-    #[error("{0} decompression failed — corrupt data or wrong offset")]
-    StageDecompressionFailed(DecompressionStage),
+    #[error("{stage} decompression failed: {reason}")]
+    StageDecompressionFailed {
+        stage: DecompressionStage,
+        reason: DecompressionFailure,
+    },
 
     #[error("{pipeline} section block {block} decompression failed")]
     SectionDecompressionFailed {
@@ -196,6 +247,12 @@ pub enum UnpackError {
 
     #[error("Huffman table is outside the image at offset {offset}")]
     InvalidHuffmanTable { offset: u32 },
+
+    #[error("DLL pipeline failed: {dll}; EXE fallback failed: {exe}")]
+    PipelineFallbackFailed {
+        dll: Box<UnpackError>,
+        exe: Box<UnpackError>,
+    },
 
     #[error(
         "PE32 second-stage range is invalid (offset {offset}, size {size}, image length {image_len})"
@@ -391,8 +448,13 @@ impl<'a> Unpacker<'a> {
     }
 
     // Strategy (a): delegate to primitives::decrypt_and_decompress_data
-    fn decrypt_and_decompress_data(&mut self, pos: u32, key: u32, custom: Option<&[Op]>) -> bool {
-        primitives::decrypt_and_decompress_data(
+    fn decrypt_and_decompress_data(
+        &mut self,
+        pos: u32,
+        key: u32,
+        custom: Option<&[Op]>,
+    ) -> Result<(), DecompressionFailure> {
+        primitives::decrypt_and_decompress_data_detailed(
             &mut self.decompressed,
             pos,
             key,
@@ -620,26 +682,34 @@ impl<'a> Unpacker<'a> {
             }
         };
 
-        // Detect config-block layout version. Newer Crackproof builds (observed
-        // across several EXE families) shift every anchor-relative field from
-        // offset 40 onward by +8 bytes. The config-version stamp sits at
-        // anchor+104 in the old layout and anchor+112 in the new one. Across
-        // the whole corpus the stamp's top nibble is always 0x4 (top byte 0x40
-        // or 0x44), whereas the +8 layout's anchor+104 holds an inserted small
-        // count (top nibble 0), so the stamp position is a reliable layout
-        // discriminator.
-        let stamp_at = |off: u32| -> bool {
-            (anchor + off + 4) as usize <= u.decompressed.len()
-                && (get_u32(&u.decompressed, anchor + off) >> 28) == 0x4
+        // Layouts shift the anchor-relative fields by either zero or eight
+        // bytes. The nearby version-like word is not stable across all build
+        // families, so validate the stage1 (RVA, length) descriptor itself.
+        let descriptor_is_valid = |extra: u32| -> bool {
+            let pos = anchor.wrapping_add(120 + extra);
+            let Some(end) = (pos as usize).checked_add(8) else {
+                return false;
+            };
+            if end > u.decompressed.len() {
+                return false;
+            }
+            let base = get_u32(&u.decompressed, pos);
+            let length = get_u32(&u.decompressed, pos.wrapping_add(4));
+            base >= u.info[3]
+                && length >= 16
+                && (base as usize)
+                    .checked_add(length as usize)
+                    .is_some_and(|stage_end| stage_end <= u.decompressed.len())
         };
-        let magic_off: u32 = if stamp_at(104) {
-            104
-        } else if stamp_at(112) {
-            112
-        } else {
-            104
-        };
-        let anchor_extra: u32 = magic_off - 104;
+        let anchor_extra = [0u32, 8]
+            .into_iter()
+            .find(|&extra| descriptor_is_valid(extra))
+            .ok_or(UnpackError::Stage1DescriptorNotFound { anchor })?;
+
+        if verbose {
+            println!("  anchor = 0x{anchor:08X}");
+            println!("  anchor layout offset = +0x{anchor_extra:X}");
+        }
 
         let p1 = get_u32(&u.decompressed, anchor.wrapping_add(8));
         let p2 = get_u32(&u.decompressed, anchor.wrapping_add(4));
@@ -667,11 +737,22 @@ impl<'a> Unpacker<'a> {
         let v_at = anchor.wrapping_add(20);
         let v = get_u32(&u.decompressed, v_at);
         let tgt = anchor.wrapping_add(120 + anchor_extra);
+        let stage1_descriptor = [
+            get_u32(&u.decompressed, tgt),
+            get_u32(&u.decompressed, tgt.wrapping_add(4)),
+        ];
         u.decrypt_data3(tgt, xor_acc ^ chk1 ^ v, 21);
         let stage1 = get_u32(&u.decompressed, tgt);
+        let stage1_len = get_u32(&u.decompressed, tgt.wrapping_add(4));
         if verbose {
             println!("[3/9] Locating config layout...");
             println!("  stage1 = 0x{:08X}", stage1);
+            println!("  stage1_len = 0x{stage1_len:08X}");
+            println!(
+                "  stage1 descriptor = [0x{:08X}, 0x{:08X}]",
+                stage1_descriptor[0], stage1_descriptor[1]
+            );
+            println!("  stage1 key = xor 0x{xor_acc:08X} ^ chk 0x{chk1:08X} ^ val 0x{v:08X}");
         }
 
         // Field offsets inside stage1 vary between Crackproof versions. Locate
@@ -680,7 +761,6 @@ impl<'a> Unpacker<'a> {
         // derive every other field as fixed offsets from there. Observed
         // stage2_off: 3632 (older EXE builds), 3616 (another old-layout build),
         // 3624 (managed-assembly builds).
-        let stage1_len = get_u32(&u.decompressed, tgt.wrapping_add(4));
         let info3 = u.info[3];
         let info5 = u.info[5];
         // Use the full info[3]..info[3]+info[5] range: stage entries may live in
@@ -752,6 +832,9 @@ impl<'a> Unpacker<'a> {
         if verbose {
             println!("[4/9] Decrypting stage2...");
             println!("  stage2 = 0x{:08X}", stage2);
+            println!("  stage2_off = 0x{stage2_off:04X}");
+            println!("  checksum table = stage1+0x{chk_src_start:04X}");
+            println!("  stage2 key = 0x{key2:08X}");
         }
 
         // The stage2 head/walk2 tables shift between Crackproof versions. The 4-entry
@@ -783,6 +866,20 @@ impl<'a> Unpacker<'a> {
         };
         let head_off = table_start.wrapping_add(32);
         let walk2_off = head_off.wrapping_sub(88);
+        if verbose {
+            println!("  operation table = stage2+0x{table_start:04X}");
+            println!("  head/walk = +0x{head_off:04X}/+0x{walk2_off:04X}");
+            for index in 0..2u32 {
+                let entry = stage2.wrapping_add(head_off + index * 16);
+                println!(
+                    "  operation[{index}] = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
+                    get_u32(&u.decompressed, entry),
+                    get_u32(&u.decompressed, entry.wrapping_add(4)),
+                    get_u32(&u.decompressed, entry.wrapping_add(8)),
+                    get_u32(&u.decompressed, entry.wrapping_add(12)),
+                );
+            }
+        }
 
         let mut head = stage2.wrapping_add(head_off);
         for _iter in 0..2 {
@@ -825,30 +922,110 @@ impl<'a> Unpacker<'a> {
             }
             walk2 = walk2.wrapping_add(32);
         }
+        if verbose {
+            println!(
+                "  key offsets = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
+                u.key_offsets[0], u.key_offsets[1], u.key_offsets[2], u.key_offsets[3]
+            );
+        }
 
         let chk2 = u.calculate_checksum(anchor.wrapping_add(48 + anchor_extra));
         let accum_at = stage1.wrapping_add(chk_src_start.wrapping_sub(16));
-        let mut accum = get_u32(&u.decompressed, accum_at);
-        for l in 0..4u32 {
+        let accum_seed = get_u32(&u.decompressed, accum_at);
+        let mut running_accum = accum_seed;
+        let mut accum_candidates = vec![(0u32, accum_seed)];
+        for l in 0..8u32 {
             let bound = (l + 1).wrapping_mul(25) << 2;
             let mut i: u32 = 1;
             while i <= bound {
-                accum = accum.wrapping_add(i);
+                running_accum = running_accum.wrapping_add(i);
                 i = i.wrapping_add(1);
             }
+            accum_candidates.push((l + 1, running_accum));
         }
+        let accum = accum_candidates[4].1;
 
         let at1 = stage1.wrapping_add(stage2_off.wrapping_add(88));
         let stage3_field = get_u32(&u.decompressed, at1);
+        let stage3_slen = get_u32(&u.decompressed, at1.wrapping_add(4));
+        let stage3_dest = get_u32(&u.decompressed, at1.wrapping_add(8));
         let stage3_dlen = get_u32(&u.decompressed, at1.wrapping_add(12));
         if verbose {
             println!("[5/9] Decrypting stages 3-5...");
             println!("  stage3  = 0x{:08X}", stage3_field);
+            println!(
+                "  stage3 descriptor = [0x{stage3_field:08X}, 0x{stage3_slen:08X}, 0x{stage3_dest:08X}, 0x{stage3_dlen:08X}]"
+            );
+            println!("  stage3 key = xor 0x{xor_acc:08X} ^ chk 0x{chk2:08X} ^ val 0x{accum:08X}");
+            println!("  stage3 accum seed = 0x{accum_seed:08X}");
         }
-        if !u.decrypt_and_decompress_data(at1, xor_acc ^ chk2 ^ accum, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::ExeStage3,
-            ));
+        let stage3_key = xor_acc ^ chk2 ^ accum;
+        let stage3_source_end = (stage3_field as usize)
+            .checked_add(stage3_slen as usize)
+            .filter(|&end| end <= u.decompressed.len())
+            .ok_or(UnpackError::BufferRangeOutOfBounds {
+                operation: BufferOperation::Read,
+                offset: stage3_field as usize,
+                size: stage3_slen as usize,
+                buffer_len: u.decompressed.len(),
+            })?;
+        let stage3_dest_end = (stage3_dest as usize)
+            .checked_add(stage3_dlen as usize)
+            .filter(|&end| end <= u.decompressed.len())
+            .ok_or(UnpackError::BufferRangeOutOfBounds {
+                operation: BufferOperation::CopyDestination,
+                offset: stage3_dest as usize,
+                size: stage3_dlen as usize,
+                buffer_len: u.decompressed.len(),
+            })?;
+        const MAX_STAGE3_TRIAL_BYTES: usize = 16 * 1024 * 1024;
+        let trial_size = (stage3_slen as usize).checked_add(stage3_dlen as usize);
+        let stage3_backups = trial_size
+            .filter(|&size| size <= MAX_STAGE3_TRIAL_BYTES)
+            .map(|_| {
+                (
+                    u.decompressed[stage3_field as usize..stage3_source_end].to_vec(),
+                    u.decompressed[stage3_dest as usize..stage3_dest_end].to_vec(),
+                )
+            });
+        let default_result = u.decrypt_and_decompress_data(at1, stage3_key, None);
+        if let Err(reason) = default_result {
+            let Some((source_backup, dest_backup)) = stage3_backups else {
+                return Err(UnpackError::StageDecompressionFailed {
+                    stage: DecompressionStage::ExeStage3,
+                    reason,
+                });
+            };
+            let restore_stage3 = |data: &mut [u8]| {
+                data[stage3_field as usize..stage3_source_end].copy_from_slice(&source_backup);
+                data[stage3_dest as usize..stage3_dest_end].copy_from_slice(&dest_backup);
+            };
+            let mut selected = None;
+            for (rounds, candidate_accum) in &accum_candidates {
+                if *rounds == 4 {
+                    continue;
+                }
+                restore_stage3(&mut u.decompressed);
+                let candidate_key = xor_acc ^ chk2 ^ candidate_accum;
+                let result = u.decrypt_and_decompress_data(at1, candidate_key, None);
+                if result.is_ok()
+                    && find_v4_offset(&u.decompressed, stage3_field, stage3_dlen).is_some()
+                {
+                    selected = Some(*rounds);
+                    break;
+                }
+            }
+            if let Some(rounds) = selected {
+                if verbose {
+                    println!("  selected stage3 accumulator rounds = {rounds}");
+                }
+            } else {
+                restore_stage3(&mut u.decompressed);
+                return Err(UnpackError::StageDecompressionFailed {
+                    stage: DecompressionStage::ExeStage3,
+                    reason,
+                });
+            }
         }
 
         let at2 = stage1.wrapping_add(stage2_off.wrapping_add(104));
@@ -865,10 +1042,11 @@ impl<'a> Unpacker<'a> {
         let v4 = find_v4_offset(&u.decompressed, stage3_field, stage3_dlen)
             .unwrap_or_else(|| stage3_field.wrapping_add(4692));
         let v4_val = get_u32(&u.decompressed, v4);
-        if !u.decrypt_and_decompress_data(at2, xor_acc ^ chk3 ^ v4_val, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::ExeStage3Secondary,
-            ));
+        if let Err(reason) = u.decrypt_and_decompress_data(at2, xor_acc ^ chk3 ^ v4_val, None) {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::ExeStage3Secondary,
+                reason,
+            });
         }
 
         let chk4 = u.calculate_checksum(stage1.wrapping_add(chk_src_start.wrapping_add(16)));
@@ -886,10 +1064,11 @@ impl<'a> Unpacker<'a> {
         if verbose {
             println!("  stage4  = 0x{:08X}", stage4_field);
         }
-        if !u.decrypt_and_decompress_data(at3, xor_acc ^ chk4 ^ v5_val, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::ExeStage4,
-            ));
+        if let Err(reason) = u.decrypt_and_decompress_data(at3, xor_acc ^ chk4 ^ v5_val, None) {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::ExeStage4,
+                reason,
+            });
         }
 
         // Inside stage4, two locations vary by build:
@@ -953,10 +1132,13 @@ impl<'a> Unpacker<'a> {
         if verbose {
             println!("  stage5  = 0x{:08X}", stage5_field);
         }
-        if !u.decrypt_and_decompress_data(at4, xor_acc ^ chk4 ^ chk5 ^ accum2, Some(&ops1)) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::ExeStage5,
-            ));
+        if let Err(reason) =
+            u.decrypt_and_decompress_data(at4, xor_acc ^ chk4 ^ chk5 ^ accum2, Some(&ops1))
+        {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::ExeStage5,
+                reason,
+            });
         }
 
         // Inside stage5, the loader stores a table of (ptr, size) pairs at a
@@ -2189,10 +2371,11 @@ impl<'a> Unpacker<'a> {
         let dp_base = ss.wrapping_add(dp_base_off);
         let forth_addr = dp_base.wrapping_add(0x40);
         let fk = header_checksum ^ second_stage_cs ^ forth_stage_key;
-        if !self.decrypt_and_decompress_data(forth_addr, fk, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::Pe32FourthStage,
-            ));
+        if let Err(reason) = self.decrypt_and_decompress_data(forth_addr, fk, None) {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::Pe32FourthStage,
+                reason,
+            });
         }
 
         // ---- FifthStage ----
@@ -2207,10 +2390,11 @@ impl<'a> Unpacker<'a> {
                 .wrapping_sub(4),
         );
         let fk5 = header_checksum ^ forth_cs ^ fifth_key;
-        if !self.decrypt_and_decompress_data(fifth_addr, fk5, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::Pe32FifthStage,
-            ));
+        if let Err(reason) = self.decrypt_and_decompress_data(fifth_addr, fk5, None) {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::Pe32FifthStage,
+                reason,
+            });
         }
 
         // ---- SevenStage ----
@@ -2232,10 +2416,11 @@ impl<'a> Unpacker<'a> {
             cs1_addr.wrapping_add(cs1_size).wrapping_sub(0x10),
         );
         let fk7 = header_checksum ^ fifth_cs ^ seven_key;
-        if !self.decrypt_and_decompress_data(seven_addr, fk7, None) {
-            return Err(UnpackError::StageDecompressionFailed(
-                DecompressionStage::Pe32SeventhStage,
-            ));
+        if let Err(reason) = self.decrypt_and_decompress_data(seven_addr, fk7, None) {
+            return Err(UnpackError::StageDecompressionFailed {
+                stage: DecompressionStage::Pe32SeventhStage,
+                reason,
+            });
         }
 
         // ---- EighthStage ----
@@ -3034,10 +3219,13 @@ mod error_tests {
 
     #[test]
     fn structured_errors_include_stage_and_block_context() {
-        let stage = UnpackError::StageDecompressionFailed(DecompressionStage::ExeStage4);
+        let stage = UnpackError::StageDecompressionFailed {
+            stage: DecompressionStage::ExeStage4,
+            reason: DecompressionFailure::NoProgress,
+        };
         assert_eq!(
             stage.to_string(),
-            "EXE stage4 decompression failed — corrupt data or wrong offset"
+            "EXE stage4 decompression failed: Huffman symbol consumed no input and produced no output"
         );
 
         let block = UnpackError::SectionDecompressionFailed {

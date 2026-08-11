@@ -610,24 +610,28 @@ pub(crate) fn calculate_checksum2(d: &[u8], clean: &[u8], pos: u32, start: u32) 
 /// Reads `s_size` bytes from `src`, writes `d_size` bytes to `dest`.
 /// The Huffman table lives at `key_offset` within `d`.
 ///
-/// Returns `true` when exactly `d_size` bytes were written (full success),
-/// `false` on any corruption-triggered early exit. The PE32 eighth-stage key
-/// brute force uses this status to discriminate the correct key.
-pub(crate) fn decompress(
+/// Returns a structured reason when the stream cannot produce exactly
+/// `d_size` bytes.
+pub(crate) fn decompress_detailed(
     d: &mut [u8],
     src: u32,
     mut dest: u32,
     key_offset: u32,
     s_size: u32,
     d_size: u32,
-) -> bool {
+) -> Result<(), super::DecompressionFailure> {
+    use super::DecompressionFailure;
+
     // Bound the scratch allocation: a corrupt descriptor could request a
     // multi-gigabyte source size, and an allocation failure aborts the process
     // (uncatchable). Real payloads are far below this.
     if s_size as u64 > super::MAX_IMAGE_SIZE {
-        return false;
+        return Err(DecompressionFailure::SourceTooLarge {
+            size: s_size,
+            max: super::MAX_IMAGE_SIZE,
+        });
     }
-    DECOMPRESS_SCRATCH.with_borrow_mut(|buf| {
+    DECOMPRESS_SCRATCH.with_borrow_mut(|buf| -> Result<(), DecompressionFailure> {
         let mut bit_pos: i32 = 0;
         let need = (s_size as usize).saturating_add(3);
         if buf.len() < need {
@@ -661,7 +665,7 @@ pub(crate) fn decompress(
                 // length byte comes from a corrupt table, and `1 << b2` would
                 // panic (debug) or wrap (release) on it.
                 if b2 >= 32 {
-                    return false;
+                    return Err(DecompressionFailure::InvalidCodeLength { bits: b2 });
                 }
                 let mut mask: u32 = 1u32 << b2;
                 b2 = b2.wrapping_add(1);
@@ -673,7 +677,7 @@ pub(crate) fn decompress(
                 while (t2 & 0x8000) == 0 {
                     depth += 1;
                     if depth > 64 {
-                        return false;
+                        return Err(DecompressionFailure::HuffmanTraversalLimit);
                     }
                     mask <<= 1;
                     b2 = b2.wrapping_add(1);
@@ -700,8 +704,7 @@ pub(crate) fn decompress(
                 0x100 => {
                     step = 0;
                     if pending >= 256 {
-                        // corrupt input: stop decompressing (diagnostics go to caller/log, not stdout)
-                        return false;
+                        return Err(DecompressionFailure::PendingLengthOverflow { pending });
                     }
                     pending = if pending == 0 {
                         payload
@@ -715,7 +718,11 @@ pub(crate) fn decompress(
                     }
                     step = pending.wrapping_mul(payload);
                     if step.wrapping_add(written) > d_size {
-                        return false;
+                        return Err(DecompressionFailure::OutputOverflow {
+                            written,
+                            step,
+                            expected: d_size,
+                        });
                     }
                     // Run-fill replicates the unit just written before `dest`. A
                     // corrupt stream can emit one of these before anything has been
@@ -724,7 +731,10 @@ pub(crate) fn decompress(
                     match payload {
                         1 => {
                             if dest < 1 {
-                                return false;
+                                return Err(DecompressionFailure::RunFillBeforeOutput {
+                                    width: payload,
+                                    destination: dest,
+                                });
                             }
                             let v = d[(dest as usize) - 1];
                             for k in 0..pending {
@@ -733,7 +743,10 @@ pub(crate) fn decompress(
                         }
                         2 => {
                             if dest < 2 {
-                                return false;
+                                return Err(DecompressionFailure::RunFillBeforeOutput {
+                                    width: payload,
+                                    destination: dest,
+                                });
                             }
                             let v = get_u16(d, dest.wrapping_sub(2));
                             for k in 0..pending {
@@ -742,7 +755,10 @@ pub(crate) fn decompress(
                         }
                         4 => {
                             if dest < 4 {
-                                return false;
+                                return Err(DecompressionFailure::RunFillBeforeOutput {
+                                    width: payload,
+                                    destination: dest,
+                                });
                             }
                             let v = get_u32(d, dest.wrapping_sub(4));
                             for k in 0..pending {
@@ -755,7 +771,9 @@ pub(crate) fn decompress(
                             // yet still counted `step` bytes as written, leaving
                             // stale-buffer holes that later stages treated as
                             // plaintext. Report corruption instead.
-                            return false;
+                            return Err(DecompressionFailure::InvalidRunFillWidth {
+                                width: payload,
+                            });
                         }
                     }
                     pending = 0;
@@ -765,7 +783,18 @@ pub(crate) fn decompress(
                     if written.wrapping_add(payload) > d_size
                         || pending.wrapping_add(payload) > written
                     {
-                        return false;
+                        let distance = pending.wrapping_add(payload);
+                        if distance > written {
+                            return Err(DecompressionFailure::InvalidBackReference {
+                                distance,
+                                written,
+                            });
+                        }
+                        return Err(DecompressionFailure::OutputOverflow {
+                            written,
+                            step: payload,
+                            expected: d_size,
+                        });
                     }
                     let back = pending.wrapping_add(payload);
                     for k in 0..payload {
@@ -783,16 +812,32 @@ pub(crate) fn decompress(
                 // infinite loop (and `catch_unpack` traps panics, not hangs).
                 // Every real symbol consumes ≥ 1 bit, so a valid stream can
                 // never hit this.
-                return false;
+                return Err(DecompressionFailure::NoProgress);
             }
         }
         src_consumed += if bit_pos != 0 { 1 } else { 0 };
-        // Mismatch in consumed/written sizes indicates corrupt input; the unpack
-        // result will then fail downstream checks. No stdout diagnostics here —
-        // the pure core stays I/O-free; surface errors via the caller/logfile.
-        let _ = src_consumed;
-        written == d_size
+        if written != d_size {
+            return Err(DecompressionFailure::OutputSizeMismatch {
+                written,
+                expected: d_size,
+                consumed: src_consumed.max(0) as u32,
+                source_size: s_size,
+            });
+        }
+        Ok(())
     })
+}
+
+/// Boolean compatibility wrapper used by candidate searches and block fan-out.
+pub(crate) fn decompress(
+    d: &mut [u8],
+    src: u32,
+    dest: u32,
+    key_offset: u32,
+    s_size: u32,
+    d_size: u32,
+) -> bool {
+    decompress_detailed(d, src, dest, key_offset, s_size, d_size).is_ok()
 }
 
 /// Walk the Huffman table at `key_offset` and snapshot its bytes for
@@ -1874,14 +1919,14 @@ pub(crate) fn decrypt_data7(d: &mut [u8], pos: u32, mut key: u8) {
 ///
 /// Returns the decompression success status (always `true` when no
 /// decompression was needed). The PE32 eighth-stage key search relies on this.
-pub(crate) fn decrypt_and_decompress_data(
+pub(crate) fn decrypt_and_decompress_data_detailed(
     d: &mut [u8],
     pos: u32,
     key: u32,
     key1_offset: u32,
     key3_offset: u32,
     ops: Option<&[Op]>,
-) -> bool {
+) -> Result<(), super::DecompressionFailure> {
     let src = get_u32(d, pos);
     let src_len = get_u32(d, pos.wrapping_add(4));
     aes_decrypt(d, src, src_len, key3_offset);
@@ -1894,9 +1939,21 @@ pub(crate) fn decrypt_and_decompress_data(
     let dest = get_u32(d, pos.wrapping_add(8));
     let dest_len = get_u32(d, pos.wrapping_add(12));
     if src_len != dest_len {
-        return decompress(d, src, dest, key1_offset, src_len, dest_len);
+        return decompress_detailed(d, src, dest, key1_offset, src_len, dest_len);
     }
-    true
+    Ok(())
+}
+
+/// Boolean compatibility wrapper used by key searches that trial candidates.
+pub(crate) fn decrypt_and_decompress_data(
+    d: &mut [u8],
+    pos: u32,
+    key: u32,
+    key1_offset: u32,
+    key3_offset: u32,
+    ops: Option<&[Op]>,
+) -> bool {
+    decrypt_and_decompress_data_detailed(d, pos, key, key1_offset, key3_offset, ops).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2202,7 +2259,10 @@ mod tests {
         d[0..2].copy_from_slice(&sym.to_le_bytes());
         d[2] = 8;
         // All-zero source -> symbol index 0 -> the invalid run-fill.
-        assert!(!decompress(&mut d, 0x40, 0x80, 0, 4, 3));
+        assert_eq!(
+            decompress_detailed(&mut d, 0x40, 0x80, 0, 4, 3),
+            Err(super::super::DecompressionFailure::InvalidRunFillWidth { width: 3 })
+        );
     }
 
     /// Control for the above: a width-1 run-fill is legal and succeeds.
