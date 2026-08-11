@@ -1,5 +1,7 @@
 //! Validation-driven selection for per-page text transforms.
 
+use super::discovery::trial_decrypt5_u32;
+
 /// PE32 `.text` dd8 key-formula selection with a skip decision. The packer keys
 /// the per-page XOR either with `page+1` or `0x8000*(page+1)`; the formula is
 /// not recorded. Replays the dd8 page pass on a scratch copy of sample pages
@@ -118,26 +120,29 @@ pub fn select_dd8_formula_pe32(data: &[u8], text_off: u32, text_size: u32) -> Op
 //
 // The packer scrambles ~1 byte per 16-byte block of .text via decrypt_data8,
 // keyed by `page_idx << shift` (absolute page index = text_va >> 12). Observed
-// shifts are 0 and 15. The shift is NOT stored in any header/config field:
-// two otherwise-unrelated builds can carry byte-identical config-version stamps
-// (0x40327253) yet require different shifts, so the only reliable discriminator
-// is the .text content itself.
+// shifts are 0 and 15. The shift is NOT stored in any header/config field, so
+// the decision must be validated against the resulting .text content.
 //
-// Detection scoring formula: for each candidate shift, replay decrypt_data8
-// across a few sample pages (25/50/75% of .text) and count how many of the 255
-// mutated positions become 0xCC — the MSVC int3 padding byte. The correct shift
-// hits int3 pads disproportionately often (~3-10x the baseline), so the
-// highest-scoring shift wins. If neither shift clears 2x the baseline, .text
-// is already plaintext → skip (return 99).
+// A recognised CRT entry stub is the strongest oracle: decode skip/0/15 and
+// require both of its direct rel32 branches to land in executable .text. This
+// includes the call/jump displacement bytes themselves; an older entry oracle
+// wildcarded those bytes and could accept a stub whose opcodes looked right but
+// whose branch targets were outside the image.
 //
-// This replaces an earlier entry-stub oracle that matched the 14 fixed CRT-stub
-// bytes at the AEP. That oracle false-positived on a newer EXE-64 build: dd8
-// corrupted only the call rel32 (bytes 5-8, the wildcard region), so the stub
-// matched under BOTH shifts and the selector defaulted to 0 when the truth was
-// 15. The 0xCC statistic samples hundreds of positions per page and is not
-// fooled by a stub whose fixed bytes happen to survive.
+// Other entry shapes fall back to padding statistics: replay each shift across
+// sample pages and count positions restored to the MSVC int3 padding byte. A
+// clear gain selects the shift; otherwise .text is treated as already plain.
 // ---------------------------------------------------------------------------
-pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, _info3: u32) -> u32 {
+pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, info3: u32) -> u32 {
+    if let Some((shift, scores)) = select_dd8_by_entry_stub(data, text_va, text_size, info3) {
+        if std::env::var("SEL_DIAG").is_ok() {
+            eprintln!(
+                "SEL dd8 entry best_shift={} none={} s0={} s15={}",
+                shift, scores[0], scores[1], scores[2]
+            );
+        }
+        return shift;
+    }
     if text_size < 0x1000 {
         return 0;
     }
@@ -190,6 +195,123 @@ pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, _info3: u32) 
         );
     }
     best_shift
+}
+
+/// Select DD8 from the common CRT entry stub when its direct call and jump
+/// provide a stronger oracle than sparse padding statistics. The candidate is
+/// accepted only when it is the sole one whose two branch targets stay inside
+/// `.text`; unrecognised entry code falls through to the padding selector.
+fn select_dd8_by_entry_stub(
+    data: &[u8],
+    text_va: u32,
+    text_size: u32,
+    info3: u32,
+) -> Option<(u32, [u8; 3])> {
+    for entry in entry_candidates(data, text_va, text_size, info3) {
+        let [Some(none), Some(s0), Some(s15)] = [None, Some(0), Some(15)]
+            .map(|shift| entry_stub_branch_score(data, text_va, text_size, entry, shift))
+        else {
+            continue;
+        };
+        let scores = [none, s0, s15];
+        let best = scores.iter().copied().max()?;
+        if best == 2 && scores.iter().filter(|&&score| score == best).count() == 1 {
+            let index = scores.iter().position(|&score| score == best)?;
+            return Some(([99, 0, 15][index], scores));
+        }
+    }
+    None
+}
+
+fn entry_candidates(data: &[u8], text_va: u32, text_size: u32, info3: u32) -> Vec<u32> {
+    let text_end = text_va.saturating_add(text_size);
+    let mut entries = Vec::with_capacity(3);
+    if let Some(pe) = read_u32(data, 0x3C)
+        && let Some(entry) = pe.checked_add(40).and_then(|offset| read_u32(data, offset))
+        && (text_va..text_end).contains(&entry)
+    {
+        entries.push(entry);
+    }
+    for metadata_off in [32u32, 64] {
+        let Some(end) = info3
+            .checked_add(metadata_off)
+            .and_then(|offset| offset.checked_add(8))
+        else {
+            continue;
+        };
+        if end as usize > data.len() {
+            continue;
+        }
+        let entry = trial_decrypt5_u32(data, info3 + metadata_off);
+        let image_base = trial_decrypt5_u32(data, info3 + metadata_off + 4);
+        if image_base == info3 && (text_va..text_end).contains(&entry) && !entries.contains(&entry)
+        {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+fn entry_stub_branch_score(
+    data: &[u8],
+    text_va: u32,
+    text_size: u32,
+    entry: u32,
+    shift: Option<u32>,
+) -> Option<u8> {
+    let text_end = text_va.checked_add(text_size)?;
+    if entry < text_va || entry.checked_add(18)? > text_end {
+        return None;
+    }
+
+    let mut stub = [0u8; 18];
+    for (offset, byte) in stub.iter_mut().enumerate() {
+        *byte = dd8_candidate_byte(data, entry + offset as u32, shift)?;
+    }
+    if stub[0..3] != [0x48, 0x83, 0xEC]
+        || stub[4] != 0xE8
+        || stub[9..12] != [0x48, 0x83, 0xC4]
+        || stub[12] != stub[3]
+        || stub[13] != 0xE9
+    {
+        return None;
+    }
+
+    let call_rel = i32::from_le_bytes(stub[5..9].try_into().ok()?) as i64;
+    let jump_rel = i32::from_le_bytes(stub[14..18].try_into().ok()?) as i64;
+    let call_target = i64::from(entry) + 9 + call_rel;
+    let jump_target = i64::from(entry) + 18 + jump_rel;
+    let in_text = |target: i64| target >= i64::from(text_va) && target < i64::from(text_end);
+    Some(u8::from(in_text(call_target)) + u8::from(in_text(jump_target)))
+}
+
+fn dd8_candidate_byte(data: &[u8], rva: u32, shift: Option<u32>) -> Option<u8> {
+    let mut byte = *data.get(rva as usize)?;
+    let Some(shift) = shift else {
+        return Some(byte);
+    };
+    let page = rva >> 12;
+    let block = (rva & 0xFFF) >> 4;
+    let mut key = page << shift;
+    for index in 0..=block {
+        let mixed = key.rotate_right(15).wrapping_add(index);
+        key = mixed.wrapping_add(index);
+        if index != 0 {
+            let target = (page << 12)
+                .wrapping_add(index << 4)
+                .wrapping_add(mixed & 0xF);
+            if target == rva {
+                byte ^= key as u8;
+            }
+        }
+    }
+    Some(byte)
+}
+
+fn read_u32(data: &[u8], offset: u32) -> Option<u32> {
+    let start = offset as usize;
+    let bytes = data.get(start..start.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 // Baseline: count int3 pads already present at the first byte of each 16-byte
@@ -249,6 +371,42 @@ fn score_dd8_shift(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry_stub_fixture() -> Vec<u8> {
+        let mut data = vec![0u8; 0x5000];
+        data[0x3C..0x40].copy_from_slice(&0x100u32.to_le_bytes());
+        data[0x128..0x12C].copy_from_slice(&0x1264u32.to_le_bytes());
+        data[0x1264..0x1276].copy_from_slice(&[
+            0x48, 0x83, 0xEC, 0x28, 0xE8, 0x5B, 0x02, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x28, 0xE9,
+            0x7A, 0xFE, 0xFF, 0xFF,
+        ]);
+        data
+    }
+
+    fn apply_dd8_page(data: &mut [u8], page_rva: u32, shift: u32) {
+        let mut key = (page_rva >> 12) << shift;
+        for index in 0..256u32 {
+            let mixed = key.rotate_right(15).wrapping_add(index);
+            key = mixed.wrapping_add(index);
+            if index == 0 {
+                continue;
+            }
+            let target = page_rva.wrapping_add(index << 4).wrapping_add(mixed & 0xF) as usize;
+            data[target] ^= key as u8;
+        }
+    }
+
+    #[test]
+    fn entry_stub_selects_plaintext_and_both_dd8_shifts() {
+        let plain = entry_stub_fixture();
+        assert_eq!(select_dd8_shift(&plain, 0x1000, 0x4000, 0), 99);
+
+        for expected in [0u32, 15] {
+            let mut encrypted = plain.clone();
+            apply_dd8_page(&mut encrypted, 0x1000, expected);
+            assert_eq!(select_dd8_shift(&encrypted, 0x1000, 0x4000, 0), expected);
+        }
+    }
 
     /// Seed the first `count` dd8-targeted positions of each sampled page with
     /// the byte that decodes to `0xCC` under the `page+1` formula — i.e. an

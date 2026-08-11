@@ -77,6 +77,49 @@ fn rva_to_off(secs: &[Section], file_len: usize, rva: u32, need: u32) -> Option<
     None
 }
 
+fn is_executable_rva(secs: &[Section], rva: u32) -> bool {
+    secs.iter().any(|section| {
+        let span = section.vsize.max(section.raw_size);
+        rva >= section.va
+            && rva < section.va.wrapping_add(span)
+            && (section.chars & 0x2000_0000) != 0
+    })
+}
+
+fn check_common_entry_branches(
+    stub: &[u8],
+    ep: u32,
+    secs: &[Section],
+    report: &mut IntegrityReport,
+) {
+    if stub.len() < 18
+        || stub[0..3] != [0x48, 0x83, 0xEC]
+        || stub[4] != 0xE8
+        || stub[9..12] != [0x48, 0x83, 0xC4]
+        || stub[12] != stub[3]
+        || stub[13] != 0xE9
+    {
+        return;
+    }
+    for (name, rel_off, instruction_len) in [("call", 5usize, 9i64), ("jump", 14usize, 18i64)] {
+        let rel = i32::from_le_bytes([
+            stub[rel_off],
+            stub[rel_off + 1],
+            stub[rel_off + 2],
+            stub[rel_off + 3],
+        ]) as i64;
+        let target = i64::from(ep) + instruction_len + rel;
+        let valid = u32::try_from(target)
+            .ok()
+            .is_some_and(|rva| is_executable_rva(secs, rva));
+        if !valid {
+            report.issues.push(format!(
+                "entry point {name} target 0x{target:X} is outside executable sections (DD8 selection is likely wrong)"
+            ));
+        }
+    }
+}
+
 /// Inspect an unpacked PE image and report any defect that would make the OS
 /// loader fault at runtime. `out` is the bytes the unpacker produced.
 pub fn check(out: &[u8]) -> IntegrityReport {
@@ -253,6 +296,9 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                         "entry point RVA 0x{ep:X} is not in an executable section"
                     ));
                 }
+                if let Some(entry_stub) = out.get(off as usize..off as usize + 18) {
+                    check_common_entry_branches(entry_stub, ep, &secs, &mut r);
+                }
             }
         }
     }
@@ -362,4 +408,41 @@ fn looks_like_dll_name(d: &[u8], off: u32) -> bool {
         return false; // empty, or no NUL within a sane window
     }
     d[start..end].iter().all(|&b| (0x20..0x7F).contains(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executable_text() -> Vec<Section> {
+        vec![Section {
+            va: 0x1000,
+            vsize: 0x4000,
+            raw_ptr: 0x1000,
+            raw_size: 0x4000,
+            chars: 0x6000_0020,
+        }]
+    }
+
+    #[test]
+    fn common_entry_stub_rejects_out_of_image_branches() {
+        let stub = [
+            0x48, 0x83, 0xEC, 0x28, 0xE8, 0x5B, 0x02, 0x41, 0x00, 0x48, 0x83, 0xC4, 0x28, 0xE9,
+            0x7A, 0xFE, 0x54, 0xFF,
+        ];
+        let mut report = IntegrityReport::default();
+        check_common_entry_branches(&stub, 0x1264, &executable_text(), &mut report);
+        assert_eq!(report.issues.len(), 2);
+    }
+
+    #[test]
+    fn common_entry_stub_accepts_executable_branches() {
+        let stub = [
+            0x48, 0x83, 0xEC, 0x28, 0xE8, 0x5B, 0x02, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x28, 0xE9,
+            0x7A, 0xFE, 0xFF, 0xFF,
+        ];
+        let mut report = IntegrityReport::default();
+        check_common_entry_branches(&stub, 0x1264, &executable_text(), &mut report);
+        assert!(report.ok());
+    }
 }

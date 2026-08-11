@@ -831,14 +831,17 @@ impl<'a> Unpacker<'a> {
         // (i.e., the 4 bytes immediately after the last instance of that pattern).
         let v6 = find_v_after_pad(&u.decompressed, stage4_field, stage4_dlen)
             .unwrap_or_else(|| idb_pos.wrapping_sub(24));
-        let mut accum2 = get_u32(&u.decompressed, v6);
-        for m in 0..3u32 {
+        let accum2_seed = get_u32(&u.decompressed, v6);
+        let mut accum2 = accum2_seed;
+        let mut accum2_candidates = vec![(0u32, accum2_seed)];
+        for m in 0..8u32 {
             let bound = (m + 1).wrapping_mul(25) << 2;
             let mut i: u32 = 1;
             while i <= bound {
                 accum2 = accum2.wrapping_add(i);
                 i = i.wrapping_add(1);
             }
+            accum2_candidates.push((m + 1, accum2));
         }
 
         let ops1 = match generate(&u.decompressed, data_offset) {
@@ -852,19 +855,58 @@ impl<'a> Unpacker<'a> {
 
         let at4 = stage1.wrapping_add(stage2_off.wrapping_add(216));
         let stage5_field = get_u32(&u.decompressed, at4);
-        // at4 is a (src, src_len, dest, dest_len) quad; only src and dest_len
-        // are needed here, the other two are consumed by the decrypt below.
+        let stage5_slen = get_u32(&u.decompressed, at4.wrapping_add(4));
+        let stage5_dest = get_u32(&u.decompressed, at4.wrapping_add(8));
         let stage5_dlen = get_u32(&u.decompressed, at4.wrapping_add(12));
         if verbose {
             println!("  stage5  = 0x{:08X}", stage5_field);
+            println!(
+                "  stage5 descriptor = [0x{stage5_field:08X}, 0x{stage5_slen:08X}, 0x{stage5_dest:08X}, 0x{stage5_dlen:08X}]"
+            );
+            println!("  stage5 bytecode = 0x{data_offset:08X}");
+            println!("  stage5 accumulator seed = 0x{accum2_seed:08X} at 0x{v6:08X}");
         }
-        if let Err(reason) =
-            u.decrypt_and_decompress_data(at4, xor_acc ^ chk4 ^ chk5 ^ accum2, Some(&ops1))
-        {
+        let stage5_lo = stage5_field.min(stage5_dest) as usize;
+        let stage5_hi = stage5_field
+            .checked_add(stage5_slen)
+            .zip(stage5_dest.checked_add(stage5_dlen))
+            .map(|(source_end, dest_end)| source_end.max(dest_end) as usize)
+            .filter(|&end| stage5_lo <= end && end <= u.decompressed.len())
+            .ok_or(UnpackError::BufferRangeOutOfBounds {
+                operation: BufferOperation::Read,
+                offset: stage5_lo,
+                size: stage5_slen.max(stage5_dlen) as usize,
+                buffer_len: u.decompressed.len(),
+            })?;
+        let stage5_backup = u.decompressed[stage5_lo..stage5_hi].to_vec();
+        let mut first_failure = None;
+        let mut selected_rounds = None;
+        for rounds in std::iter::once(3u32).chain((0..=8).filter(|&rounds| rounds != 3)) {
+            u.decompressed[stage5_lo..stage5_hi].copy_from_slice(&stage5_backup);
+            let candidate_accum = accum2_candidates[rounds as usize].1;
+            match u.decrypt_and_decompress_data(
+                at4,
+                xor_acc ^ chk4 ^ chk5 ^ candidate_accum,
+                Some(&ops1),
+            ) {
+                Ok(()) => {
+                    selected_rounds = Some(rounds);
+                    break;
+                }
+                Err(reason) => {
+                    first_failure.get_or_insert(reason);
+                }
+            }
+        }
+        let Some(selected_rounds) = selected_rounds else {
+            u.decompressed[stage5_lo..stage5_hi].copy_from_slice(&stage5_backup);
             return Err(UnpackError::StageDecompressionFailed {
                 stage: DecompressionStage::ExeStage5,
-                reason,
+                reason: first_failure.expect("at least one Stage5 candidate was tried"),
             });
+        };
+        if verbose {
+            println!("  selected stage5 accumulator rounds = {selected_rounds}");
         }
 
         // Inside stage5, the loader stores a table of (ptr, size) pairs at a
