@@ -69,9 +69,22 @@ pub(crate) fn write_u32(data: &mut [u8], offset: u32, value: u32) {
 
 #[allow(dead_code)]
 pub(crate) fn try_u32(d: &[u8], off: usize) -> Result<u32, super::UnpackError> {
-    d.get(off..off + 4)
+    let end = off
+        .checked_add(4)
+        .ok_or(super::UnpackError::BufferRangeOutOfBounds {
+            operation: super::BufferOperation::Read,
+            offset: off,
+            size: 4,
+            buffer_len: d.len(),
+        })?;
+    d.get(off..end)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-        .ok_or(super::UnpackError::OutOfBounds(off))
+        .ok_or(super::UnpackError::BufferRangeOutOfBounds {
+            operation: super::BufferOperation::Read,
+            offset: off,
+            size: 4,
+            buffer_len: d.len(),
+        })
 }
 
 #[allow(dead_code)]
@@ -79,7 +92,7 @@ pub(crate) fn try_i32(d: &[u8], off: usize) -> Result<i32, super::UnpackError> {
     try_u32(d, off).map(|v| v as i32)
 }
 
-/// Checked copy: returns OutOfBounds if src or dst ranges exceed their respective slices.
+/// Checked copy with distinct source and destination range errors.
 pub(crate) fn try_copy_from_slice(
     dst: &mut [u8],
     dst_off: usize,
@@ -87,17 +100,39 @@ pub(crate) fn try_copy_from_slice(
     src: &[u8],
     src_off: usize,
 ) -> Result<(), super::UnpackError> {
-    let dst_end = dst_off
-        .checked_add(dst_len)
-        .ok_or(super::UnpackError::OutOfBounds(dst_off))?;
-    let src_end = src_off
-        .checked_add(dst_len)
-        .ok_or(super::UnpackError::OutOfBounds(src_off))?;
+    let dst_end =
+        dst_off
+            .checked_add(dst_len)
+            .ok_or(super::UnpackError::BufferRangeOutOfBounds {
+                operation: super::BufferOperation::CopyDestination,
+                offset: dst_off,
+                size: dst_len,
+                buffer_len: dst.len(),
+            })?;
+    let src_end =
+        src_off
+            .checked_add(dst_len)
+            .ok_or(super::UnpackError::BufferRangeOutOfBounds {
+                operation: super::BufferOperation::CopySource,
+                offset: src_off,
+                size: dst_len,
+                buffer_len: src.len(),
+            })?;
     if dst_end > dst.len() {
-        return Err(super::UnpackError::OutOfBounds(dst_off));
+        return Err(super::UnpackError::BufferRangeOutOfBounds {
+            operation: super::BufferOperation::CopyDestination,
+            offset: dst_off,
+            size: dst_len,
+            buffer_len: dst.len(),
+        });
     }
     if src_end > src.len() {
-        return Err(super::UnpackError::OutOfBounds(src_off));
+        return Err(super::UnpackError::BufferRangeOutOfBounds {
+            operation: super::BufferOperation::CopySource,
+            offset: src_off,
+            size: dst_len,
+            buffer_len: src.len(),
+        });
     }
     dst[dst_off..dst_end].copy_from_slice(&src[src_off..src_end]);
     Ok(())
@@ -2004,6 +2039,37 @@ fn score_dd8_shift(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_copy_distinguishes_source_and_destination_ranges() {
+        let mut short_destination = [0u8; 2];
+        let source = [1u8; 4];
+        let error = try_copy_from_slice(&mut short_destination, 0, 3, &source, 0)
+            .expect_err("destination must be rejected");
+        assert!(matches!(
+            error,
+            super::super::UnpackError::BufferRangeOutOfBounds {
+                operation: super::super::BufferOperation::CopyDestination,
+                offset: 0,
+                size: 3,
+                buffer_len: 2,
+            }
+        ));
+
+        let mut destination = [0u8; 4];
+        let short_source = [1u8; 2];
+        let error = try_copy_from_slice(&mut destination, 0, 3, &short_source, 0)
+            .expect_err("source must be rejected");
+        assert!(matches!(
+            error,
+            super::super::UnpackError::BufferRangeOutOfBounds {
+                operation: super::super::BufferOperation::CopySource,
+                offset: 0,
+                size: 3,
+                buffer_len: 2,
+            }
+        ));
+    }
 
     #[test]
     fn aes_ks_variant_matches_single_buffer() {

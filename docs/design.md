@@ -12,7 +12,7 @@ The crate is split into a pure core and a thin CLI shell:
 - **`src/unpacker/`** — the core. Pure functions over byte slices: no file
   I/O, no environment access (beyond a few debugging overrides, see
   [development.md](development.md)), panic-free at the public boundary (all
-  internal panics are trapped and converted to `UnpackError::Corrupt`). This
+  internal panics are trapped and converted to `UnpackError::InternalPanic`). This
   is what the WebAssembly build embeds.
 - **`src/` (top level)** — the CLI shell: argument parsing, recursive folder
   scanning, per-run log file, progress bar, Explorer-friendly exit pause, and
@@ -120,7 +120,12 @@ threads (WebAssembly) the sequential path is used automatically.
 
 The public API never panics: every pipeline runs under a `catch_unwind`
 wrapper (`catch_unpack`) that converts a trapped panic to
-`UnpackError::Corrupt`, with the default panic hook transiently suppressed.
+`UnpackError::InternalPanic`, including the Rust source location and panic
+payload. The capture context is propagated into section worker threads; panics
+outside an active unpack continue through the previously installed panic hook.
+Expected validation failures use structured variants carrying the failed stage,
+block index, table kind, or invalid range instead of collapsing unrelated causes
+into a generic corruption error.
 Size requests are bounds-checked against a 1 GiB `MAX_IMAGE_SIZE` before
 allocation so a crafted header cannot abort the process with a huge
 allocation. In folder mode each file is isolated: one file's failure is logged

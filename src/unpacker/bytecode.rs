@@ -61,8 +61,8 @@ impl OpsLut {
 pub fn generate(data: &[u8], offset: u32) -> Option<Vec<Op>> {
     // Bounds-checked cursor: a corrupt `data_offset` (bad decrypt_data6 / the
     // alignment fallback) must yield `None`, not an out-of-bounds panic — the
-    // panic path would surface as a misleading `UnpackError::Corrupt` instead
-    // of the precise `BytecodeGenFailed`, and any future caller without a
+    // panic path would surface as a misleading `UnpackError::InternalPanic` instead
+    // of the precise `BytecodeGenerationFailed`, and any future caller without a
     // `catch_unwind` wrapper would abort outright.
     let mut pos = offset as usize;
     let mut next = move || {

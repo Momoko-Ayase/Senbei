@@ -2,13 +2,121 @@ use super::bytecode::{Op, OpsLut, generate};
 use super::primitives;
 use super::primitives::*;
 
-#[derive(Debug, thiserror::Error)]
-pub enum UnpackError {
-    #[error("input too short for header (need at least 4096 bytes, got {0})")]
-    InputTooShort(usize),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecompressionStage {
+    ExeStage3,
+    ExeStage3Secondary,
+    ExeStage4,
+    ExeStage5,
+    Pe32FourthStage,
+    Pe32FifthStage,
+    Pe32SeventhStage,
+    DllCodeBlock1,
+    DllCodeBlock2,
+    DllCodeBlock3,
+    DllCodeBlock4,
+}
 
-    #[error("info[1] mismatch — corrupt data or wrong offset")]
-    HeaderMismatch,
+impl std::fmt::Display for DecompressionStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExeStage3 => "EXE stage3",
+            Self::ExeStage3Secondary => "EXE secondary stage3",
+            Self::ExeStage4 => "EXE stage4",
+            Self::ExeStage5 => "EXE stage5",
+            Self::Pe32FourthStage => "PE32 fourth stage",
+            Self::Pe32FifthStage => "PE32 fifth stage",
+            Self::Pe32SeventhStage => "PE32 seventh stage",
+            Self::DllCodeBlock1 => "DLL code block 1",
+            Self::DllCodeBlock2 => "DLL code block 2",
+            Self::DllCodeBlock3 => "DLL code block 3",
+            Self::DllCodeBlock4 => "DLL code block 4",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytecodeStage {
+    ExeStage4,
+    ExeStage5,
+    Pe32CustomDecryptor,
+    Pe32FileDecryptor,
+    DllPrimaryDecryptor,
+    DllSectionDecryptor,
+}
+
+impl std::fmt::Display for BytecodeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExeStage4 => "EXE stage4",
+            Self::ExeStage5 => "EXE stage5",
+            Self::Pe32CustomDecryptor => "PE32 custom decryptor",
+            Self::Pe32FileDecryptor => "PE32 file decryptor",
+            Self::DllPrimaryDecryptor => "DLL primary decryptor",
+            Self::DllSectionDecryptor => "DLL section decryptor",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionPipeline {
+    ExePe32Plus,
+    ExePe32,
+    Dll,
+}
+
+impl std::fmt::Display for SectionPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExePe32Plus => "PE32+ EXE",
+            Self::ExePe32 => "PE32 EXE",
+            Self::Dll => "DLL",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorTable {
+    DllSectionBlocks,
+    DllZeroFill,
+}
+
+impl std::fmt::Display for DescriptorTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DllSectionBlocks => "DLL section-block",
+            Self::DllZeroFill => "DLL zero-fill",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferOperation {
+    Read,
+    CopySource,
+    CopyDestination,
+    ZeroFill,
+}
+
+impl std::fmt::Display for BufferOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::CopySource => "copy source",
+            Self::CopyDestination => "copy destination",
+            Self::ZeroFill => "zero-fill",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UnpackError {
+    #[error("input too short (need at least {required} bytes, got {actual})")]
+    InputTooShort { actual: usize, required: usize },
+
+    #[error("decrypted header magic mismatch (got 0x{found:08X})")]
+    HeaderMagicMismatch { found: u32 },
 
     #[error("anchor field not found — corrupt data or wrong offset")]
     AnchorNotFound,
@@ -22,23 +130,42 @@ pub enum UnpackError {
     #[error("table_start not found — corrupt data or wrong offset")]
     TableStartNotFound,
 
-    #[error("stage4 bytecode generation failed — corrupt data or wrong offset")]
-    BytecodeGenFailed,
+    #[error("{0} bytecode generation failed — corrupt data or wrong offset")]
+    BytecodeGenerationFailed(BytecodeStage),
 
     #[error("stage5 marker not found — this build's layout is not supported by this unpacker")]
     Stage5MarkerNotFound,
 
-    #[error("stage5 bytecode generation failed — corrupt data or wrong offset")]
-    Stage5BytecodeGenFailed,
-
-    #[error("DLL unpack failed: {0}")]
-    DllUnpack(String),
-
     #[error("not a Crackproof-protected file")]
     NotCrackproof,
 
-    #[error("out-of-bounds access at offset {0}")]
-    OutOfBounds(usize),
+    #[error("invalid PE header offset {offset} for {input_len}-byte input")]
+    InvalidPeOffset { offset: i64, input_len: usize },
+
+    #[error("DLL pipeline requires PE32+ optional-header magic, got 0x{found:04X}")]
+    UnsupportedDllPeMagic { found: u16 },
+
+    #[error("invalid SizeOfImage {size}; expected 1..={max}")]
+    InvalidImageSize { size: i64, max: u64 },
+
+    #[error(
+        "{operation} range out of bounds (offset {offset}, size {size}, buffer length {buffer_len})"
+    )]
+    BufferRangeOutOfBounds {
+        operation: BufferOperation,
+        offset: usize,
+        size: usize,
+        buffer_len: usize,
+    },
+
+    #[error(
+        "{table} descriptor out of bounds (offset {offset}, size 16, image length {image_len})"
+    )]
+    DescriptorOutOfBounds {
+        table: DescriptorTable,
+        offset: usize,
+        image_len: usize,
+    },
 
     #[error("PE32 tbl not found — corrupt data or wrong offset")]
     Pe32TblNotFound,
@@ -49,20 +176,52 @@ pub enum UnpackError {
     #[error("PE32 customDecryptor not found in sevenStage")]
     Pe32CustomDecryptorNotFound,
 
-    #[error("PE32 stage bytecode generation failed")]
-    Pe32BytecodeGenFailed,
-
     #[error("PE32 eighthStageKey not found")]
     Pe32EighthKeyNotFound,
 
     #[error("PE32 file LFSR not found in eighthStage")]
     Pe32FileLfsrNotFound,
 
-    #[error("decompression failed — corrupt data or wrong offset")]
-    DecompressFailed,
+    #[error("{0} decompression failed — corrupt data or wrong offset")]
+    StageDecompressionFailed(DecompressionStage),
 
-    #[error("input is corrupt or not a supported Crackproof layout")]
-    Corrupt,
+    #[error("{pipeline} section block {block} decompression failed")]
+    SectionDecompressionFailed {
+        pipeline: SectionPipeline,
+        block: usize,
+    },
+
+    #[error("AES key schedule is outside the image at offset {offset}")]
+    InvalidAesKeySchedule { offset: u32 },
+
+    #[error("Huffman table is outside the image at offset {offset}")]
+    InvalidHuffmanTable { offset: u32 },
+
+    #[error(
+        "PE32 second-stage range is invalid (offset {offset}, size {size}, image length {image_len})"
+    )]
+    Pe32SecondStageRangeInvalid {
+        offset: u32,
+        size: u32,
+        image_len: usize,
+    },
+
+    #[error("PE32 relocation-data descriptor not found")]
+    Pe32RelocationDataNotFound,
+
+    #[error("file decryptor candidate failed structural validation")]
+    FileDecryptorValidationFailed,
+
+    #[error("PE32 memory image could not be rebuilt as a file-layout PE")]
+    Pe32OutputLayoutInvalid,
+
+    #[error("internal panic at {file}:{line}:{column}: {message}")]
+    InternalPanic {
+        message: String,
+        file: String,
+        line: u32,
+        column: u32,
+    },
 }
 
 pub fn unpack(input: &[u8]) -> Result<Vec<u8>, UnpackError> {
@@ -93,8 +252,12 @@ fn prot_rva_to_off(file_data: &[u8], pe_header: u32, rva: u32) -> Option<u32> {
 }
 
 pub fn unpack_v(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError> {
-    if input.len() < 4096 {
-        return Err(UnpackError::InputTooShort(input.len()));
+    const HEADER_LEN: usize = 4128;
+    if input.len() < HEADER_LEN {
+        return Err(UnpackError::InputTooShort {
+            actual: input.len(),
+            required: HEADER_LEN,
+        });
     }
     // The pipeline chases offsets read out of the decrypted image; on a
     // truncated/garbled-but-detected file those run out of bounds. Trap any
@@ -376,13 +539,25 @@ impl<'a> Unpacker<'a> {
             println!("  info[7]            = 0x{:08X}", u.info[7]);
         }
         if !super::is_supported_magic(u.info[1]) {
-            return Err(UnpackError::HeaderMismatch);
+            return Err(UnpackError::HeaderMagicMismatch { found: u.info[1] });
         }
 
         let pe_off = get_u32(u.file_data, 60);
+        if (pe_off as usize)
+            .checked_add(84)
+            .is_none_or(|end| end > u.file_data.len())
+        {
+            return Err(UnpackError::InvalidPeOffset {
+                offset: i64::from(pe_off),
+                input_len: u.file_data.len(),
+            });
+        }
         let size_of_image = get_u32(u.file_data, pe_off.wrapping_add(80));
         if size_of_image == 0 || size_of_image as u64 > super::MAX_IMAGE_SIZE {
-            return Err(UnpackError::Corrupt);
+            return Err(UnpackError::InvalidImageSize {
+                size: i64::from(size_of_image),
+                max: super::MAX_IMAGE_SIZE,
+            });
         }
         u.decompressed = vec![0u8; size_of_image as usize];
         u.decrypt_size = u.info[6].wrapping_sub(u.info[3]).wrapping_add(8192);
@@ -671,7 +846,9 @@ impl<'a> Unpacker<'a> {
             println!("  stage3  = 0x{:08X}", stage3_field);
         }
         if !u.decrypt_and_decompress_data(at1, xor_acc ^ chk2 ^ accum, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::ExeStage3,
+            ));
         }
 
         let at2 = stage1.wrapping_add(stage2_off.wrapping_add(104));
@@ -689,7 +866,9 @@ impl<'a> Unpacker<'a> {
             .unwrap_or_else(|| stage3_field.wrapping_add(4692));
         let v4_val = get_u32(&u.decompressed, v4);
         if !u.decrypt_and_decompress_data(at2, xor_acc ^ chk3 ^ v4_val, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::ExeStage3Secondary,
+            ));
         }
 
         let chk4 = u.calculate_checksum(stage1.wrapping_add(chk_src_start.wrapping_add(16)));
@@ -708,7 +887,9 @@ impl<'a> Unpacker<'a> {
             println!("  stage4  = 0x{:08X}", stage4_field);
         }
         if !u.decrypt_and_decompress_data(at3, xor_acc ^ chk4 ^ v5_val, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::ExeStage4,
+            ));
         }
 
         // Inside stage4, two locations vary by build:
@@ -758,7 +939,9 @@ impl<'a> Unpacker<'a> {
         let ops1 = match generate(&u.decompressed, data_offset) {
             Some(v) => v,
             None => {
-                return Err(UnpackError::BytecodeGenFailed);
+                return Err(UnpackError::BytecodeGenerationFailed(
+                    BytecodeStage::ExeStage4,
+                ));
             }
         };
 
@@ -771,7 +954,9 @@ impl<'a> Unpacker<'a> {
             println!("  stage5  = 0x{:08X}", stage5_field);
         }
         if !u.decrypt_and_decompress_data(at4, xor_acc ^ chk4 ^ chk5 ^ accum2, Some(&ops1)) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::ExeStage5,
+            ));
         }
 
         // Inside stage5, the loader stores a table of (ptr, size) pairs at a
@@ -921,7 +1106,9 @@ impl<'a> Unpacker<'a> {
         let ops2 = match generate(&u.decompressed, data_offset2) {
             Some(v) => v,
             None => {
-                return Err(UnpackError::Stage5BytecodeGenFailed);
+                return Err(UnpackError::BytecodeGenerationFailed(
+                    BytecodeStage::ExeStage5,
+                ));
             }
         };
         // The new layout picked its file decryptor by distance (no marker, no
@@ -930,7 +1117,7 @@ impl<'a> Unpacker<'a> {
         // garbling into the output without any error (see the validator).
         let rebase = (!get_u32(u.file_data, 4224)).wrapping_add(4096);
         if new_layout && !u.new_layout_file_ops_validate(walk4_slot, &ops2, rebase) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::FileDecryptorValidationFailed);
         }
 
         let at6 = walk4_slot;
@@ -980,9 +1167,9 @@ impl<'a> Unpacker<'a> {
             // Snapshot the shared tables before the fan-out: workers get
             // disjoint span slices, not the whole buffer.
             let ks_snap = primitives::aes_schedule_snapshot(&u.decompressed, ko[2])
-                .ok_or(UnpackError::Corrupt)?;
+                .ok_or(UnpackError::InvalidAesKeySchedule { offset: ko[2] })?;
             let tab_snap = primitives::huffman_table_snapshot(&u.decompressed, ko[0])
-                .ok_or(UnpackError::DecompressFailed)?;
+                .ok_or(UnpackError::InvalidHuffmanTable { offset: ko[0] })?;
             let spans: Vec<(usize, usize)> = blocks
                 .iter()
                 .map(|b| {
@@ -1009,7 +1196,10 @@ impl<'a> Unpacker<'a> {
                         b.len,
                         b.plain_len,
                     ) {
-                        return Err(UnpackError::DecompressFailed);
+                        return Err(UnpackError::SectionDecompressionFailed {
+                            pipeline: SectionPipeline::ExePe32Plus,
+                            block: i,
+                        });
                     }
                 }
                 Ok(())
@@ -1475,7 +1665,7 @@ impl<'a> Unpacker<'a> {
     /// whose fileCS pointer sits just past `info[3]`), not by content. A
     /// coincidental LFSR-shaped block at a shorter distance would decode to a
     /// wrong `ops2` translate and silently garble every section block — raw
-    /// blocks never hit `DecompressFailed`, so the failure would ship as a
+    /// raw blocks never enter the decompressor, so the failure would ship as a
     /// plausible but wrong image. Replay the first *compressed* block's full
     /// transform (raw copy, AES, translate, decompress) on a snapshot and
     /// require decompression to succeed; restore the region afterwards.
@@ -1837,7 +2027,11 @@ impl<'a> Unpacker<'a> {
         let ss_lo = ss as usize;
         let ss_hi = ss_lo.wrapping_add(ss_size as usize);
         if ss_hi < ss_lo || ss_hi > self.decompressed.len() {
-            return Err(UnpackError::Corrupt);
+            return Err(UnpackError::Pe32SecondStageRangeInvalid {
+                offset: ss,
+                size: ss_size,
+                image_len: self.decompressed.len(),
+            });
         }
         let ss_ct: Vec<u8> = self.decompressed[ss_lo..ss_hi].to_vec();
         // PE32 data dir 5 (BaseReloc) = optional_header(pe+24) + 0x60 + 5*8 = pe+0xA0.
@@ -1872,7 +2066,7 @@ impl<'a> Unpacker<'a> {
             }
         }
         if !found {
-            return Err(UnpackError::Corrupt);
+            return Err(UnpackError::Pe32RelocationDataNotFound);
         }
         if verbose {
             println!(
@@ -1996,7 +2190,9 @@ impl<'a> Unpacker<'a> {
         let forth_addr = dp_base.wrapping_add(0x40);
         let fk = header_checksum ^ second_stage_cs ^ forth_stage_key;
         if !self.decrypt_and_decompress_data(forth_addr, fk, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::Pe32FourthStage,
+            ));
         }
 
         // ---- FifthStage ----
@@ -2012,7 +2208,9 @@ impl<'a> Unpacker<'a> {
         );
         let fk5 = header_checksum ^ forth_cs ^ fifth_key;
         if !self.decrypt_and_decompress_data(fifth_addr, fk5, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::Pe32FifthStage,
+            ));
         }
 
         // ---- SevenStage ----
@@ -2035,7 +2233,9 @@ impl<'a> Unpacker<'a> {
         );
         let fk7 = header_checksum ^ fifth_cs ^ seven_key;
         if !self.decrypt_and_decompress_data(seven_addr, fk7, None) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(
+                DecompressionStage::Pe32SeventhStage,
+            ));
         }
 
         // ---- EighthStage ----
@@ -2063,8 +2263,9 @@ impl<'a> Unpacker<'a> {
         .ok_or(UnpackError::Pe32CustomDecryptorNotFound)?;
         let custom_dec_addr = seven_start_actual.wrapping_add(custom_dec_off);
         self.decrypt_data6(custom_dec_addr);
-        let custom_ops = generate(&self.decompressed, custom_dec_addr)
-            .ok_or(UnpackError::Pe32BytecodeGenFailed)?;
+        let custom_ops = generate(&self.decompressed, custom_dec_addr).ok_or(
+            UnpackError::BytecodeGenerationFailed(BytecodeStage::Pe32CustomDecryptor),
+        )?;
 
         let seven_cs = self.calculate_checksum(seven_stage_cs_addr);
         let eighth_addr = dp_base.wrapping_add(0xC0);
@@ -2323,7 +2524,7 @@ impl<'a> Unpacker<'a> {
                     // "legacy loose scan" picked the nearest LFSR-shaped block
                     // by offset distance without any validation — that is
                     // exactly how a wrong file_ops got applied to every data
-                    // block (uncompressed blocks never hit DecompressFailed),
+                    // block (uncompressed blocks never enter the decompressor),
                     // producing a plausible but fully wrong image (the PE32
                     // .text scramble root cause). Trial-and-validate or error.
                     return Err(UnpackError::Pe32FileLfsrNotFound);
@@ -2362,8 +2563,9 @@ impl<'a> Unpacker<'a> {
         };
         let file_dec_addr = eighth_start.wrapping_add(lfsr_off);
         self.decrypt_data6(file_dec_addr);
-        let file_ops = generate(&self.decompressed, file_dec_addr)
-            .ok_or(UnpackError::Pe32BytecodeGenFailed)?;
+        let file_ops = generate(&self.decompressed, file_dec_addr).ok_or(
+            UnpackError::BytecodeGenerationFailed(BytecodeStage::Pe32FileDecryptor),
+        )?;
 
         // ---- PE32 metadata: EP and data dirs from info[3] ----
         let test_val = get_u32(&self.decompressed, info3.wrapping_add(0x10));
@@ -2448,9 +2650,9 @@ impl<'a> Unpacker<'a> {
             let clean = &self.file_data;
             let ko = self.key_offsets;
             let ks_snap = primitives::aes_schedule_snapshot(&self.decompressed, ko[2])
-                .ok_or(UnpackError::Corrupt)?;
+                .ok_or(UnpackError::InvalidAesKeySchedule { offset: ko[2] })?;
             let tab_snap = primitives::huffman_table_snapshot(&self.decompressed, ko[0])
-                .ok_or(UnpackError::DecompressFailed)?;
+                .ok_or(UnpackError::InvalidHuffmanTable { offset: ko[0] })?;
             let spans: Vec<(usize, usize)> = blocks
                 .iter()
                 .map(|b| {
@@ -2472,7 +2674,10 @@ impl<'a> Unpacker<'a> {
                     if !primitives::decompress_tbl(
                         &tab_snap, span, rel as u32, rel as u32, b.ssz, b.dsz,
                     ) {
-                        return Err(UnpackError::DecompressFailed);
+                        return Err(UnpackError::SectionDecompressionFailed {
+                            pipeline: SectionPipeline::ExePe32,
+                            block: i,
+                        });
                     }
                 }
                 Ok(())
@@ -2805,8 +3010,43 @@ impl<'a> Unpacker<'a> {
         if !is_dll && !primitives::pe32_imports_already_match_idata_layout(&mut out, pe_off) {
             primitives::move_pe32_imports_to_kmiat(&mut out, pe_off);
         }
-        let compact =
-            primitives::compact_memory_image_to_pe(&out, pe_off).ok_or(UnpackError::Corrupt)?;
+        let compact = primitives::compact_memory_image_to_pe(&out, pe_off)
+            .ok_or(UnpackError::Pe32OutputLayoutInvalid)?;
         Ok(compact)
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn short_input_reports_actual_and_required_lengths() {
+        let error = unpack(&[0; 4096]).expect_err("header must be rejected");
+        assert_eq!(
+            error,
+            UnpackError::InputTooShort {
+                actual: 4096,
+                required: 4128,
+            }
+        );
+    }
+
+    #[test]
+    fn structured_errors_include_stage_and_block_context() {
+        let stage = UnpackError::StageDecompressionFailed(DecompressionStage::ExeStage4);
+        assert_eq!(
+            stage.to_string(),
+            "EXE stage4 decompression failed — corrupt data or wrong offset"
+        );
+
+        let block = UnpackError::SectionDecompressionFailed {
+            pipeline: SectionPipeline::ExePe32,
+            block: 7,
+        };
+        assert_eq!(
+            block.to_string(),
+            "PE32 EXE section block 7 decompression failed"
+        );
     }
 }

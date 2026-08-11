@@ -46,7 +46,7 @@ pub(crate) fn thread_cap() -> usize {
 ///
 /// Returns the first `Err` any block produces; re-raises the first block panic
 /// on the calling thread (so the pipeline's existing `catch_unpack` still
-/// converts it to `UnpackError::Corrupt`).
+/// converts it to `UnpackError::InternalPanic`).
 pub(crate) fn parallel_for<E, F>(
     buf: &mut [u8],
     spans: &[(usize, usize)],
@@ -125,6 +125,7 @@ where
     let stop = AtomicBool::new(false);
     let first_err: Mutex<Option<E>> = Mutex::new(None);
     let first_panic: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let panic_capture = super::current_panic_capture();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -133,6 +134,7 @@ where
             let first_err = &first_err;
             let first_panic = &first_panic;
             let f = &f;
+            let panic_capture = panic_capture.clone();
             scope.spawn(move || {
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -141,9 +143,15 @@ where
                     let next = iter.lock().unwrap().next();
                     let Some((i, piece)) = next else { break };
                     let span = piece.unwrap();
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        f(i, spans[i].0, span)
-                    }));
+                    // Keep details local until this panic wins `first_panic`;
+                    // otherwise simultaneous workers could pair one worker's
+                    // location with another worker's propagated payload.
+                    let block_capture = panic_capture.as_ref().map(|_| super::PanicCapture::new());
+                    let r = super::with_panic_capture(block_capture.clone(), || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            f(i, spans[i].0, span)
+                        }))
+                    });
                     match r {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -157,6 +165,11 @@ where
                         Err(panic) => {
                             let mut slot = first_panic.lock().unwrap();
                             if slot.is_none() {
+                                if let (Some(parent), Some(block)) =
+                                    (&panic_capture, &block_capture)
+                                {
+                                    parent.merge_from(block);
+                                }
                                 *slot = Some(panic);
                             }
                             stop.store(true, Ordering::Relaxed);

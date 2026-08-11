@@ -13,9 +13,12 @@
 //!   CalculateChecksumWithSizeXor        -> primitives::calculate_checksum
 //!   CalculateCrc32                      -> crc32::compute (via above)
 
-use super::UnpackError;
 use super::bytecode::{Op, OpsLut, generate};
 use super::primitives::{self, *};
+use super::{
+    BufferOperation, BytecodeStage, DecompressionStage, DescriptorTable, SectionPipeline,
+    UnpackError,
+};
 
 /// Read a signed 32-bit little-endian value.
 fn get_i32(d: &[u8], offset: i32) -> i32 {
@@ -68,6 +71,7 @@ fn decrypt_data4(
     key: i32,
     decomp_params: &[i32; 4],
     transform: Option<&[Op]>,
+    stage: DecompressionStage,
 ) -> Result<(), UnpackError> {
     let addr = get_i32(d, offset);
     let size = get_i32(d, offset + 4);
@@ -95,7 +99,7 @@ fn decrypt_data4(
             size as u32,
             decompressed_size as u32,
         ) {
-            return Err(UnpackError::DecompressFailed);
+            return Err(UnpackError::StageDecompressionFailed(stage));
         }
     }
     Ok(())
@@ -218,7 +222,11 @@ fn decrypt_and_decompress_data(
         // Guard: need 16 bytes at section_data_offset in `d`
         let off = section_data_offset as usize;
         if off.saturating_add(16) > d.len() {
-            return Err(UnpackError::OutOfBounds(off));
+            return Err(UnpackError::DescriptorOutOfBounds {
+                table: DescriptorTable::DllSectionBlocks,
+                offset: off,
+                image_len: d.len(),
+            });
         }
         decrypt_data6_shift6(d, section_data_offset, 16);
         let dest_offset = get_i32(d, section_data_offset);
@@ -246,10 +254,10 @@ fn decrypt_and_decompress_data(
         let lut = OpsLut::new(decrypt_func);
         let ko0 = decomp_params[0];
         let ko2 = decomp_params[2];
-        let ks_snap =
-            primitives::aes_schedule_snapshot(d, ko2 as u32).ok_or(UnpackError::Corrupt)?;
+        let ks_snap = primitives::aes_schedule_snapshot(d, ko2 as u32)
+            .ok_or(UnpackError::InvalidAesKeySchedule { offset: ko2 as u32 })?;
         let tab_snap = primitives::huffman_table_snapshot(d, ko0 as u32)
-            .ok_or(UnpackError::DecompressFailed)?;
+            .ok_or(UnpackError::InvalidHuffmanTable { offset: ko0 as u32 })?;
         let spans: Vec<(usize, usize)> = blocks
             .iter()
             .map(|b| {
@@ -277,7 +285,10 @@ fn decrypt_and_decompress_data(
                     b.size as u32,
                     b.expected_crc as u32,
                 ) {
-                    return Err(UnpackError::DecompressFailed);
+                    return Err(UnpackError::SectionDecompressionFailed {
+                        pipeline: SectionPipeline::Dll,
+                        block: i,
+                    });
                 }
             }
             Ok(())
@@ -292,7 +303,11 @@ fn decrypt_and_decompress_data(
         // decrypts 16 too, so guard 16 (an 8-byte guard would let
         // decrypt_data6_shift6 index past the end of a truncated descriptor).
         if off.saturating_add(16) > d.len() {
-            return Err(UnpackError::OutOfBounds(off));
+            return Err(UnpackError::DescriptorOutOfBounds {
+                table: DescriptorTable::DllZeroFill,
+                offset: off,
+                image_len: d.len(),
+            });
         }
         decrypt_data6_shift6(d, section_data_offset, 16);
         let zero_offset = get_i32(d, section_data_offset);
@@ -305,7 +320,12 @@ fn decrypt_and_decompress_data(
         for i in 0..zero_size {
             let idx = (zero_offset + i) as usize;
             if idx >= d.len() {
-                return Err(UnpackError::OutOfBounds(idx));
+                return Err(UnpackError::BufferRangeOutOfBounds {
+                    operation: BufferOperation::ZeroFill,
+                    offset: idx,
+                    size: 1,
+                    buffer_len: d.len(),
+                });
             }
             d[idx] = 0;
         }
@@ -328,8 +348,12 @@ pub fn unpack_dll_v(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
 }
 
 fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError> {
-    if input.len() < 4096 {
-        return Err(UnpackError::InputTooShort(input.len()));
+    const HEADER_LEN: usize = 4128;
+    if input.len() < HEADER_LEN {
+        return Err(UnpackError::InputTooShort {
+            actual: input.len(),
+            required: HEADER_LEN,
+        });
     }
 
     // `file_data` and `original_file_data` both borrow the same protected input.
@@ -348,14 +372,17 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     }
 
     if !super::is_supported_magic(keys[1] as u32) {
-        return Err(UnpackError::DllUnpack(
-            "Not a Crackproof protected file (KONN magic mismatch)".into(),
-        ));
+        return Err(UnpackError::HeaderMagicMismatch {
+            found: keys[1] as u32,
+        });
     }
 
     let pe_offset = get_i32(file_data, 60);
     if pe_offset < 0 || (pe_offset as usize).saturating_add(84) > file_data.len() {
-        return Err(UnpackError::DllUnpack("implausible PE offset".into()));
+        return Err(UnpackError::InvalidPeOffset {
+            offset: i64::from(pe_offset),
+            input_len: file_data.len(),
+        });
     }
     // This pipeline is PE32+-only: its header fixups write the data
     // directories at PE32+ offsets (pe+144..180, pe+136 for the DD blob). On a
@@ -363,14 +390,18 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     // structurally plausible but unloadable file. Reject early with a clear
     // error so `unpack_auto`'s EXE-pipeline fallback handles PE32 DLLs (that
     // path is PE32-aware — see run_pe32), instead of us mangling them here.
-    if get_i32(file_data, pe_offset + 24) & 0xFFFF != 0x20B {
-        return Err(UnpackError::DllUnpack(
-            "not a PE32+ image (the DLL pipeline handles 64-bit only)".into(),
-        ));
+    let optional_magic = get_u16(file_data, (pe_offset + 24) as u32);
+    if optional_magic != 0x20B {
+        return Err(UnpackError::UnsupportedDllPeMagic {
+            found: optional_magic,
+        });
     }
     let size_of_image = get_i32(file_data, pe_offset + 80);
     if size_of_image <= 0 || size_of_image as u64 > super::MAX_IMAGE_SIZE {
-        return Err(UnpackError::DllUnpack("implausible SizeOfImage".into()));
+        return Err(UnpackError::InvalidImageSize {
+            size: i64::from(size_of_image),
+            max: super::MAX_IMAGE_SIZE,
+        });
     }
     let mut out = vec![0u8; size_of_image as usize];
     let base_offset = keys[6] - keys[3] + 0x2000;
@@ -512,6 +543,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         table_val ^ checksum2 ^ (xor_accumulator as i32),
         &decomp_params,
         None,
+        DecompressionStage::DllCodeBlock1,
     )?;
 
     let addr3b = get_i32(&out, decrypted_addr1 + 3728);
@@ -537,6 +569,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         crc_xored ^ (xor_accumulator as i32) ^ trailing_val,
         &decomp_params,
         None,
+        DecompressionStage::DllCodeBlock2,
     )?;
 
     let checksum3 = calculate_checksum(&out, (decrypted_addr1 + 3480) as u32) as i32;
@@ -549,6 +582,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         (not_val ^ (xor_key as u32)) as i32,
         &decomp_params,
         None,
+        DecompressionStage::DllCodeBlock3,
     )?;
 
     let addr4 = get_i32(&out, addr4_offset);
@@ -574,8 +608,9 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         lfsr_seed_val = lfsr_seed_val.wrapping_add(k);
     }
 
-    let decrypt_func = generate(&out, lfsr as u32)
-        .ok_or_else(|| UnpackError::DllUnpack("Failed to build decryption expression".into()))?;
+    let decrypt_func = generate(&out, lfsr as u32).ok_or(UnpackError::BytecodeGenerationFailed(
+        BytecodeStage::DllPrimaryDecryptor,
+    ))?;
 
     let addr5_offset = decrypted_addr1 + 3840;
     let addr5 = get_i32(&out, addr5_offset);
@@ -585,6 +620,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         lfsr_seed_val ^ xor_key ^ checksum4,
         &decomp_params,
         Some(&decrypt_func),
+        DecompressionStage::DllCodeBlock4,
     )?;
     if verbose {
         println!("[7/9] Decrypting code block 4 (addr5)...");
@@ -603,9 +639,9 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     let lfsr2 = metadata_offset + 88;
     decrypt_data6(&mut out, lfsr2 as u32);
 
-    let decrypt_func2 = generate(&out, lfsr2 as u32).ok_or_else(|| {
-        UnpackError::DllUnpack("Failed to build second decryption expression".into())
-    })?;
+    let decrypt_func2 = generate(&out, lfsr2 as u32).ok_or(
+        UnpackError::BytecodeGenerationFailed(BytecodeStage::DllSectionDecryptor),
+    )?;
 
     let section_image_base = 4095 - get_i32(original_file_data, 4224);
     let section_data_offset = get_i32(&out, addr5 + 11976);

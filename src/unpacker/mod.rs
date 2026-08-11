@@ -9,8 +9,14 @@ pub(crate) mod parallel;
 pub(crate) mod primitives;
 mod tables;
 
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+
 pub use dll::{unpack_dll, unpack_dll_v};
-pub use exe::{UnpackError, unpack as unpack_exe, unpack_v as unpack_exe_v};
+pub use exe::{
+    BufferOperation, BytecodeStage, DecompressionStage, DescriptorTable, SectionPipeline,
+    UnpackError, unpack as unpack_exe, unpack_v as unpack_exe_v,
+};
 pub use integrity::{IntegrityReport, check as check_integrity};
 
 /// Maximum plausible PE `SizeOfImage` we are willing to allocate a zero buffer
@@ -20,11 +26,139 @@ pub use integrity::{IntegrityReport, check as check_integrity};
 /// Real protected binaries are far below this.
 pub(crate) const MAX_IMAGE_SIZE: u64 = 1 << 30; // 1 GiB
 
+#[derive(Clone)]
+pub(crate) struct PanicCapture(Arc<Mutex<Option<PanicDetails>>>);
+
+#[derive(Clone)]
+struct PanicDetails {
+    message: String,
+    file: String,
+    line: u32,
+    column: u32,
+}
+
+thread_local! {
+    static ACTIVE_PANIC_CAPTURE: RefCell<Option<PanicCapture>> = const { RefCell::new(None) };
+}
+
+struct PanicCaptureGuard(Option<PanicCapture>);
+
+impl Drop for PanicCaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_PANIC_CAPTURE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+impl PanicCapture {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn record(&self, info: &std::panic::PanicHookInfo<'_>) {
+        let location = info.location();
+        let details = PanicDetails {
+            message: panic_message(info.payload()),
+            file: location
+                .map(|value| value.file().to_owned())
+                .unwrap_or_else(|| "<unknown>".to_owned()),
+            line: location.map_or(0, std::panic::Location::line),
+            column: location.map_or(0, std::panic::Location::column),
+        };
+        let mut captured = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if captured.is_none() {
+            *captured = Some(details);
+        }
+    }
+
+    fn into_error(self, payload: &(dyn std::any::Any + Send)) -> UnpackError {
+        let details = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| PanicDetails {
+                message: panic_message(payload),
+                file: "<unknown>".to_owned(),
+                line: 0,
+                column: 0,
+            });
+        UnpackError::InternalPanic {
+            message: details.message,
+            file: details.file,
+            line: details.line,
+            column: details.column,
+        }
+    }
+
+    fn merge_from(&self, other: &Self) {
+        let details = other
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(details) = details else { return };
+        let mut captured = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if captured.is_none() {
+            *captured = Some(details);
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_panic_capture_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let capture = ACTIVE_PANIC_CAPTURE
+                .try_with(|slot| slot.borrow().clone())
+                .ok()
+                .flatten();
+            if let Some(capture) = capture {
+                capture.record(info);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn install_panic_capture_hook() {}
+
+pub(crate) fn current_panic_capture() -> Option<PanicCapture> {
+    ACTIVE_PANIC_CAPTURE.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn with_panic_capture<R>(capture: Option<PanicCapture>, f: impl FnOnce() -> R) -> R {
+    let previous = ACTIVE_PANIC_CAPTURE.with(|slot| slot.replace(capture));
+    let _guard = PanicCaptureGuard(previous);
+    f()
+}
+
 /// Run an unpack pipeline, converting any internal panic into a clean
-/// [`UnpackError::Corrupt`] so the public API stays panic-free on any input
-/// (truncated/garbled files chase offsets out of bounds). The default panic
-/// hook is suppressed transiently so a trapped panic does not spill a
-/// backtrace to stderr.
+/// [`UnpackError::InternalPanic`] so the public API stays panic-free on any input
+/// (truncated/garbled files chase offsets out of bounds). The panic location and
+/// payload are captured for diagnostics without printing a backtrace to stderr.
 ///
 /// Note: allocation *failures* abort the process and are NOT caught here; size
 /// requests are bounds-checked against [`MAX_IMAGE_SIZE`] before allocating.
@@ -32,17 +166,17 @@ pub(crate) fn catch_unpack<F>(f: F) -> Result<Vec<u8>, UnpackError>
 where
     F: FnOnce() -> Result<Vec<u8>, UnpackError>,
 {
-    // Hook suppression is skipped on wasm: the prebuilt std cannot unwind
-    // there, so a panic traps immediately — and the suppressed hook would
-    // hide the panic message, leaving a bare `unreachable` with no clue.
-    #[cfg(not(target_arch = "wasm32"))]
-    let prev = std::panic::take_hook();
-    #[cfg(not(target_arch = "wasm32"))]
-    std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    #[cfg(not(target_arch = "wasm32"))]
-    std::panic::set_hook(prev);
-    r.unwrap_or(Err(UnpackError::Corrupt))
+    // Hook capture is skipped on wasm: the prebuilt std cannot unwind there,
+    // so a panic traps immediately. The Web Worker boundary reports that trap.
+    install_panic_capture_hook();
+    let capture = PanicCapture::new();
+    let r = with_panic_capture(Some(capture.clone()), || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+    });
+    match r {
+        Ok(result) => result,
+        Err(payload) => Err(capture.into_error(payload.as_ref())),
+    }
 }
 
 /// Crackproof header magic stored in `keys[1]`/`info[1]`.
@@ -207,4 +341,61 @@ pub fn unpack_auto_v(input: &[u8], verbose: bool) -> Result<(Kind, Vec<u8>), Unp
         }
     };
     Ok((detected.kind, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn caught_panic_reports_location_and_message() {
+        let error = catch_unpack(|| -> Result<Vec<u8>, UnpackError> {
+            panic!("test panic");
+        })
+        .expect_err("panic must become an error");
+        let UnpackError::InternalPanic {
+            message,
+            file,
+            line,
+            column,
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(message, "test panic");
+        assert!(file.ends_with("src/unpacker/mod.rs") || file.ends_with("src\\unpacker\\mod.rs"));
+        assert!(line > 0);
+        assert!(column > 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn worker_panic_keeps_the_worker_source_location() {
+        let error = catch_unpack(|| -> Result<Vec<u8>, UnpackError> {
+            let capture = current_panic_capture();
+            let result = std::thread::spawn(move || {
+                with_panic_capture(capture, || panic!("worker panic"));
+            })
+            .join();
+            if let Err(payload) = result {
+                std::panic::resume_unwind(payload);
+            }
+            Ok(Vec::new())
+        })
+        .expect_err("worker panic must become an error");
+        let UnpackError::InternalPanic {
+            message,
+            file,
+            line,
+            column,
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(message, "worker panic");
+        assert!(file.ends_with("src/unpacker/mod.rs") || file.ends_with("src\\unpacker\\mod.rs"));
+        assert!(line > 0);
+        assert!(column > 0);
+    }
 }
