@@ -47,6 +47,3 @@ LICENSE         text eol=lf
 *.gz            binary
 *.xz            binary
 *.dat           binary
-
-# wasm-pack output is generated.
-web/pkg/**      linguist-generated=true

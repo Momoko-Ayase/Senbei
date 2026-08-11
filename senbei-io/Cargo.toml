@@ -1,0 +1,23 @@
+[package]
+name = "senbei-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filesystem, scanning, logging, and CLI orchestration for Senbei"
+
+[dependencies]
+anyhow.workspace = true
+indicatif.workspace = true
+owo-colors.workspace = true
+senbei-metadata.workspace = true
+senbei-pe.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

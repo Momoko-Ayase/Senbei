@@ -208,17 +208,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "senbei"
+name = "senbei-cli"
+version = "1.0.0"
+dependencies = [
+ "senbei-io",
+]
+
+[[package]]
+name = "senbei-crypto"
+version = "1.0.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "senbei-io"
 version = "1.0.0"
 dependencies = [
  "anyhow",
  "indicatif",
  "libc",
  "owo-colors",
+ "senbei-metadata",
+ "senbei-pe",
  "tempfile",
- "thiserror",
  "walkdir",
  "windows",
+]
+
+[[package]]
+name = "senbei-metadata"
+version = "1.0.0"
+
+[[package]]
+name = "senbei-pe"
+version = "1.0.0"
+dependencies = [
+ "senbei-crypto",
+ "thiserror",
 ]
 
 [[package]]

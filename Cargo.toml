@@ -1,39 +1,36 @@
-[package]
-name = "senbei"
+[workspace]
+members = [
+    "senbei-cli",
+    "senbei-crypto",
+    "senbei-io",
+    "senbei-metadata",
+    "senbei-pe",
+]
+default-members = ["senbei-cli"]
+resolver = "2"
+
+[workspace.package]
 version = "1.0.0"
 edition = "2024"
-description = "Static unpacker for Crackproof-protected PE files"
 license = "AGPL-3.0-only"
-keywords = ["unpacker", "reverse-engineering", "pe", "security-research"]
-categories = ["command-line-utilities"]
 
-[lib]
-name = "senbei"
-path = "src/lib.rs"
-
-[[bin]]
-name = "senbei"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
+indicatif = "0.18"
+libc = "0.2"
+owo-colors = "4"
+tempfile = "3"
 thiserror = "2"
 walkdir = "2"
-indicatif = "0.18"
-owo-colors = "4"
-
-[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_SystemInformation",
 ] }
-
-[target.'cfg(all(not(windows), not(target_arch = "wasm32")))'.dependencies]
-libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
+senbei-crypto = { path = "senbei-crypto" }
+senbei-io = { path = "senbei-io" }
+senbei-metadata = { path = "senbei-metadata" }
+senbei-pe = { path = "senbei-pe" }
 
 [profile.release]
 opt-level = 3
