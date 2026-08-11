@@ -28,12 +28,11 @@ const MIN_SIZE: u64 = 4128;
 /// File extensions that are bulk data by construction and can never be a PE
 /// image or an il2cpp metadata blob.
 ///
-/// This is deliberately a **deny**-list, not an allow-list: the default is to
-/// probe, so anything unrecognised is still opened. Targets are recognised by
-/// content, not extension, and can carry arbitrary names — there is no closed
-/// set of target extensions an allow-list of `exe`/`dll` could enumerate.
-/// Only extensions that are bulk asset or text formats by construction appear
-/// here.
+/// This is deliberately a **deny**-list, not an executable allow-list: unknown
+/// extensions are still probed. Extensionless files are handled separately by
+/// [`denied_name`] because asset stores commonly contain tens of thousands of
+/// extensionless chunks; exhaustive probing remains available through
+/// `--scan-all`.
 ///
 /// Set `SENBEI_SCAN_ALL=1` (or pass `--scan-all`) to probe every file regardless.
 const DENY_EXT: &[&str] = &[
@@ -90,11 +89,12 @@ const DENY_EXT: &[&str] = &[
     "sr",
 ];
 
-/// Whether `path`'s extension is on [`DENY_EXT`]. Extensionless files are never
-/// denied (they could be anything).
-fn denied_ext(path: &Path) -> bool {
+/// Whether `path` can be skipped from its name alone. Extensionless files and
+/// files whose extension is on [`DENY_EXT`] are not opened during a default
+/// scan. `--scan-all` remains available when exhaustive probing is required.
+fn denied_name(path: &Path) -> bool {
     let Some(ext) = path.extension() else {
-        return false;
+        return true;
     };
     let Some(ext) = ext.to_str() else {
         return false;
@@ -206,12 +206,17 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> (Vec<PathBuf>, Vec<Path
             continue;
         }
         if !scan_all {
+            // Name checks come first so extensionless asset chunks never
+            // trigger even an explicit metadata query.
+            if denied_name(entry.path()) {
+                continue;
+            }
             // Skip on directory metadata alone — never open these.
             let too_small = entry
                 .metadata()
                 .map(|m| m.len() < MIN_SIZE)
                 .unwrap_or(false);
-            if too_small || denied_ext(entry.path()) {
+            if too_small {
                 continue;
             }
         }
@@ -329,27 +334,47 @@ mod tests {
     #[test]
     fn denies_bulk_asset_extensions_case_insensitively() {
         for p in ["a.ab", "a.XML", "a.Acb", "a.ma2", "a.manifest", "a.PNG"] {
-            assert!(denied_ext(Path::new(p)), "{p} should be denied");
+            assert!(denied_name(Path::new(p)), "{p} should be denied");
+        }
+    }
+
+    #[test]
+    fn denies_extensionless_files() {
+        for p in ["asset", "level0", "0123456789abcdef"] {
+            assert!(denied_name(Path::new(p)), "{p} should be denied");
         }
     }
 
     #[test]
     fn never_denies_what_a_target_can_be_named() {
-        // Targets are recognised by content, not name — a protected module
-        // can carry any extension, or none — so names like these must always
-        // be probed. An allow-list would have skipped them.
+        // Unknown extensions must still be probed. This keeps the filter a
+        // narrow deny-list rather than an executable-extension allow-list.
         for p in [
             "app.exe.bak",
             "managed.dll.bak",
             "daemon.exe",
             "GameLib.dll",
             "global-metadata.dat",
-            "noextension",
             "a.so",
             "a.bin",
         ] {
-            assert!(!denied_ext(Path::new(p)), "{p} must still be probed");
+            assert!(!denied_name(Path::new(p)), "{p} must still be probed");
         }
+    }
+
+    #[test]
+    fn extensionless_targets_require_exhaustive_scan() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let mut blob = vec![0u8; MIN_SIZE as usize + 1];
+        blob[..4].copy_from_slice(&0xFAB1_1BAFu32.to_le_bytes());
+        std::fs::write(root.join("metadata"), &blob).unwrap();
+
+        let (_, filtered, _) = find_targets_opts(root, false);
+        assert!(filtered.is_empty());
+
+        let (_, exhaustive, _) = find_targets_opts(root, true);
+        assert_eq!(exhaustive.len(), 1);
     }
 
     /// A file below the Crackproof key-table bound is skipped without being

@@ -387,9 +387,9 @@ pub fn run_folder_v(
 ///
 /// When `scan_all` is true every regular file under `root` is opened and
 /// content-probed, instead of skipping ones the free directory metadata already
-/// rules out (too small to hold a Crackproof key table, or a bulk-asset
-/// extension). See [`crate::scan::find_targets_opts`] — exhaustive scanning is
-/// dramatically slower on asset-heavy game trees and finds the same targets.
+/// rules out (extensionless, too small to hold a Crackproof key table, or a
+/// bulk-asset extension). See [`crate::scan::find_targets_opts`] — exhaustive
+/// scanning is dramatically slower on asset-heavy trees.
 pub fn run_folder_opts(
     root: &Path,
     out_dir: Option<&Path>,
