@@ -151,3 +151,5 @@ target/
 # descend into it to find the re-included README). See senbei/samples/README.md.
 /samples/*
 !/samples/README.md
+
+/test
