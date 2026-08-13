@@ -73,8 +73,22 @@ impl<'a> Unpacker<'a> {
     }
 
     // Strategy (a): delegate to primitives::calculate_checksum2
-    fn calculate_checksum2(&self, pos: u32, start: u32) -> u32 {
-        primitives::calculate_checksum2(&self.decompressed, self.file_data, pos, start)
+    fn calculate_checksum2(&self, pos: u32, start: u32) -> Result<u32, UnpackError> {
+        primitives::calculate_checksum2(&self.decompressed, self.file_data, pos, start).map_err(
+            |error| match error {
+                senbei_crypto::Error::BufferRangeOutOfBounds {
+                    offset,
+                    size,
+                    buffer_len,
+                    ..
+                } => UnpackError::ExeChecksumRangeOutOfBounds {
+                    descriptor: pos,
+                    offset,
+                    size,
+                    image_len: buffer_len,
+                },
+            },
+        )
     }
 
     // Strategy (a): delegate to primitives::decrypt_data1
@@ -1018,7 +1032,19 @@ impl<'a> Unpacker<'a> {
                 let n = get_u32(&u.decompressed, p.wrapping_add(4));
                 walk3 = walk3.wrapping_add(16);
                 if n != 0 {
-                    chain_crc = u.calculate_checksum2(walk3.wrapping_sub(16), chain_crc);
+                    match u.calculate_checksum2(walk3.wrapping_sub(16), chain_crc) {
+                        Ok(next) => chain_crc = next,
+                        Err(UnpackError::ExeChecksumRangeOutOfBounds { .. }) => {
+                            if verbose {
+                                println!(
+                                    "  checksum chain terminates at 0x{:08X}: descriptor payload is outside protected input",
+                                    walk3.wrapping_sub(16)
+                                );
+                            }
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 if get_u32(&u.decompressed, walk3.wrapping_sub(16).wrapping_add(4)) == 0 {
                     break;

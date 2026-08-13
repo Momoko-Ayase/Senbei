@@ -382,11 +382,28 @@ pub fn calculate_checksum(d: &[u8], pos: u32) -> u32 {
 
 /// CRC32 chained checksum. The (offset, length) descriptor at `pos` is read
 /// from `d`; the bytes themselves are read from the separate `clean` buffer
-/// (the original file image). `start` is the initial CRC accumulator.
-pub fn calculate_checksum2(d: &[u8], clean: &[u8], pos: u32, start: u32) -> u32 {
+/// (the original file image). `start` is the initial CRC accumulator. Returns
+/// a range error instead of panicking when a descriptor points past `clean`.
+pub fn calculate_checksum2(
+    d: &[u8],
+    clean: &[u8],
+    pos: u32,
+    start: u32,
+) -> Result<u32, crate::Error> {
     let offset = get_u32(d, pos);
     let length = get_u32(d, pos.wrapping_add(4));
-    crc32::append(start, &clean[offset as usize..(offset + length) as usize])
+    let data_start = offset as usize;
+    let size = length as usize;
+    let end = data_start.checked_add(size);
+    let Some(end) = end.filter(|&end| end <= clean.len()) else {
+        return Err(crate::Error::BufferRangeOutOfBounds {
+            operation: crate::BufferOperation::Read,
+            offset: data_start,
+            size,
+            buffer_len: clean.len(),
+        });
+    };
+    Ok(crc32::append(start, &clean[data_start..end]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,5 +1111,23 @@ mod tests {
         d[2] = 8;
         assert!(decompress(&mut d, 0x40, 0x80, 0, 4, 3));
         assert_eq!(&d[0x80..0x83], &[0x5A, 0x5A, 0x5A]);
+    }
+
+    #[test]
+    fn checksum2_rejects_source_range_outside_clean_image() {
+        let mut descriptor = [0u8; 8];
+        descriptor[0..4].copy_from_slice(&448u32.to_le_bytes());
+        descriptor[4..8].copy_from_slice(&634_432u32.to_le_bytes());
+        let clean = vec![0u8; 590_896];
+        let error = calculate_checksum2(&descriptor, &clean, 0, 0).expect_err("range must fail");
+        assert!(matches!(
+            error,
+            crate::Error::BufferRangeOutOfBounds {
+                operation: crate::BufferOperation::Read,
+                offset: 448,
+                size: 634_432,
+                buffer_len: 590_896,
+            }
+        ));
     }
 }

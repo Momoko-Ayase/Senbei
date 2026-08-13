@@ -150,6 +150,16 @@ pub enum UnpackError {
     },
 
     #[error(
+        "EXE checksum descriptor at 0x{descriptor:08X} points outside input (offset {offset}, size {size}, input length {image_len})"
+    )]
+    ExeChecksumRangeOutOfBounds {
+        descriptor: u32,
+        offset: usize,
+        size: usize,
+        image_len: usize,
+    },
+
+    #[error(
         "{table} descriptor out of bounds (offset {offset}, size 16, image length {image_len})"
     )]
     DescriptorOutOfBounds {
