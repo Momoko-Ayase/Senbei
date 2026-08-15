@@ -1874,70 +1874,199 @@ pub(crate) fn decrypt_and_decompress_data(
 // (0x40327253) yet require different shifts, so the only reliable discriminator
 // is the .text content itself.
 //
-// Detection scoring formula: for each candidate shift, replay decrypt_data8
-// across a few sample pages (25/50/75% of .text) and count how many of the 255
-// mutated positions become 0xCC — the MSVC int3 padding byte. The correct shift
-// hits int3 pads disproportionately often (~3-10x the baseline), so the
-// highest-scoring shift wins. If neither shift clears 2x the baseline, .text
-// is already plaintext → skip (return 99).
+// Detection replays the three candidate states — no dd8 (already plaintext),
+// shift 0, shift 15 — over a few sample pages (head/tail margin skipped:
+// entry/exit regions have atypical padding density) and picks the state whose
+// decoded pages look most like real x64 code. The primary signal is a
+// *structural* fingerprint: the MSVC function-end padding pattern, a 0xC3 RET
+// opcode followed by a run of >= 4 0xCC int3 bytes. dd8 XORs one pseudo-random
+// byte per 16-byte block, so an already-plaintext page keeps its padding runs
+// only under "no dd8", while a packer-encrypted page restores them only under
+// the correct shift — a wrong candidate destroys every run it touches and
+// essentially never manufactures a RET followed by a long int3 run by chance.
+// This separates the states far more cleanly than a bare 0xCC count, which a
+// wrong candidate inflates for free (~255 coincidences per page at p=1/256).
+//
+// When no candidate produces any RET-anchored padding (sampled pages with
+// dense code and no padded epilogues), the fingerprint is silent, so the
+// decision falls back to the older mutated-position 0xCC count. Both signals
+// use the same decision rule: a candidate must beat the no-dd8 baseline by a
+// clear 2x margin AND an absolute floor, otherwise dd8 is skipped — a wrongly
+// applied dd8 scrambles ~1 byte per 16 with no error surfaced downstream.
 //
 // This replaces an earlier entry-stub oracle that matched the 14 fixed CRT-stub
 // bytes at the AEP. That oracle false-positived on a newer EXE-64 build: dd8
 // corrupted only the call rel32 (bytes 5-8, the wildcard region), so the stub
 // matched under BOTH shifts and the selector defaulted to 0 when the truth was
-// 15. The 0xCC statistic samples hundreds of positions per page and is not
-// fooled by a stub whose fixed bytes happen to survive.
+// 15. A whole-page padding statistic samples hundreds of positions per page
+// and is not fooled by a stub whose fixed bytes happen to survive.
 // ---------------------------------------------------------------------------
+
+/// Minimum 0xCC run length after a RET for the run to count as MSVC
+/// function-end padding.
+const MIN_CC_RUN: u32 = 4;
+
+/// Total length of MSVC function-end padding runs in a page: each 0xC3 byte
+/// followed by >= [`MIN_CC_RUN`] 0xCC bytes contributes the run length.
+fn ret_int3_score(page: &[u8]) -> u32 {
+    let mut total = 0u32;
+    let mut i = 0;
+    while i < page.len() {
+        if page[i] == 0xC3 {
+            let mut j = i + 1;
+            while j < page.len() && page[j] == 0xCC {
+                j += 1;
+            }
+            let run = (j - i - 1) as u32;
+            if run >= MIN_CC_RUN {
+                total += run;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    total
+}
+
+/// Replay the dd8 page-XOR in place on one sample page.
+fn dd8_apply(buf: &mut [u8; 0x1000], abs_page: u32, shift: u32) {
+    let mut key = abs_page << shift;
+    for bi in 0..256u32 {
+        let mixed = key.rotate_right(15).wrapping_add(bi);
+        key = mixed.wrapping_add(bi);
+        // The packer's dd8 loop does not XOR block i=0 (see decrypt_data8).
+        if bi == 0 {
+            continue;
+        }
+        let tidx = (bi.wrapping_mul(16).wrapping_add(mixed & 0xF)) as usize;
+        buf[tidx] ^= key as u8;
+    }
+}
+
+/// Sum the RET+int3 fingerprint over the sample pages for one candidate
+/// (`None` = the no-dd8 baseline, page as-is).
+fn fingerprint_score(
+    data: &[u8],
+    text_off: usize,
+    abs_base: u32,
+    sample_pages: &[u32],
+    shift: Option<u32>,
+) -> u32 {
+    let mut total = 0u32;
+    for &sp in sample_pages {
+        let pg_off = text_off + (sp as usize) * 0x1000;
+        if pg_off + 0x1000 > data.len() {
+            continue;
+        }
+        let mut page = [0u8; 0x1000];
+        page.copy_from_slice(&data[pg_off..pg_off + 0x1000]);
+        if let Some(sh) = shift {
+            dd8_apply(&mut page, abs_base.wrapping_add(sp), sh);
+        }
+        total += ret_int3_score(&page);
+    }
+    total
+}
+
 pub(crate) fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, _info3: u32) -> u32 {
-    if text_size < 0x1000 {
+    let num_pages_total = text_size >> 12;
+    // Fewer than two pages: nothing meaningful to sample; preserve the
+    // historical behavior (shift 0 — the dd8 loop is empty or single-page).
+    if num_pages_total < 2 {
         return 0;
     }
     let text_off = text_va as usize;
-    let num_pages_total = text_size >> 12;
 
-    // Sample pages at 25/50/75% of .text, falling back to the midpoint for tiny
-    // sections.
+    // Sample up to 4 pages, skipping a head/tail margin. Small .text: sample
+    // every page.
     let mut sample_pages: Vec<u32> = Vec::new();
-    for frac in [0.25f64, 0.5, 0.75] {
-        let pg = (num_pages_total as f64 * frac) as u32;
-        if pg > 0 && pg < num_pages_total {
-            sample_pages.push(pg);
+    if num_pages_total <= 4 {
+        sample_pages.extend(0..num_pages_total);
+    } else {
+        let margin = (num_pages_total / 8).max(1);
+        let lo = margin;
+        let hi = num_pages_total - margin;
+        if hi <= lo {
+            sample_pages.extend(0..num_pages_total);
+        } else {
+            let step = ((hi - lo) / 4).max(1);
+            let mut i = 0;
+            while i < 4 {
+                let p = lo + i * step;
+                if p < num_pages_total {
+                    sample_pages.push(p);
+                }
+                i += 1;
+            }
         }
-    }
-    if sample_pages.is_empty() && num_pages_total > 1 {
-        sample_pages.push(num_pages_total / 2);
     }
     if sample_pages.is_empty() {
         return 0;
     }
 
-    let none_hits = score_dd8_baseline(data, text_off, &sample_pages);
-    let s0 = score_dd8_shift(data, text_off, text_va, &sample_pages, 0);
-    let s15 = score_dd8_shift(data, text_off, text_va, &sample_pages, 15);
-    let mut best_score = none_hits;
-    let mut best_shift = 99u32; // 99 == skip dd8
-    for (shift, hits) in [(0u32, s0), (15u32, s15)] {
-        if hits > best_score {
-            best_score = hits;
-            best_shift = shift;
-        }
-    }
+    let abs_base = text_va >> 12;
     // Require a clear 2x margin over the already-plaintext baseline AND an
-    // absolute floor. The 2x test alone
-    // trips on noise when the counts are tiny: an external-companion DLL whose
-    // .text is already plaintext scores s15=4 vs none=1 — a spurious 4x — and
-    // gets dd8 wrongly applied, corrupting ~1 byte per 16. Across the whole
-    // golden corpus every build that genuinely needs dd8 scores >= 10 (lowest
-    // observed scores at 10-12; up to 107), so a floor of 8 rejects the noise
-    // while keeping every golden's shift selection unchanged.
+    // absolute floor. The 2x test alone trips on noise when the counts are
+    // tiny: an external-companion DLL whose .text is already plaintext scores
+    // s15=4 vs none=1 — a spurious 4x — and gets dd8 wrongly applied,
+    // corrupting ~1 byte per 16. The floor rejects that noise while sitting
+    // far below every genuinely-encrypted build's score.
     const MIN_DD8_HITS: u32 = 8;
-    if best_shift != 99 && (best_score < none_hits * 2 || best_score < MIN_DD8_HITS) {
-        best_shift = 99;
-    }
+    let margin_pick = |none: u32, s0: u32, s15: u32| -> u32 {
+        let mut best_score = none;
+        let mut best_shift = 99u32; // 99 == skip dd8
+        for (shift, hits) in [(0u32, s0), (15u32, s15)] {
+            if hits > best_score {
+                best_score = hits;
+                best_shift = shift;
+            }
+        }
+        if best_shift != 99 && (best_score < none * 2 || best_score < MIN_DD8_HITS) {
+            best_shift = 99;
+        }
+        best_shift
+    };
+
+    // Primary: RET+int3 padding fingerprint. The fingerprint is diluted across
+    // the whole page (dd8 touches only 255 of 4096 bytes, so even an encrypted
+    // page keeps most of its padding runs), so instead of the fallback's 2x
+    // margin the gate is a *positive delta* over the no-dd8 baseline: on an
+    // already-plaintext .text each wrong shift destroys runs (scores below the
+    // baseline), while the correct shift on an encrypted page restores them
+    // (scores above it). The floor on the delta rejects noise-level gains.
+    let r_none = fingerprint_score(data, text_off, abs_base, &sample_pages, None);
+    let r0 = fingerprint_score(data, text_off, abs_base, &sample_pages, Some(0));
+    let r15 = fingerprint_score(data, text_off, abs_base, &sample_pages, Some(15));
+    // Fallback: mutated-position 0xCC count, for pages whose code has no
+    // RET-anchored padding at all (the fingerprint is silent there).
+    let (none_hits, s0, s15);
+    let best_shift = if r_none != 0 || r0 != 0 || r15 != 0 {
+        none_hits = 0;
+        s0 = 0;
+        s15 = 0;
+        let mut best_score = r_none;
+        let mut shift = 99u32;
+        for (s, score) in [(0u32, r0), (15u32, r15)] {
+            if score > best_score {
+                best_score = score;
+                shift = s;
+            }
+        }
+        if shift != 99 && best_score.saturating_sub(r_none) < MIN_DD8_HITS {
+            shift = 99;
+        }
+        shift
+    } else {
+        none_hits = score_dd8_baseline(data, text_off, &sample_pages);
+        s0 = score_dd8_shift(data, text_off, text_va, &sample_pages, 0);
+        s15 = score_dd8_shift(data, text_off, text_va, &sample_pages, 15);
+        margin_pick(none_hits, s0, s15)
+    };
     if std::env::var("SEL_DIAG").is_ok() {
         eprintln!(
-            "SEL dd8 best_shift={} s0={} s15={} none_hits={} samples={:?}",
-            best_shift, s0, s15, none_hits, sample_pages
+            "SEL dd8 best_shift={} fp=({},{},{}) cc=({},{},{}) samples={:?}",
+            best_shift, r_none, r0, r15, none_hits, s0, s15, sample_pages
         );
     }
     best_shift
