@@ -1,6 +1,6 @@
 [package]
 name = "senbei"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Static unpacker for Crackproof-protected PE files"
 license = "AGPL-3.0-only"

@@ -1,6 +1,6 @@
 [package]
 name = "senbei-web"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "WebAssembly browser frontend for senbei"
 license = "AGPL-3.0-only"
