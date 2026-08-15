@@ -28,6 +28,15 @@ target\release\senbei-android.exe
 
 ## 还原 libil2cpp.so
 
+先直接从受保护 SO 静态提取 Stage 1/Stage 2 和模块索引：
+
+```powershell
+senbei-android extract-stage2 INPUT OUTPUT_DIR
+```
+
+默认在 `OUTPUT_DIR` 写入紧凑的 `index.json` 及后续还原实际需要的模块产物；
+需要保留完整 Stage 2 镜像用于分析时，额外传入 `--stage2-out FILE`。
+
 ```powershell
 senbei-android restore-so INPUT OUTPUT --index INDEX_JSON --report REPORT_JSON
 ```
@@ -74,7 +83,23 @@ senbei-android restore-metadata `
 ```
 
 可用 `--seed 0xA6FAE968` 显式指定十六进制 seed，也支持十进制。还原操作是
-幂等的：已规范化的 image 会保持不变。
+幂等的，并严格先检测状态、再决定是否解密：
+
+- 先验证 metadata magic、版本、表边界、MethodDef token 类型与完整归属关系。
+- 所有 image 的 RID 已规范时报告 `encryption_status: "clean"`，不执行逆置换，
+  输出与输入逐字节一致。
+- 存在非规范 RID 时，必须先确认它们构成合法置换，并让指定 seed 对所有 image
+  完整通过五轮逆置换校验；只有此时才报告 `encryption_status: "encrypted"` 并写出结果。
+- seed 错误、算法变化或数据损坏会直接报错，不生成输出文件和报告。
+
+不确定样本 seed 时可先执行只读诊断：
+
+```powershell
+senbei-android discover-metadata INPUT
+```
+
+该命令不会修改文件，会列出每个 image 的状态、seed residue 以及满足当前 v31
+算法的 32 位 seed 候选。
 
 ## Workspace
 

@@ -25,6 +25,7 @@ const METHOD_TOKEN_TABLE: u32 = 0x0600_0000;
 pub struct Report {
     pub version: u32,
     pub seed: String,
+    pub encryption_status: String,
     pub images: usize,
     pub images_with_methods: usize,
     pub types: usize,
@@ -34,6 +35,26 @@ pub struct Report {
     pub correct_after: usize,
     pub changed_tokens: usize,
     pub transformed_images: usize,
+}
+
+/// Per-image constraints recovered from the encrypted MethodDef RID
+/// permutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageKeyDiscovery {
+    pub image: usize,
+    pub method_count: u32,
+    pub modulus: u32,
+    pub clean: bool,
+    pub seed_residues: Vec<u32>,
+}
+
+/// Result of statically testing the known five-round permutation against a
+/// metadata file without assuming a seed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeedDiscoveryReport {
+    pub version: u32,
+    pub images: Vec<ImageKeyDiscovery>,
+    pub seed_candidates: Vec<u32>,
 }
 
 /// Metadata parsing or validation failure.
@@ -318,6 +339,11 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
         Report {
             version,
             seed: format!("0x{seed:08X}"),
+            encryption_status: if changed_tokens == 0 {
+                "clean".to_owned()
+            } else {
+                "encrypted".to_owned()
+            },
             images: image_count,
             images_with_methods,
             types: type_count,
@@ -329,6 +355,199 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
             transformed_images,
         },
     ))
+}
+
+/// Discover seeds compatible with the known v31 five-round RID permutation.
+///
+/// This is diagnostic and does not modify metadata. It enumerates the only
+/// possible per-image key residues and intersects them over the 32-bit seed
+/// domain. An empty candidate list means that the sample changed the
+/// permutation itself rather than merely embedding a different seed.
+pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
+    if read_u32(data, 0).ok() != Some(MAGIC) {
+        return Err(Error::NotMetadata);
+    }
+    let version = read_u32(data, 4)?;
+    if version != SUPPORTED_VERSION {
+        return Ok(SeedDiscoveryReport {
+            version,
+            images: Vec::new(),
+            seed_candidates: Vec::new(),
+        });
+    }
+    let (method_offset, method_size) = table(data, HDR_METHODS)?;
+    let (type_offset, type_size) = table(data, HDR_TYPES)?;
+    let (image_offset, image_size) = table(data, HDR_IMAGES)?;
+    if method_size % METHOD_STRIDE != 0
+        || type_size % TYPE_STRIDE != 0
+        || image_size % IMAGE_STRIDE != 0
+    {
+        return malformed("v31 table size is not divisible by its entry stride");
+    }
+    let method_count = method_size / METHOD_STRIDE;
+    let type_count = type_size / TYPE_STRIDE;
+    let image_count = image_size / IMAGE_STRIDE;
+    let mut reports = Vec::with_capacity(image_count);
+    for image_index in 0..image_count {
+        let image_base = image_offset + image_index * IMAGE_STRIDE;
+        let type_start = usize::try_from(read_i32(data, image_base + IMAGE_TYPE_START_OFFSET)?)
+            .map_err(|_| Error::Malformed(format!("image {image_index} has negative typeStart")))?;
+        let type_entries = read_u32(data, image_base + IMAGE_TYPE_COUNT_OFFSET)? as usize;
+        let type_end = type_start
+            .checked_add(type_entries)
+            .ok_or_else(|| Error::Malformed("image type range overflow".to_owned()))?;
+        if type_end > type_count {
+            return malformed(format!("image {image_index} type range exceeds the table"));
+        }
+        let mut methods = Vec::new();
+        for type_index in type_start..type_end {
+            let type_base = type_offset + type_index * TYPE_STRIDE;
+            let method_entries = read_u16(data, type_base + TYPE_METHOD_COUNT_OFFSET)? as usize;
+            if method_entries == 0 {
+                continue;
+            }
+            let method_start =
+                usize::try_from(read_i32(data, type_base + TYPE_METHOD_START_OFFSET)?).map_err(
+                    |_| Error::Malformed(format!("type {type_index} has negative methodStart")),
+                )?;
+            let method_end = method_start
+                .checked_add(method_entries)
+                .ok_or_else(|| Error::Malformed("type method range overflow".to_owned()))?;
+            if method_end > method_count {
+                return malformed(format!("type {type_index} method range exceeds the table"));
+            }
+            methods.extend(method_start..method_end);
+        }
+        if methods.is_empty() {
+            reports.push(ImageKeyDiscovery {
+                image: image_index,
+                method_count: 0,
+                modulus: 0,
+                clean: true,
+                seed_residues: Vec::new(),
+            });
+            continue;
+        }
+        let method_base = *methods
+            .iter()
+            .min()
+            .ok_or_else(|| Error::Malformed("image method minimum is missing".to_owned()))?;
+        let method_last = *methods
+            .iter()
+            .max()
+            .ok_or_else(|| Error::Malformed("image method maximum is missing".to_owned()))?;
+        if method_last - method_base + 1 != methods.len() {
+            return validation(format!(
+                "image {image_index} method block is not contiguous"
+            ));
+        }
+        let mut values = Vec::with_capacity(methods.len());
+        let mut clean = true;
+        for method_index in methods {
+            let token = read_u32(
+                data,
+                method_offset + method_index * METHOD_STRIDE + METHOD_TOKEN_OFFSET,
+            )?;
+            if token & 0xff00_0000 != METHOD_TOKEN_TABLE {
+                return validation(format!(
+                    "method {method_index} has non-MethodDef token 0x{token:08x}"
+                ));
+            }
+            let expected = u32::try_from(method_index - method_base + 1)
+                .map_err(|_| Error::Validation("local method RID exceeds u32".to_owned()))?;
+            let rid = token & 0x00ff_ffff;
+            clean &= rid == expected;
+            values.push((rid, expected));
+        }
+        let count = u32::try_from(values.len())
+            .map_err(|_| Error::Validation("image method count exceeds u32".to_owned()))?;
+        if clean {
+            reports.push(ImageKeyDiscovery {
+                image: image_index,
+                method_count: count,
+                modulus: count / 2,
+                clean,
+                seed_residues: Vec::new(),
+            });
+            continue;
+        }
+        let low = values
+            .iter()
+            .map(|(rid, _)| *rid)
+            .min()
+            .ok_or_else(|| Error::Validation("image has no encrypted RID".to_owned()))?;
+        let high = values
+            .iter()
+            .map(|(rid, _)| *rid)
+            .max()
+            .ok_or_else(|| Error::Validation("image has no encrypted RID".to_owned()))?;
+        if high - low + 1 != count || count < 2 {
+            return validation(format!(
+                "image {image_index} RID interval is not a permutation"
+            ));
+        }
+        let half = count / 2;
+        let quarter = count / 4;
+        let mut residues = Vec::new();
+        for key_delta in 0..half {
+            let key = quarter + key_delta;
+            let valid = values
+                .iter()
+                .all(|(rid, expected)| decrypt_rid_with_key(*rid, low, high, key) == *expected);
+            if valid {
+                residues.push(key_delta);
+            }
+        }
+        reports.push(ImageKeyDiscovery {
+            image: image_index,
+            method_count: count,
+            modulus: half,
+            clean,
+            seed_residues: residues,
+        });
+    }
+
+    let constraints = reports
+        .iter()
+        .filter(|report| !report.clean)
+        .collect::<Vec<_>>();
+    let mut seeds = Vec::new();
+    if let Some(anchor) = constraints.iter().max_by_key(|report| report.modulus) {
+        for &residue in &anchor.seed_residues {
+            let mut candidate = u64::from(residue);
+            let modulus = u64::from(anchor.modulus);
+            while candidate <= u64::from(u32::MAX) {
+                let valid = constraints.iter().all(|report| {
+                    report.modulus != 0
+                        && !report.seed_residues.is_empty()
+                        && report
+                            .seed_residues
+                            .iter()
+                            .any(|&value| candidate % u64::from(report.modulus) == u64::from(value))
+                });
+                if valid {
+                    seeds.push(candidate as u32);
+                }
+                candidate = candidate.saturating_add(modulus);
+            }
+        }
+    }
+    seeds.sort_unstable();
+    seeds.dedup();
+    Ok(SeedDiscoveryReport {
+        version,
+        images: reports,
+        seed_candidates: seeds,
+    })
+}
+
+fn decrypt_rid_with_key(rid: u32, low: u32, high: u32, key: u32) -> u32 {
+    let count = high - low + 1;
+    let mut value = rid - low;
+    for _ in 0..5 {
+        value = inverse_round(value, count, key);
+    }
+    value + low
 }
 
 #[cfg(test)]
@@ -394,6 +613,8 @@ mod tests {
         let (data, methods) = build(&tokens);
         let (restored, report) =
             restore_method_tokens(&data, DEFAULT_METHOD_TOKEN_SEED).expect("restore");
+        assert_eq!(report.encryption_status, "encrypted");
+        assert!(report.changed_tokens > 0);
         assert_eq!(report.correct_after, 7);
         for index in 0..7 {
             assert_eq!(
@@ -415,7 +636,24 @@ mod tests {
         let (data, _) = build(&tokens);
         let (restored, report) =
             restore_method_tokens(&data, DEFAULT_METHOD_TOKEN_SEED).expect("restore");
+        assert_eq!(report.encryption_status, "clean");
         assert_eq!(report.changed_tokens, 0);
         assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn encrypted_metadata_rejects_the_wrong_seed() {
+        let tokens = (1..=7)
+            .map(|expected| {
+                METHOD_TOKEN_TABLE | encrypted_rid(expected, 7, DEFAULT_METHOD_TOKEN_SEED)
+            })
+            .collect::<Vec<_>>();
+        let (data, _) = build(&tokens);
+        let wrong_seed = DEFAULT_METHOD_TOKEN_SEED.wrapping_add(1);
+
+        assert!(matches!(
+            restore_method_tokens(&data, wrong_seed),
+            Err(Error::Validation(_))
+        ));
     }
 }

@@ -2,7 +2,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use senbei_android_io::{RestoreMetadataJob, RestoreSoJob, run_restore_metadata, run_restore_so};
+use senbei_android_io::{
+    ExtractStage2Job, RestoreMetadataJob, RestoreSoJob, run_extract_stage2, run_restore_metadata,
+    run_restore_so,
+};
 
 fn main() -> std::process::ExitCode {
     match run(std::env::args_os().skip(1)) {
@@ -24,6 +27,8 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
     match command.as_ref() {
         "restore-so" => restore_so(args.collect()),
         "restore-metadata" => restore_metadata(args.collect()),
+        "discover-metadata" => discover_metadata(args.collect()),
+        "extract-stage2" => extract_stage2(args.collect()),
         "-h" | "--help" => {
             print_help();
             Ok(())
@@ -34,6 +39,87 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<()> {
         }
         _ => bail!("unknown command `{command}`; use --help for usage"),
     }
+}
+
+fn discover_metadata(args: Vec<OsString>) -> Result<()> {
+    let mut positional = Vec::new();
+    for value in args {
+        if value == "-h" || value == "--help" {
+            println!("senbei-android discover-metadata INPUT");
+            return Ok(());
+        }
+        if value.to_string_lossy().starts_with('-') {
+            bail!(
+                "unknown discover-metadata option `{}`",
+                value.to_string_lossy()
+            );
+        }
+        positional.push(PathBuf::from(value));
+    }
+    let [input] = positional.as_slice() else {
+        bail!("discover-metadata requires INPUT; use --help for usage");
+    };
+    let data =
+        std::fs::read(input).with_context(|| format!("read metadata `{}`", input.display()))?;
+    let report = senbei_android_metadata::discover_method_token_seeds(&data)
+        .with_context(|| format!("discover metadata seed `{}`", input.display()))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn extract_stage2(args: Vec<OsString>) -> Result<()> {
+    let mut positional = Vec::new();
+    let mut stage2_output = None;
+    let mut outer_size = senbei_android_stage2::DEFAULT_OUTER_SIZE;
+    let mut cipher_constant = senbei_android_stage2::DEFAULT_CIPHER_CONSTANT;
+    let mut cursor = 0;
+    while cursor < args.len() {
+        match args[cursor].to_string_lossy().as_ref() {
+            "--stage2-out" => {
+                stage2_output = Some(option_path(&args, &mut cursor, "--stage2-out")?);
+            }
+            "--outer-size" => {
+                let value = option_string(&args, &mut cursor, "--outer-size")?;
+                outer_size = usize::try_from(parse_u64(&value)?)
+                    .with_context(|| format!("invalid --outer-size `{value}`"))?;
+            }
+            "--cipher-constant" => {
+                let value = option_string(&args, &mut cursor, "--cipher-constant")?;
+                cipher_constant = parse_u32(&value)
+                    .with_context(|| format!("invalid --cipher-constant `{value}`"))?;
+            }
+            "-h" | "--help" => {
+                print_extract_help();
+                return Ok(());
+            }
+            option if option.starts_with('-') => {
+                bail!("unknown extract-stage2 option `{option}");
+            }
+            _ => positional.push(PathBuf::from(&args[cursor])),
+        }
+        cursor += 1;
+    }
+    let [input, output_dir] = positional.as_slice() else {
+        bail!("extract-stage2 requires INPUT and OUTPUT_DIR; use --help for usage");
+    };
+    let mut job = ExtractStage2Job::new(input.clone(), output_dir.clone());
+    job.stage2_output = stage2_output;
+    job.outer_size = outer_size;
+    job.cipher_constant = cipher_constant;
+    let result = run_extract_stage2(&job)?;
+    let module_images = result
+        .module_registry
+        .iter()
+        .filter(|module| module.classification == "module_image")
+        .count();
+    println!(
+        "Extracted {} streams, {} modules and {} compact artifacts",
+        result.streams.len(),
+        module_images,
+        result.artifacts.len()
+    );
+    println!("Index {}", output_dir.join("index.json").display());
+    Ok(())
 }
 
 fn restore_so(args: Vec<OsString>) -> Result<()> {
@@ -112,8 +198,11 @@ fn restore_metadata(args: Vec<OsString>) -> Result<()> {
         report,
     })?;
     println!(
-        "Restored {}/{} MethodDef tokens ({} already canonical)",
-        result.changed_tokens, result.methods, result.already_correct_before
+        "Metadata status={} restored {}/{} MethodDef tokens ({} already canonical)",
+        result.encryption_status,
+        result.changed_tokens,
+        result.methods,
+        result.already_correct_before
     );
     Ok(())
 }
@@ -133,11 +222,15 @@ fn option_string(args: &[OsString], cursor: &mut usize, name: &str) -> Result<St
 }
 
 fn parse_u32(value: &str) -> Result<u32> {
+    Ok(u32::try_from(parse_u64(value)?)?)
+}
+
+fn parse_u64(value: &str) -> Result<u64> {
     if let Some(hex) = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
     {
-        Ok(u32::from_str_radix(hex, 16)?)
+        Ok(u64::from_str_radix(hex, 16)?)
     } else {
         Ok(value.parse()?)
     }
@@ -148,7 +241,16 @@ fn print_help() {
     println!("Usage:");
     println!("  senbei-android restore-so INPUT OUTPUT [OPTIONS]");
     println!("  senbei-android restore-metadata INPUT OUTPUT [OPTIONS]");
+    println!("  senbei-android discover-metadata INPUT");
+    println!("  senbei-android extract-stage2 INPUT OUTPUT_DIR [OPTIONS]");
     println!("  senbei-android --version");
+}
+
+fn print_extract_help() {
+    println!("senbei-android extract-stage2 INPUT OUTPUT_DIR [OPTIONS]");
+    println!("  --stage2-out FILE          Write the raw decrypted Stage 2 image");
+    println!("  --outer-size VALUE         Stage 1 outer wrapper size (default 0x23C)");
+    println!("  --cipher-constant VALUE    Stage 1 cipher constant (default 0xBF20165D)");
 }
 
 fn print_so_help() {

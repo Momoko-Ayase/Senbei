@@ -103,6 +103,18 @@ pub struct Module9bConfig {
 impl Module9bConfig {
     /// Parse the unique AES-256 decryption schedule and adjacent configuration.
     pub fn parse(image: &[u8]) -> Result<Self> {
+        Self::parse_inner(image, true)
+    }
+
+    /// Parse the decoder configuration embedded in the raw Stage 2 image.
+    ///
+    /// The embedded decoder ends before the interpreter-only `skip_aes`
+    /// field, so that flag is definitionally false for this layout.
+    pub fn parse_embedded(image: &[u8]) -> Result<Self> {
+        Self::parse_inner(image, false)
+    }
+
+    fn parse_inner(image: &[u8], has_skip_aes: bool) -> Result<Self> {
         const MARKER: [u8; 4] = [0x00, 0x01, 0x0e, 0x00];
         let mut matches = image
             .windows(MARKER.len())
@@ -117,7 +129,7 @@ impl Module9bConfig {
 
         let header_seed = read_u32(image, schedule_offset - 8)?;
         let schedule_size = read_u32(image, schedule_offset - 4)?;
-        if schedule_size != 0xf4 {
+        if !matches!(schedule_size, 0 | 0xf4) {
             return invalid(format!(
                 "unexpected 0x9B AES schedule size 0x{schedule_size:x}"
             ));
@@ -148,16 +160,24 @@ impl Module9bConfig {
         let container_seed_offset = schedule_offset
             .checked_add(0x100)
             .ok_or_else(|| Error::Invalid("container seed offset overflow".to_owned()))?;
-        let skip_aes_offset = schedule_offset
-            .checked_add(0x240)
-            .ok_or_else(|| Error::Invalid("skip-AES offset overflow".to_owned()))?;
-        let skip_aes = *image.get(skip_aes_offset).ok_or_else(|| {
-            Error::Invalid("0x9B static configuration exceeds its image".to_owned())
-        })? != 0;
+        let skip_aes = if has_skip_aes {
+            let skip_aes_offset = schedule_offset
+                .checked_add(0x240)
+                .ok_or_else(|| Error::Invalid("skip-AES offset overflow".to_owned()))?;
+            *image.get(skip_aes_offset).ok_or_else(|| {
+                Error::Invalid("module static configuration exceeds its image".to_owned())
+            })? != 0
+        } else {
+            false
+        };
 
         Ok(Self {
             header_seed,
-            container_seed: read_u32(image, container_seed_offset)?,
+            container_seed: if has_skip_aes {
+                read_u32(image, container_seed_offset)?
+            } else {
+                header_seed
+            },
             aes_key,
             skip_aes,
             schedule_offset,
@@ -570,6 +590,105 @@ pub fn transform_segment(
         }
     }
     Ok(transformed)
+}
+
+/// Decode one complete protector container into its flat output buffer.
+///
+/// This is the static equivalent of the decoder entrypoint embedded in Stage
+/// 2 and in each nested interpreter module.
+pub fn decode_container(
+    data: &[u8],
+    config: &Module9bConfig,
+    expected_size: usize,
+) -> Result<Vec<u8>> {
+    let header = ContainerHeader::parse(data, 0, config.container_seed)?;
+    let header_size = usize::try_from(header.output_size)
+        .map_err(|_| Error::Invalid("container output size exceeds usize".to_owned()))?;
+    if header_size != expected_size {
+        return invalid(format!(
+            "container output size 0x{header_size:x} != expected 0x{expected_size:x}"
+        ));
+    }
+    let decoder = HuffmanLzDecoder::new(&header.tree)?;
+    let decrypt_aes = !(config.skip_aes || header.skip_aes);
+    let mut output = vec![0_u8; expected_size];
+
+    for (segment_index, encoded) in header.segments.iter().enumerate() {
+        let start = header
+            .start
+            .checked_add(encoded.offset as usize)
+            .ok_or_else(|| Error::Invalid("encoded segment start overflow".to_owned()))?;
+        let encoded_data = range(data, start, encoded.size as usize)?;
+        let transformed = transform_segment(
+            encoded_data,
+            config.container_seed,
+            &config.aes_key,
+            decrypt_aes,
+        )?;
+        if transformed.len() < 16 {
+            return invalid(format!(
+                "decoded segment {segment_index} is shorter than its header"
+            ));
+        }
+        let base_offset = read_u32(&transformed, 0)? as usize;
+        let writer_count = read_u32(&transformed, 4)? as usize;
+        let table_offset = read_u32(&transformed, 8)? as usize;
+        let data_offset = read_u32(&transformed, 12)? as usize;
+        let table_size = writer_count
+            .checked_mul(16)
+            .ok_or_else(|| Error::Invalid("writer table size overflow".to_owned()))?;
+        let table_end = table_offset
+            .checked_add(table_size)
+            .ok_or_else(|| Error::Invalid("writer table end overflow".to_owned()))?;
+        if table_end > transformed.len() || data_offset > transformed.len() {
+            return invalid(format!(
+                "decoded segment {segment_index} has invalid writer offsets"
+            ));
+        }
+
+        let mut data_cursor = data_offset;
+        for writer_index in 0..writer_count {
+            let record =
+                table_offset
+                    .checked_add(writer_index.checked_mul(16).ok_or_else(|| {
+                        Error::Invalid("writer record offset overflow".to_owned())
+                    })?)
+                    .ok_or_else(|| Error::Invalid("writer record offset overflow".to_owned()))?;
+            let output_offset = read_u32(&transformed, record)? as usize;
+            let output_size = read_u32(&transformed, record + 4)? as usize;
+            let encoded_size = read_u32(&transformed, record + 8)? as usize;
+            let reserved = read_u32(&transformed, record + 12)?;
+            let encoded_end = data_cursor
+                .checked_add(encoded_size)
+                .ok_or_else(|| Error::Invalid("writer data end overflow".to_owned()))?;
+            if reserved != 0 || encoded_end > transformed.len() {
+                return invalid(format!(
+                    "segment {segment_index} writer {writer_index} has invalid bounds"
+                ));
+            }
+            let source = &transformed[data_cursor..encoded_end];
+            let decoded = if encoded_size == output_size {
+                None
+            } else {
+                Some(decoder.decode(source, output_size)?)
+            };
+            let decoded = decoded.as_deref().unwrap_or(source);
+            let target = base_offset
+                .checked_add(output_offset)
+                .ok_or_else(|| Error::Invalid("writer target offset overflow".to_owned()))?;
+            let target_end = target
+                .checked_add(decoded.len())
+                .ok_or_else(|| Error::Invalid("writer target end overflow".to_owned()))?;
+            let destination = output.get_mut(target..target_end).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "segment {segment_index} writer {writer_index} target is out of range"
+                ))
+            })?;
+            destination.copy_from_slice(decoded);
+            data_cursor = encoded_end;
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

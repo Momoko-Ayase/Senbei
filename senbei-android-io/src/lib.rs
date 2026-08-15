@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use senbei_android_elf::{RestoreOptions, RestoreReport, restore_libil2cpp};
 use senbei_android_metadata::{DEFAULT_METHOD_TOKEN_SEED, Report as MetadataReport};
+use senbei_android_stage2::{
+    DEFAULT_CIPHER_CONSTANT, DEFAULT_OUTER_SIZE, ExtractOptions, ExtractionReport, extract_stage2,
+};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
@@ -28,6 +31,29 @@ pub struct RestoreMetadataJob {
     pub output: PathBuf,
     pub seed: u32,
     pub report: Option<PathBuf>,
+}
+
+/// Filesystem arguments for pure-static Stage 1 and Stage 2 extraction.
+#[derive(Debug, Clone)]
+pub struct ExtractStage2Job {
+    pub input: PathBuf,
+    pub output_dir: PathBuf,
+    pub stage2_output: Option<PathBuf>,
+    pub outer_size: usize,
+    pub cipher_constant: u32,
+}
+
+impl ExtractStage2Job {
+    #[must_use]
+    pub fn new(input: PathBuf, output_dir: PathBuf) -> Self {
+        Self {
+            input,
+            output_dir,
+            stage2_output: None,
+            outer_size: DEFAULT_OUTER_SIZE,
+            cipher_constant: DEFAULT_CIPHER_CONSTANT,
+        }
+    }
 }
 
 impl RestoreMetadataJob {
@@ -85,6 +111,18 @@ pub fn run_restore_metadata(job: &RestoreMetadataJob) -> Result<MetadataReport> 
         write_json_atomic(path, &result)?;
     }
     Ok(result)
+}
+
+/// Extract Stage 2 modules directly from one protected ELF.
+pub fn run_extract_stage2(job: &ExtractStage2Job) -> Result<ExtractionReport> {
+    extract_stage2(&ExtractOptions {
+        input: job.input.clone(),
+        output_dir: job.output_dir.clone(),
+        stage2_output: job.stage2_output.clone(),
+        outer_size: job.outer_size,
+        cipher_constant: job.cipher_constant,
+    })
+    .context("extract protected Stage 1/Stage 2 payload")
 }
 
 fn refuse_in_place(input: &Path, output: &Path) -> Result<()> {

@@ -437,12 +437,33 @@ impl AuxiliaryElfImage {
         let dynsym_end = u64::from(result.dynsym_offset)
             + u64::from(result.dynsym_count) * ELF64_SYMBOL_SIZE as u64;
         let dynstr_end = u64::from(result.dynstr_offset) + u64::from(result.dynstr_size);
-        if relocation1_end != u64::from(result.relocation2_offset)
-            || relocation2_end != u64::from(result.dynsym_offset)
+        let expected_relocation2 = align_up(relocation1_end, 0x10)?;
+        let expected_dynsym = align_up(relocation2_end, 0x10)?;
+        if expected_relocation2 != u64::from(result.relocation2_offset)
+            || expected_dynsym != u64::from(result.dynsym_offset)
             || dynsym_end != u64::from(result.dynstr_offset)
             || dynstr_end != data.len() as u64
         {
-            return invalid("auxiliary ELF tables are not contiguous");
+            return invalid(format!(
+                "auxiliary ELF layout mismatch: rela1_end=0x{relocation1_end:x}/rela2=0x{:x}, rela2_end=0x{relocation2_end:x}/dynsym=0x{:x}, dynsym_end=0x{dynsym_end:x}/dynstr=0x{:x}, dynstr_end=0x{dynstr_end:x}/size=0x{:x}",
+                result.relocation2_offset,
+                result.dynsym_offset,
+                result.dynstr_offset,
+                data.len()
+            ));
+        }
+        for (start, end) in [
+            (relocation1_end, expected_relocation2),
+            (relocation2_end, expected_dynsym),
+        ] {
+            if slice_u64(data, start, end - start)?
+                .iter()
+                .any(|&byte| byte != 0)
+            {
+                return invalid(format!(
+                    "auxiliary ELF alignment padding 0x{start:x}..0x{end:x} is nonzero"
+                ));
+            }
         }
         if result.dynsym_count < 2 {
             return invalid("auxiliary dynamic symbol table is empty");
@@ -537,9 +558,12 @@ fn restore_hidden_symbols(
         let target_offset = target_index as usize * ELF64_SYMBOL_SIZE;
         symbols[target_offset..target_offset + ELF64_SYMBOL_SIZE].copy_from_slice(source_symbol);
     }
-    if cursor != table_end {
+    let string_padding = patch_data.get(cursor..table_end).ok_or_else(|| {
+        Error::Invalid("0x9E symbol strings exceed the primary patch blob".to_owned())
+    })?;
+    if string_padding.len() > 3 || string_padding.iter().any(|&byte| byte != 0) {
         return invalid(format!(
-            "0x9E symbol strings end at 0x{cursor:x}, expected 0x{table_end:x}"
+            "0x9E symbol strings have invalid padding at 0x{cursor:x}..0x{table_end:x}"
         ));
     }
     let first_target_index = patched_indices
@@ -715,12 +739,11 @@ fn patch_dynamic_tags(
 }
 
 fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, usize>> {
-    const REQUIRED: [&str; 10] = [
+    const REQUIRED: [&str; 9] = [
         ".dynsym",
         ".gnu.version",
         ".gnu.version_r",
         ".gnu.hash",
-        ".hash",
         ".dynstr",
         ".rela.dyn",
         ".rela.plt",
@@ -741,6 +764,18 @@ fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, us
             [] => return invalid(format!("ELF lacks required section {required}")),
             _ => return invalid(format!("ELF contains duplicate section {required}")),
         }
+    }
+    let sysv_hash = names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| (name == ".hash").then_some(index))
+        .collect::<Vec<_>>();
+    match sysv_hash.as_slice() {
+        [index] => {
+            result.insert(".hash", *index);
+        }
+        [] => {}
+        _ => return invalid("ELF contains duplicate section .hash"),
     }
     Ok(result)
 }
@@ -811,9 +846,13 @@ fn materialize_static_elf_tables(
         merged_versions.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
     }
     let merged_names = dynamic_symbol_names(&merged_symbols, &merged_strings)?;
-    let sysv_hash = build_sysv_hash(&merged_names)?;
+    let sysv_hash = indices
+        .contains_key(".hash")
+        .then(|| build_sysv_hash(&merged_names))
+        .transpose()?;
     let gnu_hash_table = build_gnu_hash(&merged_names)?;
     let new_symbol_count = merged_names.len();
+    let new_dynstr_size = merged_strings.len();
 
     if rela_dyn.entry_size != ELF64_RELA_SIZE as u64
         || rela_plt.entry_size != ELF64_RELA_SIZE as u64
@@ -887,7 +926,7 @@ fn materialize_static_elf_tables(
         alignment: u64,
         data: Vec<u8>,
     }
-    let tables = vec![
+    let mut tables = vec![
         TablePayload {
             name: ".dynsym",
             alignment: 8,
@@ -908,11 +947,15 @@ fn materialize_static_elf_tables(
             alignment: 8,
             data: gnu_hash_table,
         },
-        TablePayload {
+    ];
+    if let Some(data) = sysv_hash {
+        tables.push(TablePayload {
             name: ".hash",
             alignment: 4,
-            data: sysv_hash,
-        },
+            data,
+        });
+    }
+    tables.extend([
         TablePayload {
             name: ".dynstr",
             alignment: 1,
@@ -928,7 +971,7 @@ fn materialize_static_elf_tables(
             alignment: 8,
             data: merged_rela_plt,
         },
-    ];
+    ]);
     let metadata_start = dynsym.offset;
     let mut cursor = metadata_start;
     let mut placements = BTreeMap::new();
@@ -981,24 +1024,23 @@ fn materialize_static_elf_tables(
     }
 
     let section_address = |name: &'static str| -> u64 { updated_sections[indices[name]].address };
-    patch_dynamic_tags(
-        output,
-        dynamic,
-        &BTreeMap::from([
-            (DT_PLTRELSZ, (rela_plt_count * ELF64_RELA_SIZE) as u64),
-            (DT_HASH, section_address(".hash")),
-            (DT_STRTAB, section_address(".dynstr")),
-            (DT_SYMTAB, section_address(".dynsym")),
-            (DT_RELA, section_address(".rela.dyn")),
-            (DT_RELASZ, (rela_dyn_count * ELF64_RELA_SIZE) as u64),
-            (DT_STRSZ, tables[5].data.len() as u64),
-            (DT_JMPREL, section_address(".rela.plt")),
-            (DT_GNU_HASH, section_address(".gnu.hash")),
-            (DT_VERSYM, section_address(".gnu.version")),
-            (DT_RELACOUNT, relative_count as u64),
-            (DT_VERNEED, section_address(".gnu.version_r")),
-        ]),
-    )?;
+    let mut dynamic_values = BTreeMap::from([
+        (DT_PLTRELSZ, (rela_plt_count * ELF64_RELA_SIZE) as u64),
+        (DT_STRTAB, section_address(".dynstr")),
+        (DT_SYMTAB, section_address(".dynsym")),
+        (DT_RELA, section_address(".rela.dyn")),
+        (DT_RELASZ, (rela_dyn_count * ELF64_RELA_SIZE) as u64),
+        (DT_STRSZ, new_dynstr_size as u64),
+        (DT_JMPREL, section_address(".rela.plt")),
+        (DT_GNU_HASH, section_address(".gnu.hash")),
+        (DT_VERSYM, section_address(".gnu.version")),
+        (DT_RELACOUNT, relative_count as u64),
+        (DT_VERNEED, section_address(".gnu.version_r")),
+    ]);
+    if indices.contains_key(".hash") {
+        dynamic_values.insert(DT_HASH, section_address(".hash"));
+    }
+    patch_dynamic_tags(output, dynamic, &dynamic_values)?;
 
     let mut restored_layout = layout.clone();
     restored_layout.section_headers = updated_sections;
@@ -1012,7 +1054,7 @@ fn materialize_static_elf_tables(
             new_symbol_count,
             old_dynstr_size: old_strings.len(),
             auxiliary_dynstr_size: auxiliary.dynstr_size,
-            new_dynstr_size: tables[5].data.len(),
+            new_dynstr_size,
             rela_dyn_count,
             rela_plt_count,
             relative_prefix_count: relative_count,
@@ -1247,8 +1289,20 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
     let payload = map_read_only(&payload_file, payload_path)?;
     let layout = ElfLayout::parse(&source, true)?;
     let private = layout.private_section()?;
-    if private.offset != layout.file_load_end()? {
-        return invalid("SHT_LOUSER does not begin at the file-backed PT_LOAD end");
+    let file_load_end = layout.file_load_end()?;
+    let aligned_load_end = align_up(file_load_end, 0x10)?;
+    if private.offset != aligned_load_end {
+        return invalid(format!(
+            "SHT_LOUSER offset 0x{:x} != aligned file-backed PT_LOAD end 0x{aligned_load_end:x} (raw 0x{file_load_end:x})",
+            private.offset
+        ));
+    }
+    let load_padding = slice_u64(&source, file_load_end, private.offset - file_load_end)?;
+    if load_padding.iter().any(|&byte| byte != 0) {
+        return invalid(format!(
+            "nonzero padding between PT_LOAD end 0x{file_load_end:x} and SHT_LOUSER 0x{:x}",
+            private.offset
+        ));
     }
     let descriptor = ProtectedDescriptor::decrypt(&payload, config.header_seed)?;
     let load_end = layout.load_end()?;
