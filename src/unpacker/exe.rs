@@ -1040,8 +1040,13 @@ impl<'a> Unpacker<'a> {
         // layout has no such table — imports are rebuilt from the PE Import
         // Directory after the header is reconstructed (see `process_imports_idt`
         // below). Skip the walk5 pass entirely for the new layout.
+        //
+        // Managed assemblies leave the walk5 slot null as well: their imports
+        // are just the CLR bootstrap stub, so there is no encrypted name table
+        // to walk. Reading the table at address 0 would chase header garbage as
+        // a pointer chain, so a null slot means "nothing to decrypt".
         let mut walk5 = get_u32(&u.decompressed, at7);
-        if !new_layout {
+        if !new_layout && walk5 != 0 {
             loop {
                 let outer = get_u32(&u.decompressed, walk5.wrapping_add(12));
                 if outer == 0 {
@@ -1290,7 +1295,13 @@ impl<'a> Unpacker<'a> {
             let backup: Vec<u8> = u.decompressed[meta_start..meta_start + 144].to_vec();
             u.decrypt_data5(u.info[3].wrapping_add(ep_off), 144);
             let ep = get_u32(&u.decompressed, u.info[3].wrapping_add(ep_off));
-            write_u32(&mut u.decompressed, pe_off2.wrapping_add(40), ep);
+            // Managed assemblies store 0 as the entry point here (their EP is a
+            // property of the CLR header, not the PE). Keep the protected
+            // header's EP in that case — overwriting with 0 would produce an
+            // image whose entry point is the DOS header.
+            if ep != 0 {
+                write_u32(&mut u.decompressed, pe_off2.wrapping_add(40), ep);
+            }
             for n in 0..128 {
                 u.decompressed[(pe_off2 + 136 + n) as usize] =
                     u.decompressed[(u.info[3] + dd_off + n) as usize];
@@ -1383,6 +1394,61 @@ impl<'a> Unpacker<'a> {
                     let s = md_off as usize;
                     let d = md_rva as usize;
                     let n = md_size as usize;
+                    u.decompressed[d..d + n].copy_from_slice(&u.file_data[s..s + n]);
+                }
+            }
+        }
+
+        // Old-layout managed (CLR) restore: same verbatim regions as the
+        // new-layout restore above (COR20 header + BSJB MetaData stream) plus
+        // the COR20 resources blob. Crackproof preserves only these regions
+        // verbatim in the protected file — the IL method bodies between the
+        // COR20 header and the resources ARE packer-encrypted and arrive via
+        // the section-block pass, so copying the whole section's raw data (as
+        // the older-DLL pipeline does for its layout) would clobber them with
+        // the placeholder zeros the protected file carries there. Runs after
+        // the old-layout dd8 pass, so the restored bytes are final.
+        if !new_layout {
+            let clr_rva = get_u32(&u.decompressed, pe_off2.wrapping_add(0xF8));
+            let clr_size = get_u32(&u.decompressed, pe_off2.wrapping_add(0xFC));
+            if clr_rva != 0
+                && clr_size != 0
+                && (clr_rva as u64 + clr_size as u64) <= u.decompressed.len() as u64
+                && let Some(cor_off) = prot_rva_to_off(u.file_data, pe_off, clr_rva)
+                && (cor_off as u64 + 0x48) <= u.file_data.len() as u64
+                && get_u32(u.file_data, cor_off) == 0x48
+            {
+                let s = cor_off as usize;
+                let d = clr_rva as usize;
+                u.decompressed[d..d + 0x48].copy_from_slice(&u.file_data[s..s + 0x48]);
+                restored_clr = true;
+                // MetaData RVA/size from the just-restored COR20 header.
+                let md_rva = get_u32(&u.decompressed, clr_rva + 0x08);
+                let md_size = get_u32(&u.decompressed, clr_rva + 0x0C);
+                if md_rva != 0
+                    && md_size != 0
+                    && (md_rva as u64 + md_size as u64) <= u.decompressed.len() as u64
+                    && let Some(md_off) = prot_rva_to_off(u.file_data, pe_off, md_rva)
+                    && (md_off as u64 + md_size as u64) <= u.file_data.len() as u64
+                    && &u.file_data[md_off as usize..md_off as usize + 4] == b"BSJB"
+                {
+                    let s = md_off as usize;
+                    let d = md_rva as usize;
+                    let n = md_size as usize;
+                    u.decompressed[d..d + n].copy_from_slice(&u.file_data[s..s + n]);
+                }
+                // COR20 resources (managed .resources blob), verbatim too.
+                let res_rva = get_u32(&u.decompressed, clr_rva + 0x18);
+                let res_size = get_u32(&u.decompressed, clr_rva + 0x1C);
+                if res_rva != 0
+                    && res_size != 0
+                    && (res_rva as u64 + res_size as u64) <= u.decompressed.len() as u64
+                    && let Some(res_off) = prot_rva_to_off(u.file_data, pe_off, res_rva)
+                    && (res_off as u64 + res_size as u64) <= u.file_data.len() as u64
+                {
+                    let s = res_off as usize;
+                    let d = res_rva as usize;
+                    let n = res_size as usize;
                     u.decompressed[d..d + n].copy_from_slice(&u.file_data[s..s + n]);
                 }
             }

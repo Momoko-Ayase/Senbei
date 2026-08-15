@@ -53,7 +53,12 @@ managed DLL.
 
 `unpack_auto` then dispatches:
 
-- `Exe` → the EXE pipeline (handles both PE32+ and PE32).
+- `Exe` → the EXE pipeline (handles both PE32+ and PE32). Managed EXEs take
+  the same path: their import-string table is null (imports are the CLR
+  bootstrap stub), the entry point comes from the protected header (the
+  config block stores 0 for managed images), and the COR20 header, BSJB
+  metadata stream, and CLR resources are restored verbatim from the protected
+  file, mirroring the managed-DLL restore.
 - `NativeDll` / `ManagedDll` → the DLL pipeline first; on failure, the EXE
   pipeline as a fallback. Two DLL layouts exist in the wild: an older layout
   the DLL pipeline parses, and a newer one that protects DLLs with the
