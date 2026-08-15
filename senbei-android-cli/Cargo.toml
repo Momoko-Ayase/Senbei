@@ -1,0 +1,19 @@
+[package]
+name = "senbei-android-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line entry point for Senbei Android"
+
+[[bin]]
+name = "senbei-android"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+senbei-android-io.workspace = true
+senbei-android-metadata.workspace = true
+
+[lints]
+workspace = true

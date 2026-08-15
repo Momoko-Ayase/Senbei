@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "senbei-android-cli",
+    "senbei-android-crypto",
+    "senbei-android-elf",
+    "senbei-android-io",
+    "senbei-android-metadata",
+]
+default-members = ["senbei-android-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+aes = "0.8"
+anyhow = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+
+senbei-android-crypto = { path = "senbei-android-crypto" }
+senbei-android-elf = { path = "senbei-android-elf" }
+senbei-android-io = { path = "senbei-android-io" }
+senbei-android-metadata = { path = "senbei-android-metadata" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
