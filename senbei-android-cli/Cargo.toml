@@ -15,7 +15,6 @@ anyhow.workspace = true
 serde_json.workspace = true
 senbei-android-io.workspace = true
 senbei-android-metadata.workspace = true
-senbei-android-stage2.workspace = true
 
 [lints]
 workspace = true

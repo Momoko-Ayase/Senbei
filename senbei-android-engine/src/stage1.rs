@@ -8,6 +8,37 @@ pub(crate) const SHT_LOUSER: u32 = 0x8000_0000;
 pub const DEFAULT_CIPHER_CONSTANT: u32 = 0xbf20_165d;
 pub const DEFAULT_OUTER_SIZE: usize = 0x23c;
 
+pub(crate) fn looks_protected(data: &[u8]) -> bool {
+    let Ok(elf) = Elf::parse(data) else {
+        return false;
+    };
+    if elf.header.e_machine != EM_AARCH64
+        || elf
+            .section_headers
+            .iter()
+            .filter(|section| section.sh_type == SHT_LOUSER)
+            .count()
+            != 1
+    {
+        return false;
+    }
+    [
+        ".dynsym",
+        ".dynstr",
+        ".gnu.hash",
+        ".gnu.version",
+        ".gnu.version_r",
+    ]
+    .into_iter()
+    .all(|wanted| {
+        elf.section_headers.iter().any(|section| {
+            elf.shdr_strtab
+                .get_at(section.sh_name)
+                .is_some_and(|name| name == wanted)
+        })
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stage1Header {
     pub key: u32,

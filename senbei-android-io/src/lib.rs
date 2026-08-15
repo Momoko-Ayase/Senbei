@@ -1,14 +1,18 @@
 //! Filesystem orchestration for the Android restoration commands.
 
+mod folder;
+
+pub use folder::{FolderSummary, run_folder};
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use senbei_android_elf::{RestoreOptions, RestoreReport, restore_libil2cpp};
-use senbei_android_metadata::{DEFAULT_METHOD_TOKEN_SEED, Report as MetadataReport};
-use senbei_android_stage2::{
+use senbei_android_engine::{
     DEFAULT_CIPHER_CONSTANT, DEFAULT_OUTER_SIZE, ExtractOptions, ExtractionReport, extract_stage2,
 };
+use senbei_android_metadata::{DEFAULT_METHOD_TOKEN_SEED, Report as MetadataReport};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
