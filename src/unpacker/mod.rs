@@ -55,7 +55,8 @@ pub(crate) fn is_supported_magic(magic: u32) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    Exe,
+    NativeExe,
+    ManagedExe,
     NativeDll,
     ManagedDll,
 }
@@ -109,7 +110,7 @@ fn key_table(input: &[u8]) -> Option<[u32; 8]> {
 ///
 /// Routing: `keys[1]` must be the Crackproof magic (`KONN`).
 /// The PE IMAGE_FILE_DLL characteristic distinguishes EXE vs DLL;
-/// the CLR data-directory RVA further distinguishes ManagedDll from NativeDll.
+/// the CLR data-directory RVA distinguishes managed from native for both.
 pub fn detect(input: &[u8]) -> Option<Detected> {
     let keys = key_table(input)?;
     let magic = keys[1];
@@ -132,21 +133,15 @@ pub fn detect(input: &[u8]) -> Option<Detected> {
     let chars =
         (input[chars_offset as usize] as u16) | ((input[chars_offset as usize + 1] as u16) << 8);
     let is_dll = (chars & 0x2000) != 0;
-    if !is_dll {
-        return Some(Detected {
-            kind: Kind::Exe,
-            magic,
-        });
-    }
-    // DLL: determine managed vs native via CLR data-directory RVA.
+    // Managed vs native via the CLR data-directory RVA.
     // peOff + 24 = start of optional header. The data directories start at a
     // magic-dependent offset within it: PE32 (0x10B) at +96, PE32+ (0x20B) at
     // +112. Using the PE32+ offset on a PE32 image reads the wrong dword and
-    // can mis-flag a native DLL as managed.
+    // can mis-flag a native image as managed.
     //
     // `get_u16`/`get_u32` index unchecked, so every read past the already-
     // checked Characteristics word must be bounds-checked first: a truncated
-    // DLL (e.g. `e_lfanew` pointing at len-24) would otherwise panic here,
+    // file (e.g. `e_lfanew` pointing at len-24) would otherwise panic here,
     // and this detector runs on the folder scan threads where a panic aborts
     // the whole run.
     let opt_magic_off = pe_off.wrapping_add(24) as usize;
@@ -165,10 +160,11 @@ pub fn detect(input: &[u8]) -> Option<Detected> {
         return None;
     }
     let clr_rva = primitives::get_u32(input, clr_rva_offset);
-    let kind = if clr_rva != 0 {
-        Kind::ManagedDll
-    } else {
-        Kind::NativeDll
+    let kind = match (is_dll, clr_rva != 0) {
+        (false, false) => Kind::NativeExe,
+        (false, true) => Kind::ManagedExe,
+        (true, false) => Kind::NativeDll,
+        (true, true) => Kind::ManagedDll,
     };
     Some(Detected { kind, magic })
 }
@@ -184,7 +180,7 @@ pub fn unpack_auto(input: &[u8]) -> Result<(Kind, Vec<u8>), UnpackError> {
 pub fn unpack_auto_v(input: &[u8], verbose: bool) -> Result<(Kind, Vec<u8>), UnpackError> {
     let detected = detect(input).ok_or(UnpackError::NotCrackproof)?;
     let out = match detected.kind {
-        Kind::Exe => unpack_exe_v(input, verbose)?,
+        Kind::NativeExe | Kind::ManagedExe => unpack_exe_v(input, verbose)?,
         Kind::NativeDll | Kind::ManagedDll => {
             // Two Crackproof DLL layouts exist. The older one (the byte-identical
             // DLL goldens) follows the pipeline in `dll.rs`. Newer builds protect

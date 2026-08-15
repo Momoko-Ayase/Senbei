@@ -41,7 +41,8 @@ lives in [`web/`](web/).
 
 | Kind | Description |
 | --- | --- |
-| `Exe` | Crackproof-protected executable (PE32+ and PE32). |
+| `NativeExe` | Crackproof-protected native executable (PE32+ and PE32). |
+| `ManagedExe` | Protected .NET executable (has a CLR data directory). |
 | `NativeDll` | Protected native (unmanaged) DLL. |
 | `ManagedDll` | Protected .NET assembly (has a CLR data directory). |
 | `._` companion | Stub + external encrypted payload layout, spliced automatically. |

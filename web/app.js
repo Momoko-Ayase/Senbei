@@ -45,7 +45,8 @@ const files = new Map();
 const rowEls = new Map();
 
 const KIND_LABEL = {
-  exe: 'protected EXE',
+  'native-exe': 'protected native EXE',
+  'managed-exe': 'protected managed EXE',
   'native-dll': 'protected native DLL',
   'managed-dll': 'protected managed DLL',
   metadata: 'il2cpp metadata',
@@ -323,7 +324,8 @@ async function unpackModule(name, entry) {
   let comp = compEntry ? await read(compEntry.file) : undefined;
   let r = await runUnpack(input, comp, false);
 
-  if (!r.ok && r.trap && entry.kind !== 'exe') {
+  const isExe = entry.kind === 'native-exe' || entry.kind === 'managed-exe';
+  if (!r.ok && r.trap && !isExe) {
     // The DLL-routing probe trapped (panics can't be caught in wasm). Retry
     // once with the forced-EXE pipeline in a fresh worker — this mirrors the
     // CLI's dll-first/exe-fallback outcome for EXE-shell-layout DLLs.

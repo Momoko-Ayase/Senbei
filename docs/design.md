@@ -48,17 +48,18 @@ src/
 
 Detection is content-based (`unpacker::detect`), never extension-based: the
 key table is derived from the file header and checked against the format
-magic, then the PE characteristics classify the input as EXE, native DLL, or
-managed DLL.
+magic, then the PE characteristics classify the input as EXE or DLL and the
+CLR data directory splits each into native vs managed (`NativeExe` /
+`ManagedExe` / `NativeDll` / `ManagedDll`).
 
 `unpack_auto` then dispatches:
 
-- `Exe` → the EXE pipeline (handles both PE32+ and PE32). Managed EXEs take
-  the same path: their import-string table is null (imports are the CLR
-  bootstrap stub), the entry point comes from the protected header (the
-  config block stores 0 for managed images), and the COR20 header, BSJB
-  metadata stream, and CLR resources are restored verbatim from the protected
-  file, mirroring the managed-DLL restore.
+- `NativeExe` / `ManagedExe` → the EXE pipeline (handles both PE32+ and
+  PE32). Managed EXEs take the same path: their import-string table is null
+  (imports are the CLR bootstrap stub), the entry point comes from the
+  protected header (the config block stores 0 for managed images), and the
+  COR20 header, BSJB metadata stream, and CLR resources are restored verbatim
+  from the protected file, mirroring the managed-DLL restore.
 - `NativeDll` / `ManagedDll` → the DLL pipeline first; on failure, the EXE
   pipeline as a fallback. Two DLL layouts exist in the wild: an older layout
   the DLL pipeline parses, and a newer one that protects DLLs with the

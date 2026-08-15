@@ -24,7 +24,8 @@ pub struct UnpackResult {
 
 #[wasm_bindgen]
 impl UnpackResult {
-    /// Detected module kind: `"exe"`, `"native-dll"`, or `"managed-dll"`.
+    /// Detected module kind: `"native-exe"`, `"managed-exe"`, `"native-dll"`,
+    /// or `"managed-dll"`.
     #[wasm_bindgen(getter)]
     pub fn kind(&self) -> String {
         self.kind.clone()
@@ -102,7 +103,8 @@ impl MetadataResult {
 
 fn kind_str(kind: senbei::unpacker::Kind) -> &'static str {
     match kind {
-        senbei::unpacker::Kind::Exe => "exe",
+        senbei::unpacker::Kind::NativeExe => "native-exe",
+        senbei::unpacker::Kind::ManagedExe => "managed-exe",
         senbei::unpacker::Kind::NativeDll => "native-dll",
         senbei::unpacker::Kind::ManagedDll => "managed-dll",
     }
@@ -110,8 +112,9 @@ fn kind_str(kind: senbei::unpacker::Kind) -> &'static str {
 
 /// Classify a file's bytes without unpacking.
 ///
-/// Returns `"exe"`, `"native-dll"`, `"managed-dll"`, `"metadata"` (an il2cpp
-/// `global-metadata.dat`), or `undefined` for anything unrecognized.
+/// Returns `"native-exe"`, `"managed-exe"`, `"native-dll"`, `"managed-dll"`,
+/// `"metadata"` (an il2cpp `global-metadata.dat`), or `undefined` for
+/// anything unrecognized.
 #[wasm_bindgen]
 pub fn detect(input: &[u8]) -> Option<String> {
     if senbei::metadata::is_metadata(input) {
