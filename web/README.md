@@ -46,8 +46,8 @@ including the `wasm32-unknown-unknown` target) and
 [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/).
 
 ```cmd
-cd web
-wasm-pack build --target web --release
+cd senbei-wasm
+wasm-pack build --target web --release --out-dir ../web/pkg
 ```
 
 This produces `web/pkg/` (git-ignored). Then serve the `web/` directory with
@@ -63,13 +63,14 @@ python -m http.server -d web 8000
 ## Layout
 
 ```
+senbei-wasm/   the senbei-wasm cdylib crate (own Cargo.lock, outside the
+               workspace; depends on the senbei-pe/-io/-metadata crates)
+└── src/lib.rs #[wasm_bindgen] bindings: detect / unpack_file /
+               unpack_file_force_exe / deobfuscate_metadata
 web/
-├── Cargo.toml     senbei-web cdylib crate (depends on the senbei lib)
-├── src/lib.rs     #[wasm_bindgen] bindings: detect / unpack_file /
-│                  unpack_file_force_exe / deobfuscate_metadata
-├── index.html     the page
-├── app.js         dropzone, file list, worker orchestration, downloads
-├── worker.js      one-shot unpack worker (fresh wasm instance per file)
+├── index.html the page
+├── app.js     dropzone, file list, worker orchestration, downloads
+├── worker.js  one-shot unpack worker (fresh wasm instance per file)
 ├── style.css
-└── pkg/           wasm-pack output (git-ignored)
+└── pkg/       wasm-pack output (git-ignored; build from senbei-wasm/)
 ```

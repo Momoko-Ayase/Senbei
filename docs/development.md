@@ -81,12 +81,18 @@ since binaries are not committed).
 
 ```
 senbei/
-├── Cargo.toml                 senbei lib + bin package
+├── Cargo.toml                 workspace root (members: the senbei-* crates)
 ├── rust-toolchain.toml        pinned toolchain + targets
-├── src/                       CLI shell + pure unpacker core (see docs/design.md)
-├── tests/                     CLI, detection, golden, and folder tests
+├── senbei-cli/                senbei binary (default member)
+│   └── tests/                 CLI, detection, golden, and folder tests
+├── senbei-pe/                 pure unpacker core (see docs/design.md)
+├── senbei-crypto/             crypto/compression primitives
+├── senbei-metadata/           il2cpp metadata de-obfuscation
+├── senbei-io/                 filesystem, scanning, CLI orchestration
+├── senbei-wasm/               WebAssembly bindings crate (own Cargo.lock,
+│                              outside the workspace; builds into web/pkg/)
 ├── samples/                   local-only test corpus (git-ignored)
-├── web/                       WebAssembly browser build
+├── web/                       static browser frontend assets (+ built pkg/)
 ├── docs/                      usage, design, and development documentation
 └── .github/                   CI workflows and issue templates
 ```
@@ -96,8 +102,8 @@ senbei/
 See [web/README.md](../web/README.md). In short:
 
 ```cmd
-cd web
-wasm-pack build --target web --release
+cd senbei-wasm
+wasm-pack build --target web --release --out-dir ../web/pkg
 ```
 
 then serve `web/` statically and open `index.html`. Everything runs

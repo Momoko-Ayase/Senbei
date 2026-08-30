@@ -1,4 +1,4 @@
-import init, { detect, deobfuscate_metadata } from './pkg/senbei_web.js';
+import init, { detect, deobfuscate_metadata } from './pkg/senbei_wasm.js';
 
 const dropzone = document.getElementById('dropzone');
 const picker = document.getElementById('picker');

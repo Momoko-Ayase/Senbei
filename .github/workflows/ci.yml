@@ -82,11 +82,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo install wasm-pack --locked
-      # `-- --locked` forwards to cargo: web/Cargo.lock is committed on
+      # `-- --locked` forwards to cargo: senbei-wasm/Cargo.lock is committed on
       # purpose, so the wasm build must be pinned by it rather than silently
       # re-resolving (which is how it drifted out of sync with the manifest).
-      - run: wasm-pack build --target web --release -- --locked
-        working-directory: web
+      # --out-dir emits the JS/wasm package into the static frontend's web/pkg/.
+      - run: wasm-pack build --target web --release --out-dir ../web/pkg -- --locked
+        working-directory: senbei-wasm
       - uses: actions/upload-artifact@v4
         with:
           name: senbei-web

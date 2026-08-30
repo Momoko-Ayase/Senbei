@@ -8,8 +8,9 @@ Senbei is a static unpacker for Crackproof-protected PE files: a Cargo
 workspace with a pure, panic-free, no-I/O unpacker core (`senbei-pe/`, built
 on `senbei-crypto/`), an il2cpp metadata de-obfuscator (`senbei-metadata/`),
 filesystem/CLI orchestration (`senbei-io/`), the `senbei` binary
-(`senbei-cli/`), and a WebAssembly browser frontend (`web/`, outside the
-workspace). Read `docs/design.md` first.
+(`senbei-cli/`), WebAssembly bindings (`senbei-wasm/`, outside the workspace;
+builds into `web/pkg/`), and the static browser frontend assets (`web/`).
+Read `docs/design.md` first.
 
 ## Commands
 
@@ -18,7 +19,7 @@ cargo build --release            :: CLI (default member: senbei-cli)
 cargo test --release --workspace :: full suite (golden corpus: samples/, git-ignored)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
-cd web && wasm-pack build --target web --release   :: browser build
+cd senbei-wasm && wasm-pack build --target web --release --out-dir ../web/pkg   :: browser build
 ```
 
 The `samples/` corpus is user-managed and absent on CI; without it the

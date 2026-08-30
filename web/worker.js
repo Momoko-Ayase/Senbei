@@ -10,7 +10,7 @@
 //    instance is never reused). That reproduces the CLI's
 //    dll-first/exe-fallback routing without a catchable panic.
 
-import init, { unpack_file, unpack_file_force_exe } from './pkg/senbei_web.js';
+import init, { unpack_file, unpack_file_force_exe } from './pkg/senbei_wasm.js';
 
 let ready = null;
 

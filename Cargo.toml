@@ -7,9 +7,9 @@ members = [
     "senbei-pe",
 ]
 default-members = ["senbei-cli"]
-# The wasm frontend is its own crate (own Cargo.lock, cdylib) and stays outside
-# the workspace.
-exclude = ["web"]
+# The wasm bindings crate is its own crate (own Cargo.lock, cdylib) and stays
+# outside the workspace.
+exclude = ["senbei-wasm"]
 resolver = "2"
 
 [workspace.package]
