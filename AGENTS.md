@@ -4,17 +4,19 @@ Guidance for AI coding agents (and human contributors) working in this repo.
 
 ## Project
 
-Senbei is a static unpacker for Crackproof-protected PE files: a pure,
-panic-free, no-I/O unpacker core (`src/unpacker/`) plus a thin CLI shell
-(`src/`), an il2cpp metadata de-obfuscator (`src/metadata.rs`), and a
-WebAssembly browser frontend (`web/`). Read `docs/design.md` first.
+Senbei is a static unpacker for Crackproof-protected PE files: a Cargo
+workspace with a pure, panic-free, no-I/O unpacker core (`senbei-pe/`, built
+on `senbei-crypto/`), an il2cpp metadata de-obfuscator (`senbei-metadata/`),
+filesystem/CLI orchestration (`senbei-io/`), the `senbei` binary
+(`senbei-cli/`), and a WebAssembly browser frontend (`web/`, outside the
+workspace). Read `docs/design.md` first.
 
 ## Commands
 
 ```cmd
-cargo build --release            :: CLI
-cargo test --release             :: full suite (golden corpus: samples/, git-ignored)
-cargo clippy --all-targets -- -D warnings
+cargo build --release            :: CLI (default member: senbei-cli)
+cargo test --release --workspace :: full suite (golden corpus: samples/, git-ignored)
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cd web && wasm-pack build --target web --release   :: browser build
 ```

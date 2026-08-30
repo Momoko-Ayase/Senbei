@@ -101,12 +101,12 @@ impl MetadataResult {
     }
 }
 
-fn kind_str(kind: senbei::unpacker::Kind) -> &'static str {
+fn kind_str(kind: senbei_pe::Kind) -> &'static str {
     match kind {
-        senbei::unpacker::Kind::NativeExe => "native-exe",
-        senbei::unpacker::Kind::ManagedExe => "managed-exe",
-        senbei::unpacker::Kind::NativeDll => "native-dll",
-        senbei::unpacker::Kind::ManagedDll => "managed-dll",
+        senbei_pe::Kind::NativeExe => "native-exe",
+        senbei_pe::Kind::ManagedExe => "managed-exe",
+        senbei_pe::Kind::NativeDll => "native-dll",
+        senbei_pe::Kind::ManagedDll => "managed-dll",
     }
 }
 
@@ -117,10 +117,10 @@ fn kind_str(kind: senbei::unpacker::Kind) -> &'static str {
 /// anything unrecognized.
 #[wasm_bindgen]
 pub fn detect(input: &[u8]) -> Option<String> {
-    if senbei::metadata::is_metadata(input) {
+    if senbei_metadata::is_metadata(input) {
         return Some("metadata".to_string());
     }
-    senbei::unpacker::detect(input).map(|d| kind_str(d.kind).to_string())
+    senbei_pe::detect(input).map(|d| kind_str(d.kind).to_string())
 }
 
 /// Unpack a protected module.
@@ -134,7 +134,7 @@ pub fn unpack_file(
     input: &[u8],
     companion: Option<Vec<u8>>,
 ) -> Result<UnpackResult, JsError> {
-    let r = senbei::job::unpack_bytes(input, companion.as_deref())
+    let r = senbei_io::job::unpack_bytes(input, companion.as_deref())
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(UnpackResult {
         kind: kind_str(r.kind).to_string(),
@@ -153,7 +153,7 @@ pub fn unpack_file(
 #[wasm_bindgen]
 pub fn deobfuscate_metadata(data: &[u8]) -> Result<MetadataResult, JsError> {
     let (bytes, report) =
-        senbei::metadata::deobfuscate(data).map_err(|e| JsError::new(&e.to_string()))?;
+        senbei_metadata::deobfuscate(data).map_err(|e| JsError::new(&e.to_string()))?;
     Ok(MetadataResult {
         bytes,
         version: report.version,
@@ -164,14 +164,14 @@ pub fn deobfuscate_metadata(data: &[u8]) -> Result<MetadataResult, JsError> {
 }
 
 /// Unpack a protected module, forcing the EXE pipeline (no DLL-pipeline
-/// probe). See [`senbei::job::unpack_bytes_force_exe`] for why the web app
+/// probe). See [`senbei_io::job::unpack_bytes_force_exe`] for why the web app
 /// needs this recovery path.
 #[wasm_bindgen]
 pub fn unpack_file_force_exe(
     input: &[u8],
     companion: Option<Vec<u8>>,
 ) -> Result<UnpackResult, JsError> {
-    let r = senbei::job::unpack_bytes_force_exe(input, companion.as_deref())
+    let r = senbei_io::job::unpack_bytes_force_exe(input, companion.as_deref())
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(UnpackResult {
         kind: kind_str(r.kind).to_string(),

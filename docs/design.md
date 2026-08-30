@@ -7,41 +7,57 @@ no driver or proxy DLL is involved.
 
 ## Crate layout
 
-The crate is split into a pure core and a thin CLI shell:
+Senbei is a Cargo workspace split into a pure core and thin shells around it:
 
-- **`src/unpacker/`** — the core. Pure functions over byte slices: no file
-  I/O, no environment access (beyond a few debugging overrides, see
+- **`senbei-pe/`** — the core. Pure functions over byte slices: no file I/O,
+  no environment access (beyond a few debugging overrides, see
   [development.md](development.md)), panic-free at the public boundary (all
   internal panics are trapped and converted to `UnpackError::Corrupt`). This
   is what the WebAssembly build embeds.
-- **`src/` (top level)** — the CLI shell: argument parsing, recursive folder
-  scanning, per-run log file, progress bar, Explorer-friendly exit pause, and
-  the single-file/folder orchestration in `job.rs`.
-- **`src/metadata.rs`** — il2cpp `global-metadata.dat` method-token
+- **`senbei-crypto/`** — cryptographic, checksum, compression, and bytecode
+  primitives the core is built from. Same purity rules as `senbei-pe`.
+- **`senbei-metadata/`** — il2cpp `global-metadata.dat` method-token
   de-obfuscation (format version 31; other versions are left untouched).
+- **`senbei-io/`** — filesystem and orchestration: recursive folder scanning,
+  per-run log file, progress bar, Explorer-friendly exit pause, and the
+  single-file/folder orchestration in `job.rs` (incl. the wasm-safe in-memory
+  byte API used by the web frontend).
+- **`senbei-cli/`** — the `senbei` binary: argument parsing + dispatch. The
+  integration test suite (incl. the golden corpus test) lives in
+  `senbei-cli/tests/`.
 
 ```
-src/
-├── main.rs                argument parsing + dispatch
-├── lib.rs                 module roots
+senbei-cli/
+└── src/main.rs            argument parsing + dispatch
+senbei-io/src/
 ├── job.rs                 single-file + folder orchestration, out-naming,
 │                          companion splice, stub overlay/TLS restore,
 │                          pipeline routing (incl. the wasm-safe byte API)
 ├── scan.rs                recursive Crackproof + metadata discovery
-├── metadata.rs            il2cpp global-metadata.dat de-obfuscation
 ├── logfile.rs             per-run timestamped log
 ├── ui.rs                  progress bar + status lines
-├── pause.rs               Explorer-friendly exit pause
-└── unpacker/              pure, panic-free, no-I/O core
-    ├── mod.rs             detection + unpack_auto dispatch
-    ├── exe.rs             EXE pipeline (PE32+ and PE32)
-    ├── dll.rs             native + managed DLL pipeline
-    ├── integrity.rs       static post-unpack sanity check
-    ├── primitives.rs      decrypt_data* steps, key/shift selection
-    ├── bytecode.rs        bytecode VM
-    ├── parallel.rs        deterministic block-parallel fan-out
-    ├── tables.rs          constant tables
-    └── crc32.rs           checksum
+└── pause.rs               Explorer-friendly exit pause
+senbei-metadata/src/
+└── metadata.rs            il2cpp global-metadata.dat de-obfuscation
+senbei-crypto/src/
+├── primitives.rs          decrypt_data* steps, key derivation
+├── bytecode.rs            bytecode VM
+├── tables.rs              constant tables
+└── crc32.rs               checksum
+senbei-pe/src/engine/      pure, panic-free, no-I/O core
+├── mod.rs                 detection + unpack_auto dispatch
+├── error.rs               structured error taxonomy
+├── integrity.rs           static post-unpack sanity check
+├── parallel.rs            deterministic block-parallel fan-out
+├── layout/                layout discovery + validation
+│   ├── dd8.rs             .text dd8 key-formula + shift selection
+│   ├── discovery.rs       layout candidate discovery (trial-and-validate)
+│   └── image.rs           PE image reconstruction helpers
+├── exe/
+│   ├── pipeline.rs        EXE pipeline (PE32+ and PE32 orchestration)
+│   └── pipeline/pe32.rs   PE32-specific EXE restore
+└── dll/
+    └── pipeline.rs        native + managed DLL pipeline
 ```
 
 ## Detection and routing

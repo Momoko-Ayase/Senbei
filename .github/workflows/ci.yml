@@ -19,7 +19,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     # The test suite exercises Windows path semantics, so it runs on Windows.
@@ -28,7 +28,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --release
+      - run: cargo test --release --workspace
 
   check-portable:
     # Build-only portability gate: non-Windows host and the wasm target the
@@ -39,8 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo check --workspace --target wasm32-unknown-unknown
 
   cli:
     strategy:

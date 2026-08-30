@@ -1,0 +1,20 @@
+[package]
+name = "senbei-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line entry point for Senbei"
+license.workspace = true
+keywords = ["unpacker", "reverse-engineering", "pe", "security-research"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "senbei"
+path = "src/main.rs"
+
+[dependencies]
+senbei-io.workspace = true
+
+[dev-dependencies]
+senbei-io.workspace = true
+senbei-metadata.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "senbei-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cryptographic and compression primitives for Senbei"
+
+[dependencies]
+thiserror.workspace = true

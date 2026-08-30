@@ -1,0 +1,10 @@
+[package]
+name = "senbei-pe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PE detection, unpacking, and validation for Senbei"
+
+[dependencies]
+senbei-crypto.workspace = true
+thiserror.workspace = true

@@ -60,9 +60,9 @@ since binaries are not committed).
 
 ## Conventions
 
-- The `src/unpacker/` core is pure: no file I/O, no panics across the public
-  boundary, no `unsafe`. Keep it that way — it is what the WebAssembly build
-  embeds.
+- The `senbei-pe/` core (and its `senbei-crypto/` base) is pure: no file I/O,
+  no panics across the public boundary, no `unsafe`. Keep it that way — it is
+  what the WebAssembly build embeds.
 - Layout heuristics must **trial-and-validate**: never pick a candidate offset
   on shape alone and trust it; validate by decryption/checksum and fall
   through to the next candidate on failure. A silent wrong offset produces a

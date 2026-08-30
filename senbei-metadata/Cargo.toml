@@ -1,0 +1,6 @@
+[package]
+name = "senbei-metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unity il2cpp metadata de-obfuscation for Senbei"
