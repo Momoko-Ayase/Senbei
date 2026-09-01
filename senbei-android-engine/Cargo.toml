@@ -1,0 +1,20 @@
+[package]
+name = "senbei-android-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Static Stage 1 and Stage 2 extraction for Senbei Android"
+
+[dependencies]
+goblin.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+senbei-android-crypto.workspace = true
+
+[lints]
+workspace = true

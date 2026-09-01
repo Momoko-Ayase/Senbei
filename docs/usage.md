@@ -30,13 +30,44 @@ expects; the output is `global-metadata.unpack.dat`, written only when tokens
 actually changed. Only metadata format version 31 is rewritten; other versions
 are reported and left untouched.
 
+## Android targets
+
+Senbei also restores Android (AArch64) protected shared libraries and app
+packages:
+
+- **`.so`** — a protected library is hollowed out on disk: its original
+  sections live in an encrypted payload appended to the file, and senbei
+  rebuilds the static image from it. Output: `libil2cpp.unpack.so`.
+- **`.apk`** — entries are extracted to a temporary workspace and
+  content-probed like loose files; protected libraries and metadata blobs
+  inside are restored to `<out>/<apk name>/<entry path>`.
+- **`.apks` / `.xapk`** — split-package bundles; each nested `.apk` is opened
+  and searched the same way, under `<out>/<bundle name>/<split name>/...`.
+
+When a restored il2cpp library carries its metadata embedded in its data
+section (no standalone `global-metadata.dat` in the app at all), senbei
+unwraps the blob and writes it next to the library as
+`global-metadata.unpack.dat`. One observed packaging variant wraps the blob in
+a per-word XOR layer whose keys are generated at runtime and stored nowhere;
+senbei ships the keystream recovered from the one build known to use it and
+content-probes for it — builds with a different keystream are silently
+skipped (the library itself is still fully restored).
+
+The same content may appear loose in a folder, in its `.apk`, and in a bundle
+side by side: identical content is restored once, at the loose file's
+destination. A restored library is validated structurally by the restore
+itself (the rebuild refuses inconsistent layouts); a protected library that
+fails validation counts as an error, not a suspect.
+
 ## Folder mode
 
 Senbei walks the directory recursively, skips any subdirectory literally named
-`unpack`, and unpacks every file it recognises as Crackproof-protected (by
-content, not extension — renamed files and `.bak` backups are still found).
-Results land under `<root>/unpack/` (or `--out DIR`), mirroring the input
-tree's relative paths. The run log is written **in that same out directory**:
+`unpack`, and unpacks every file it recognises as protected (by content, not
+extension — renamed files and `.bak` backups are still found; packages are the
+one exception, recognised by extension plus the zip magic because they are
+containers). Results land under `<root>/unpack/` (or `--out DIR`), mirroring
+the input tree's relative paths. The run log is written **in that same out
+directory**:
 
 ```cmd
 senbei "C:\Games\MyGame"
@@ -58,7 +89,13 @@ line, then duration:
 done in 1234 ms
 ```
 
+The `packages` count appears (as `· N packages`) only when Android app
+packages were processed.
+
 ## Integrity check
+
+(PE outputs only — Android restores carry their own structural validation; see
+[Android targets](#android-targets).)
 
 A successful unpack is not always a runnable one: a layout heuristic can pick
 the wrong offset and leave the entry-point stub or import strings encrypted, so
@@ -98,7 +135,7 @@ line, adds a `SUSPECT` entry to the run log, and counts it in the summary's
 | Flag | Behavior |
 | --- | --- |
 | `--out DIR` | Write outputs (and the log, unless `--no-log`) under `DIR`. |
-| `-v`, `--verbose` | Print detailed `[N/9]` per-stage unpack progress (and the destination path) for each file. In folder mode this replaces the progress bar. |
+| `-v`, `--verbose` | Print detailed per-stage progress (and the destination path) for each file — `[N/9]` stages for PE targets, container/segment lines for Android libraries. In folder mode this replaces the progress bar. |
 | `-q`, `--quiet` | Once: hide progress bar and per-file lines; keep banner, summary, and duration. Twice (`-q -q`): suppress all stdio (exit code only). |
 | `--no-log` | Do not write `senbei-*.log`. Console output is unchanged by this flag alone. |
 | `--scan-all` | Probe every file in a folder, including ones the scan pre-filter skips (under 4128 bytes, or a bulk-asset extension like `.ab`/`.xml`/`.acb`). Much slower on large game trees; finds the same targets in practice. |
@@ -115,7 +152,7 @@ process.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success (single file unpacked, or folder run with no errors). |
+| `0` | Success (single file restored, or folder run with no errors). |
 | `1` | At least one file failed, a scan probe was unreadable, or a single-file unpack errored. |
 | `2` | Usage error: no path given, unknown option, missing `--out` value, or multiple input paths (help printed). |
 

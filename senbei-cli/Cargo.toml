@@ -17,4 +17,5 @@ senbei-io.workspace = true
 [dev-dependencies]
 senbei-io.workspace = true
 senbei-metadata.workspace = true
+sha2.workspace = true
 tempfile.workspace = true

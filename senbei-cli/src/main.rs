@@ -74,14 +74,7 @@ fn main() -> std::process::ExitCode {
             match result {
                 Ok(summary) => {
                     if quiet < 2 {
-                        println!(
-                            "{} unpacked · {} skipped · {} errors · {} suspect · {} metadata",
-                            summary.unpacked,
-                            summary.skipped,
-                            summary.errors,
-                            summary.suspect,
-                            summary.metadata
-                        );
+                        println!("{}", summary.line());
                         println!("done in {} ms", summary.duration_ms);
                     }
                     if summary.errors > 0 { 1 } else { 0 }
@@ -103,6 +96,12 @@ fn main() -> std::process::ExitCode {
 fn print_help() {
     println!(
         "senbei <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--scan-all] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
+    );
+    println!(
+        "  input        a Crackproof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
+         \x20              a protected Android AArch64 library (.so), an Android app\n\
+         \x20              package (.apk/.apks/.xapk), or a folder containing any of\n\
+         \x20              these"
     );
     println!(
         "  --scan-all   probe every file in a folder, including ones the scan\n\

@@ -57,6 +57,10 @@ since binaries are not committed).
 - `SENBEI_THREADS` — cap the block-parallel fan-out (`1` forces the fully
   sequential path).
 - `SENBEI_SCAN_ALL` — same as `--scan-all` (probe every file in a folder).
+- `SENBEI_ANDROID_SAMPLES` — override the Android corpus location (default
+  `samples/android/`; see `samples/README.md`). The Android corpus test pins
+  restored outputs with SHA-256 sidecar files next to each protected input
+  and documents known restore gaps with empty `<base>.restore-fails` markers.
 
 ## Conventions
 

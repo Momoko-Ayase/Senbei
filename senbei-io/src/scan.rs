@@ -115,6 +115,25 @@ enum Class {
     Crackproof,
     /// An il2cpp `global-metadata.dat` (de-obfuscation target).
     Metadata,
+    /// A protected AArch64 shared library (Android restore target).
+    AndroidSo,
+    /// An Android app package (`.apk`/`.apks`/`.xapk`) — a container whose
+    /// entries are content-probed individually during the Android pass.
+    AndroidPackage,
+}
+
+/// Everything one [`find_targets_opts`] walk found, plus non-target tallies.
+#[derive(Default)]
+pub struct ScanResult {
+    /// Crackproof-protected PE files.
+    pub crackproof: Vec<PathBuf>,
+    /// il2cpp `global-metadata.dat` blobs.
+    pub metadata: Vec<PathBuf>,
+    /// Protected AArch64 shared libraries.
+    pub android_so: Vec<PathBuf>,
+    /// Android app packages (containers restored entry-by-entry).
+    pub android_packages: Vec<PathBuf>,
+    pub stats: ScanStats,
 }
 
 /// Walk `root` recursively (skipping any directory literally named `"unpack"`)
@@ -146,7 +165,7 @@ enum Class {
 /// thread count: each worker owns a disjoint contiguous slice of the path list
 /// and writes the matching disjoint slice of the class list, so results are
 /// deterministic.
-pub fn find_targets(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, ScanStats) {
+pub fn find_targets(root: &Path) -> ScanResult {
     find_targets_opts(root, scan_all_env())
 }
 
@@ -169,7 +188,7 @@ pub struct ScanStats {
 /// [`find_targets`], but with the pre-filter explicitly controlled. When
 /// `scan_all` is true every regular file is probed, restoring the exhaustive
 /// (and on asset-heavy trees, far slower) behavior.
-pub fn find_targets_opts(root: &Path, scan_all: bool) -> (Vec<PathBuf>, Vec<PathBuf>, ScanStats) {
+pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
     // Phase 1: serial traversal collecting regular-file paths only. No file is
     // opened here; `readdir` is fast relative to the content probe that follows,
     // and `entry.metadata()` is served from the directory entry on Windows, so
@@ -246,19 +265,23 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> (Vec<PathBuf>, Vec<Path
         });
     }
 
-    let mut candidates = Vec::new();
-    let mut metadata = Vec::new();
+    let mut result = ScanResult {
+        stats,
+        ..ScanResult::default()
+    };
     for (p, c) in paths.into_iter().zip(class) {
         match c {
-            Some(Class::Crackproof) => candidates.push(p),
-            Some(Class::Metadata) => metadata.push(p),
-            Some(Class::None) => stats.skipped += 1,
+            Some(Class::Crackproof) => result.crackproof.push(p),
+            Some(Class::Metadata) => result.metadata.push(p),
+            Some(Class::AndroidSo) => result.android_so.push(p),
+            Some(Class::AndroidPackage) => result.android_packages.push(p),
+            Some(Class::None) => result.stats.skipped += 1,
             // Unreadable / panicking probe: NOT skipped — the scan could not
             // classify it, so it may be a target we failed to unpack.
-            None => stats.probe_errors += 1,
+            None => result.stats.probe_errors += 1,
         }
     }
-    (candidates, metadata, stats)
+    result
 }
 
 /// True if a walked directory entry is a reparse point (junction or symlink).
@@ -292,10 +315,11 @@ pub fn scan_all_env() -> bool {
 }
 
 /// Classify one file by content. Reads a short prefix once and tests the
-/// Crackproof detector first, then the il2cpp metadata magic. Returns `None`
-/// when the file could not be classified at all — an I/O error opening it
-/// (locked, permissions) or a panic inside a detector — so the caller counts
-/// it as a probe error rather than a clean "not a target" skip.
+/// Crackproof detector first, then the il2cpp metadata magic, then the
+/// Android probes. Returns `None` when the file could not be classified at
+/// all — an I/O error opening it (locked, permissions) or a panic inside a
+/// detector — so the caller counts it as a probe error rather than a clean
+/// "not a target" skip.
 ///
 /// The detector is wrapped in `catch_unwind` because a panic in a scan worker
 /// thread would otherwise abort the whole folder run (a scoped-thread panic
@@ -304,16 +328,32 @@ pub fn scan_all_env() -> bool {
 ///
 /// A Crackproof PE never matches the metadata magic (it is a PE, not a
 /// metadata blob) and vice versa, so the order is immaterial.
+///
+/// The Android library probe needs more than the prefix: the protection
+/// payload lives in a section found via the section-header table at the *end*
+/// of the file, so an ELF64/AArch64 prefix triggers a full-file read. Only
+/// aarch64 images pay for it — a handful of `.so` files per app tree, against
+/// tens of thousands of assets the free name/size checks already rejected.
 fn classify(path: &Path) -> Option<Class> {
     let head = read_prefix(path, DETECT_PREFIX)?;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if detect(&head).is_some() {
-            Class::Crackproof
-        } else if senbei_metadata::is_metadata(&head) {
-            Class::Metadata
-        } else {
-            Class::None
+            return Class::Crackproof;
         }
+        if senbei_metadata::is_metadata(&head) {
+            return Class::Metadata;
+        }
+        if crate::android::is_elf64_aarch64(&head)
+            && std::fs::read(path)
+                .map(|bytes| senbei_android_engine::is_protected_libil2cpp(&bytes))
+                .unwrap_or(false)
+        {
+            return Class::AndroidSo;
+        }
+        if crate::android::is_app_package(path, &head) {
+            return Class::AndroidPackage;
+        }
+        Class::None
     }));
     r.ok()
 }
@@ -370,11 +410,11 @@ mod tests {
         blob[..4].copy_from_slice(&0xFAB1_1BAFu32.to_le_bytes());
         std::fs::write(root.join("metadata"), &blob).unwrap();
 
-        let (_, filtered, _) = find_targets_opts(root, false);
-        assert!(filtered.is_empty());
+        let filtered = find_targets_opts(root, false);
+        assert!(filtered.metadata.is_empty());
 
-        let (_, exhaustive, _) = find_targets_opts(root, true);
-        assert_eq!(exhaustive.len(), 1);
+        let exhaustive = find_targets_opts(root, true);
+        assert_eq!(exhaustive.metadata.len(), 1);
     }
 
     /// A file below the Crackproof key-table bound is skipped without being
@@ -389,10 +429,10 @@ mod tests {
 
         // None of them are Crackproof, so both modes find nothing; the point is
         // that the filtered walk does not panic and honors `scan_all`.
-        let (c, m, _) = find_targets_opts(root, false);
-        assert!(c.is_empty() && m.is_empty());
-        let (c, m, _) = find_targets_opts(root, true);
-        assert!(c.is_empty() && m.is_empty());
+        let scan = find_targets_opts(root, false);
+        assert!(scan.crackproof.is_empty() && scan.metadata.is_empty());
+        let scan = find_targets_opts(root, true);
+        assert!(scan.crackproof.is_empty() && scan.metadata.is_empty());
     }
 
     /// An il2cpp metadata blob is found by the filtered scan: `.dat` is not on
@@ -407,9 +447,9 @@ mod tests {
         // Same magic but too small to be processable — skipped by the size floor.
         std::fs::write(root.join("stub.dat"), &blob[..64]).unwrap();
 
-        let (_, m, _) = find_targets_opts(root, false);
-        assert_eq!(m.len(), 1);
-        assert!(m[0].ends_with("global-metadata.dat"));
+        let scan = find_targets_opts(root, false);
+        assert_eq!(scan.metadata.len(), 1);
+        assert!(scan.metadata[0].ends_with("global-metadata.dat"));
     }
 
     /// Review regression: a previous output tree is pruned case-insensitively
@@ -428,12 +468,15 @@ mod tests {
         // A big non-target file at the root: probed, then skipped.
         std::fs::write(root.join("plain.dll"), vec![0u8; 100_000]).unwrap();
 
-        let (c, m, stats) = find_targets_opts(root, false);
+        let scan = find_targets_opts(root, false);
         assert!(
-            c.is_empty() && m.is_empty(),
+            scan.crackproof.is_empty() && scan.metadata.is_empty(),
             "old output tree must be pruned"
         );
-        assert_eq!(stats.skipped, 1, "the probed non-target counts as skipped");
-        assert_eq!(stats.walk_errors, 0);
+        assert_eq!(
+            scan.stats.skipped, 1,
+            "the probed non-target counts as skipped"
+        );
+        assert_eq!(scan.stats.walk_errors, 0);
     }
 }

@@ -19,16 +19,22 @@ pub fn progress(n: u64, quiet: bool) -> ProgressBar {
 
 /// Print a green success line, suspending the progress bar.
 pub fn ok(bar: &ProgressBar, quiet: bool, rel: &Path, kind: Kind, dest: &Path) {
+    ok_label(
+        bar,
+        quiet,
+        &rel.display().to_string(),
+        &format!("{kind:?}"),
+        dest,
+    );
+}
+
+/// Print a green success line with a free-form kind label (Android targets),
+/// suspending the progress bar.
+pub fn ok_label(bar: &ProgressBar, quiet: bool, rel: &str, label: &str, dest: &Path) {
     if quiet {
         return;
     }
-    let msg = format!(
-        "{} {:?}  {}  ->  {}",
-        "✓".green(),
-        kind,
-        rel.display(),
-        dest.display()
-    );
+    let msg = format!("{} {}  {}  ->  {}", "✓".green(), label, rel, dest.display());
     bar.suspend(|| println!("{msg}"));
 }
 

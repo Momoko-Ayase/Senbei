@@ -1,7 +1,8 @@
 # Senbei
 
-A static unpacker for Crackproof-protected 64-bit and 32-bit PE files. Point it
-at a file or a folder and it writes decrypted copies — no launch of the
+A static unpacker for Crackproof-protected 64-bit and 32-bit PE files and
+protected Android (AArch64) shared libraries. Point it at a file, an app
+package, or a folder and it writes decrypted copies — no launch of the
 protected program, no kernel driver, no code runs out of the protected binary.
 
 > _"Crackproof"? It's senbei (煎餅 — rice cracker). Cracks itself._
@@ -27,8 +28,12 @@ lives in [`web/`](web/).
   is lawful.
 - Senbei does not bypass any access control for you: it performs a purely
   static transformation of a file already on your disk. It derives everything
-  it needs from the input file itself, contains no vendor code or secrets, and
-  distributes no keys, cracks, or copyrighted content.
+  it needs from the input file itself, contains no vendor code, and
+  distributes no cracks or copyrighted content. (One Android packaging
+  variant's embedded metadata layer is unwrapped with an XOR keystream
+  recovered from a ciphertext/plaintext pair during analysis of a single
+  build; that keystream is research output shipped with the unpacker, not a
+  vendor-distributed key, and builds it doesn't match are left alone.)
 - Senbei does not enable online play, license fraud, or cheating, and must not
   be used to redistribute decrypted binaries. Do not upload outputs anywhere.
 - The authors provide this software "as is", without warranty of any kind, and
@@ -47,9 +52,13 @@ lives in [`web/`](web/).
 | `ManagedDll` | Protected .NET assembly (has a CLR data directory). |
 | `._` companion | Stub + external encrypted payload layout, spliced automatically. |
 | `global-metadata.dat` | il2cpp metadata with obfuscated method tokens, de-obfuscated in place. |
+| Android `.so` | Protected AArch64 shared library, statically restored (hollowed sections + stripped dynamic tables rebuilt). |
+| `.apk` / `.apks` / `.xapk` | App packages; protected entries inside are restored, preserving the package's internal layout. |
 
 Detection is content-based (header key-table at offset 4096, magic `KONN`),
-not extension-based. Anything unrecognized is left untouched.
+not extension-based — app packages are the one exception, recognised by
+extension plus the zip magic because they are containers. Anything
+unrecognized is left untouched.
 
 ## Quick start
 
@@ -58,6 +67,9 @@ cargo build --release
 
 senbei protected.exe
 :: -> unpack\protected.unpack.exe
+
+senbei game.apk
+:: -> unpack\game.apk\lib\arm64-v8a\libil2cpp.unpack.so
 
 senbei "C:\Games\MyGame"
 :: -> C:\Games\MyGame\unpack\...  (recursive, skips non-targets)

@@ -4,13 +4,18 @@ Guidance for AI coding agents (and human contributors) working in this repo.
 
 ## Project
 
-Senbei is a static unpacker for Crackproof-protected PE files: a Cargo
-workspace with a pure, panic-free, no-I/O unpacker core (`senbei-pe/`, built
-on `senbei-crypto/`), an il2cpp metadata de-obfuscator (`senbei-metadata/`),
-filesystem/CLI orchestration (`senbei-io/`), the `senbei` binary
-(`senbei-cli/`), WebAssembly bindings (`senbei-wasm/`, outside the workspace;
-builds into `web/pkg/`), and the static browser frontend assets (`web/`).
-Read `docs/design.md` first.
+Senbei is a static unpacker for Crackproof-protected PE files and protected
+Android (AArch64) shared libraries: a Cargo workspace with a pure, panic-free,
+no-I/O PE unpacker core (`senbei-pe/`, built on `senbei-crypto/`), il2cpp
+metadata de-obfuscators (`senbei-metadata/` for the Windows structural
+variant, `senbei-android-metadata/` for the Android seeded-permutation and
+embedded-blob variants), the native-only Android pipeline
+(`senbei-android-crypto/`, `senbei-android-engine/`, `senbei-android-elf/`),
+filesystem/CLI orchestration (`senbei-io/`, including the Android
+single-library/package glue in `senbei-io/src/android.rs`), the `senbei`
+binary (`senbei-cli/`), WebAssembly bindings (`senbei-wasm/`, outside the
+workspace; builds into `web/pkg/`), and the static browser frontend assets
+(`web/`). Read `docs/design.md` first.
 
 ## Commands
 
@@ -24,15 +29,26 @@ cd senbei-wasm && wasm-pack build --target web --release --out-dir ../web/pkg   
 
 The `samples/` corpus is user-managed and absent on CI; without it the
 samples test is a no-op pass. `SENBEI_REQUIRE_SAMPLES=1` makes an absent
-corpus fail (use this on a private CI that *does* have the corpus). Do not
+corpus fail (use this on a private CI that *does* have the corpus). The
+Android corpus lives in `samples/android/` (one extracted app tree per
+subdirectory) and is covered by `tests/android_samples.rs`;
+`SENBEI_ANDROID_SAMPLES` overrides that location. Do not
 delete `samples/` with `rm -rf` — it may be a junction; use git
 worktree-aware cleanup.
 
 ## Hard rules
 
-- **The unpacker core stays pure**: no file I/O, no `unsafe`, no panics across
-  the public boundary, no platform-specific code. It must keep compiling to
-  `wasm32-unknown-unknown` (`cargo check --target wasm32-unknown-unknown`).
+- **The PE unpacker core stays pure**: `senbei-pe` and `senbei-crypto` have no
+  file I/O, no `unsafe`, no panics across the public boundary, no
+  platform-specific code. Everything `senbei-wasm` compiles must keep building
+  for `wasm32-unknown-unknown` (`cargo check --target wasm32-unknown-unknown`
+  at the workspace root covers it — the Android crates do compile to wasm, but
+  nothing on the wasm path calls them).
+- **The Android crates are native-only orchestration-style crates**:
+  `senbei-android-engine`/`senbei-android-elf` memory-map inputs and write a
+  module workspace to disk (the restore is a two-phase design consuming that
+  workspace). Keep them off the web app's code paths; `senbei-io`'s
+  `android.rs` is the only caller the CLI uses.
 - **`catch_unwind` does not work on wasm** (the prebuilt std can't unwind; a
   caught panic becomes a fatal `unreachable` trap). Native code may rely on
   `catch_unpack`, but any routing decision must also work without a catchable

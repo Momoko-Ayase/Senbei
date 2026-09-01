@@ -82,3 +82,24 @@ cargo test --release --test samples -- --nocapture
 - A **companion** is `<input file name>._` (e.g. `stub.dll._` for `stub.dll`).
   Its extension is `_`, so it is never picked up as an input of its own; it is
   read only when its base module is processed.
+
+## Android corpus (`samples/android/`)
+
+The `android/` subfolder holds Android samples, one **extracted app tree** per
+subdirectory (the layout an APK unpacks to: `lib/<abi>/*.so`,
+`assets/.../global-metadata.dat`, ...). The test
+(`tests/android_samples.rs`) finds protected AArch64 libraries by content and
+restores them through the real pipeline. `SENBEI_ANDROID_SAMPLES` overrides
+the corpus location.
+
+Sidecar conventions (all next to the protected `.so` input):
+
+| File | Meaning |
+| ---- | ------- |
+| `<base>.golden.so.sha256` | Expected SHA-256 of the restored library |
+| `<base>.golden.metadata.sha256` | Expected SHA-256 of the unwrapped embedded metadata blob (when the library carries one) |
+| `<base>.restore-fails` | Empty marker: this input's restore is a known gap and *must* fail (a future fix fails the test, prompting marker removal) |
+
+A missing sidecar is a warning (with the computed digest printed, ready to
+promote), never a failure. App packages (`.apk`/`.apks`/`.xapk`) dropped into
+a tree are exercised by folder mode as containers.
