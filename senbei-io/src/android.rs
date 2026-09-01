@@ -108,7 +108,7 @@ pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Optio
 pub fn content_identity(data: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(data);
-    format!("{:x}", digest.finalize())
+    hex_digest(&digest.finalize())
 }
 
 /// Restore an il2cpp metadata blob (Android seeded permutation first, then the
@@ -217,7 +217,7 @@ pub fn restore_package(
     for index in 0..archive.len() {
         let (name, is_dir) = {
             let entry = archive.by_index(index)?;
-            (entry.enclosed_name().map(PathBuf::from), entry.is_dir())
+            (entry.enclosed_name(), entry.is_dir())
         };
         if is_dir {
             continue;
@@ -256,7 +256,7 @@ pub fn restore_package(
         for nested_index in 0..nested_archive.len() {
             let (entry_name, is_dir) = {
                 let entry = nested_archive.by_index(nested_index)?;
-                (entry.enclosed_name().map(PathBuf::from), entry.is_dir())
+                (entry.enclosed_name(), entry.is_dir())
             };
             if !is_dir {
                 let Some(entry_name) = entry_name else {
@@ -429,4 +429,13 @@ fn extract_entry(
     }
     std::fs::write(&destination, &output)?;
     Ok(destination)
+}
+/// Lowercase hex of a digest output (sha2 0.11's `Array` no longer formats as
+/// hex directly).
+fn hex_digest(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 2);
+    for byte in data {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }

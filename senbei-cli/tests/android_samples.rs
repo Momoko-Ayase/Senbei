@@ -77,7 +77,11 @@ fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
     digest.update(data);
-    format!("{:x}", digest.finalize())
+    let mut out = String::with_capacity(64);
+    for byte in digest.finalize() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// `<stem>.golden.so.sha256` next to `input`.

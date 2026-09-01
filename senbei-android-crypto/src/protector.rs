@@ -1,7 +1,7 @@
 //! Cryptographic and compression primitives used by the Android protector.
 
 use aes::Aes256;
-use aes::cipher::{Block, BlockDecrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 
 const RECORD_SIZE: usize = 0x5c;
 
@@ -582,7 +582,8 @@ pub fn transform_segment(
         for chunk in transformed[..aligned_size].chunks_exact_mut(16) {
             let mut ciphertext = [0_u8; 16];
             ciphertext.copy_from_slice(chunk);
-            cipher.decrypt_block(Block::<Aes256>::from_mut_slice(chunk));
+            // chunk is exactly one block (chunks_exact_mut(16)).
+            cipher.decrypt_block(chunk.try_into().expect("chunk is one block"));
             for (byte, prior) in chunk.iter_mut().zip(previous) {
                 *byte ^= prior;
             }

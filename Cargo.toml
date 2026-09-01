@@ -23,7 +23,7 @@ rust-version = "1.85"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-aes = "0.8"
+aes = "0.9"
 anyhow = "1"
 flate2 = "1"
 goblin = "0.10"
@@ -33,7 +33,7 @@ memmap2 = "0.9"
 owo-colors = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 walkdir = "2"
@@ -42,7 +42,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_SystemInformation",
 ] }
-zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 senbei-android-crypto = { path = "senbei-android-crypto" }
 senbei-android-elf = { path = "senbei-android-elf" }
 senbei-android-engine = { path = "senbei-android-engine" }
