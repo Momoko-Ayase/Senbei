@@ -1,4 +1,4 @@
-//! Static restoration of protected IL2CPP v31 method tokens.
+//! Static restoration of protected IL2CPP method tokens for verified layouts.
 
 use serde::Serialize;
 
@@ -6,12 +6,11 @@ use serde::Serialize;
 pub const DEFAULT_METHOD_TOKEN_SEED: u32 = 0xa6fa_e968;
 
 const MAGIC: u32 = 0xfab1_1baf;
-const SUPPORTED_VERSION: u32 = 31;
+const SUPPORTED_V29: u32 = 29;
+const SUPPORTED_V31: u32 = 31;
 const HDR_METHODS: usize = 0x30;
 const HDR_TYPES: usize = 0xa0;
 const HDR_IMAGES: usize = 0xa8;
-const METHOD_STRIDE: usize = 0x24;
-const METHOD_TOKEN_OFFSET: usize = 0x18;
 const TYPE_STRIDE: usize = 0x58;
 const TYPE_METHOD_START_OFFSET: usize = 0x24;
 const TYPE_METHOD_COUNT_OFFSET: usize = 0x40;
@@ -19,6 +18,33 @@ const IMAGE_STRIDE: usize = 0x28;
 const IMAGE_TYPE_START_OFFSET: usize = 0x08;
 const IMAGE_TYPE_COUNT_OFFSET: usize = 0x0c;
 const METHOD_TOKEN_TABLE: u32 = 0x0600_0000;
+
+// The aliases keep the v31 synthetic fixtures readable; production paths use
+// the version-specific layout returned by `layout_for_version`.
+#[cfg(test)]
+const METHOD_STRIDE: usize = 0x24;
+#[cfg(test)]
+const METHOD_TOKEN_OFFSET: usize = 0x18;
+
+#[derive(Clone, Copy)]
+struct Layout {
+    method_stride: usize,
+    method_token_offset: usize,
+}
+
+fn layout_for_version(version: u32) -> Option<Layout> {
+    match version {
+        SUPPORTED_V29 => Some(Layout {
+            method_stride: 0x20,
+            method_token_offset: 0x14,
+        }),
+        SUPPORTED_V31 => Some(Layout {
+            method_stride: 0x24,
+            method_token_offset: 0x18,
+        }),
+        _ => None,
+    }
+}
 
 /// Summary of one metadata restoration pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -174,20 +200,20 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
     if version == 39 {
         return restore_v39(data, seed);
     }
-    if version != SUPPORTED_VERSION {
+    let Some(layout) = layout_for_version(version) else {
         return Err(Error::UnsupportedVersion(version));
-    }
+    };
 
     let (method_offset, method_size) = table(data, HDR_METHODS)?;
     let (type_offset, type_size) = table(data, HDR_TYPES)?;
     let (image_offset, image_size) = table(data, HDR_IMAGES)?;
-    if method_size % METHOD_STRIDE != 0
+    if method_size % layout.method_stride != 0
         || type_size % TYPE_STRIDE != 0
         || image_size % IMAGE_STRIDE != 0
     {
-        return malformed("v31 table size is not divisible by its entry stride");
+        return malformed("method/type/image table size is not divisible by its entry stride");
     }
-    let method_count = method_size / METHOD_STRIDE;
+    let method_count = method_size / layout.method_stride;
     let type_count = type_size / TYPE_STRIDE;
     let image_count = image_size / IMAGE_STRIDE;
     let mut owners = vec![u32::MAX; method_count];
@@ -267,7 +293,8 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
         let mut tokens = Vec::with_capacity(methods.len());
         let mut image_already_clean = true;
         for &method_index in &methods {
-            let token_offset = method_offset + method_index * METHOD_STRIDE + METHOD_TOKEN_OFFSET;
+            let token_offset =
+                method_offset + method_index * layout.method_stride + layout.method_token_offset;
             let token = read_u32(data, token_offset)?;
             if token & 0xff00_0000 != METHOD_TOKEN_TABLE {
                 return malformed(format!(
@@ -360,7 +387,7 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
     ))
 }
 
-/// Discover seeds compatible with the known v31 five-round RID permutation.
+/// Discover seeds compatible with the known five-round RID permutation.
 ///
 /// This is diagnostic and does not modify metadata. It enumerates the only
 /// possible per-image key residues and intersects them over the 32-bit seed
@@ -374,23 +401,23 @@ pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
     if version == 39 {
         return discover_v39(data);
     }
-    if version != SUPPORTED_VERSION {
+    let Some(layout) = layout_for_version(version) else {
         return Ok(SeedDiscoveryReport {
             version,
             images: Vec::new(),
             seed_candidates: Vec::new(),
         });
-    }
+    };
     let (method_offset, method_size) = table(data, HDR_METHODS)?;
     let (type_offset, type_size) = table(data, HDR_TYPES)?;
     let (image_offset, image_size) = table(data, HDR_IMAGES)?;
-    if method_size % METHOD_STRIDE != 0
+    if method_size % layout.method_stride != 0
         || type_size % TYPE_STRIDE != 0
         || image_size % IMAGE_STRIDE != 0
     {
-        return malformed("v31 table size is not divisible by its entry stride");
+        return malformed("method/type/image table size is not divisible by its entry stride");
     }
-    let method_count = method_size / METHOD_STRIDE;
+    let method_count = method_size / layout.method_stride;
     let type_count = type_size / TYPE_STRIDE;
     let image_count = image_size / IMAGE_STRIDE;
     let mut reports = Vec::with_capacity(image_count);
@@ -452,7 +479,7 @@ pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
         for method_index in methods {
             let token = read_u32(
                 data,
-                method_offset + method_index * METHOD_STRIDE + METHOD_TOKEN_OFFSET,
+                method_offset + method_index * layout.method_stride + layout.method_token_offset,
             )?;
             if token & 0xff00_0000 != METHOD_TOKEN_TABLE {
                 return validation(format!(
@@ -1033,7 +1060,7 @@ mod tests {
         let methods = types + 2 * TYPE_STRIDE;
         let mut data = vec![0_u8; methods + tokens.len() * METHOD_STRIDE];
         put_u32(&mut data, 0, MAGIC);
-        put_u32(&mut data, 4, SUPPORTED_VERSION);
+        put_u32(&mut data, 4, SUPPORTED_V31);
         put_u32(&mut data, HDR_METHODS, methods as u32);
         put_u32(
             &mut data,
@@ -1082,6 +1109,50 @@ mod tests {
                 )
                 .expect("token"),
                 METHOD_TOKEN_TABLE | (index as u32 + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn restores_v29_method_tokens_with_legacy_method_layout() {
+        let method_stride = 0x20;
+        let method_token_offset = 0x14;
+        let hdr = 0x100usize;
+        let images = hdr;
+        let types = images + IMAGE_STRIDE;
+        let methods = types + 2 * TYPE_STRIDE;
+        let mut data = vec![0_u8; methods + 7 * method_stride];
+        put_u32(&mut data, 0, MAGIC);
+        put_u32(&mut data, 4, SUPPORTED_V29);
+        put_u32(&mut data, HDR_METHODS, methods as u32);
+        put_u32(&mut data, HDR_METHODS + 4, (7 * method_stride) as u32);
+        put_u32(&mut data, HDR_TYPES, types as u32);
+        put_u32(&mut data, HDR_TYPES + 4, (2 * TYPE_STRIDE) as u32);
+        put_u32(&mut data, HDR_IMAGES, images as u32);
+        put_u32(&mut data, HDR_IMAGES + 4, IMAGE_STRIDE as u32);
+        put_u32(&mut data, images + IMAGE_TYPE_START_OFFSET, 0);
+        put_u32(&mut data, images + IMAGE_TYPE_COUNT_OFFSET, 2);
+        put_u32(&mut data, types + TYPE_METHOD_START_OFFSET, 0);
+        put_u16(&mut data, types + TYPE_METHOD_COUNT_OFFSET, 3);
+        put_u32(&mut data, types + TYPE_STRIDE + TYPE_METHOD_START_OFFSET, 3);
+        put_u16(&mut data, types + TYPE_STRIDE + TYPE_METHOD_COUNT_OFFSET, 4);
+        for expected in 1..=7 {
+            let encrypted = encrypted_rid(expected, 7, DEFAULT_METHOD_TOKEN_SEED);
+            put_u32(
+                &mut data,
+                methods + (expected as usize - 1) * method_stride + method_token_offset,
+                METHOD_TOKEN_TABLE | encrypted,
+            );
+        }
+        let (restored, report) =
+            restore_method_tokens(&data, DEFAULT_METHOD_TOKEN_SEED).expect("v29 restore");
+        assert_eq!(report.version, SUPPORTED_V29);
+        assert_eq!(report.changed_tokens, 7);
+        for expected in 1..=7 {
+            let offset = methods + (expected as usize - 1) * method_stride + method_token_offset;
+            assert_eq!(
+                read_u32(&restored, offset).unwrap(),
+                METHOD_TOKEN_TABLE | expected
             );
         }
     }

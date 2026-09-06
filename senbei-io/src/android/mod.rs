@@ -135,7 +135,7 @@ pub fn content_identity(data: &[u8]) -> String {
 /// already-clean blob.
 pub fn restore_metadata_bytes(data: &[u8]) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
     if let Ok(discovery) = senbei_metadata::android::discover_method_token_seeds(data)
-        && matches!(discovery.version, 31 | 39)
+        && matches!(discovery.version, 29 | 31 | 39)
     {
         let mut seeds = discovery.seed_candidates.clone();
         if seeds.is_empty() {
