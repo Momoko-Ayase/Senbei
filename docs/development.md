@@ -23,7 +23,7 @@ For an Android package, use one command at a time because a protected `.so` can 
 - `DD8_SHIFT` overrides the PE page-XOR shift; `99` skips that stage.
 - `SEL_DIAG` prints PE layout-selector diagnostics.
 - `SENBEI_THREADS` caps deterministic block fan-out; `1` forces the sequential reference path.
-- `SENBEI_SCAN_ALL` enables the explicit scan-all mode for selected target names.
+- `SENBEI_SCAN_ALL` enables probing selected target names below the size floor; it never enables arbitrary filenames.
 - `SENBEI_ANDROID_SAMPLES` overrides the Android sample corpus location.
 
 ## Conventions

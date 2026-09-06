@@ -7,8 +7,8 @@ description = "Filesystem, scanning, logging, and CLI orchestration for Senbei"
 
 [dependencies]
 anyhow.workspace = true
-flate2.workspace = true
 indicatif.workspace = true
+memmap2.workspace = true
 owo-colors.workspace = true
 senbei-engine.workspace = true
 senbei-metadata.workspace = true

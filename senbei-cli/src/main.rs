@@ -104,8 +104,7 @@ fn print_help() {
          \x20              these"
     );
     println!(
-        "  --scan-all   probe every file in a folder, including ones the scan\n\
-         \x20              pre-filter skips (under 4128 bytes, extensionless,\n\
-         \x20              or a bulk-asset extension). Much slower on large trees."
+        "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\
+         \x20              size floor; other filenames remain excluded."
     );
 }

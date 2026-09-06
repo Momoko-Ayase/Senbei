@@ -403,11 +403,8 @@ pub fn run_folder_v(
 
 /// Like [`run_folder_v`], but with the scan pre-filter explicitly controlled.
 ///
-/// When `scan_all` is true every regular file under `root` is opened and
-/// content-probed, instead of skipping ones the free directory metadata already
-/// rules out (extensionless, too small to hold a Crackproof key table, or a
-/// bulk-asset extension). See [`crate::scan::find_targets_opts`] — exhaustive
-/// scanning is dramatically slower on asset-heavy trees.
+/// When `scan_all` is true selected target names below the minimum size are
+/// also opened and content-probed. Other filenames are never opened.
 pub fn run_folder_opts(
     root: &Path,
     out_dir: Option<&Path>,
@@ -549,8 +546,8 @@ pub fn run_folder_opts(
         let dest = out_root.join(out_name(&rel));
         // Unreadable here is fine: the restore reports the same error.
         if android_dedup
-            && let Ok(bytes) = std::fs::read(input)
-            && !android_seen.insert(crate::android::content_identity(&bytes))
+            && let Ok(identity) = crate::android::file_content_identity(input)
+            && !android_seen.insert(identity)
         {
             s.skipped += 1;
             if let Some(log) = &log {
@@ -816,10 +813,8 @@ pub fn run_file_v(
     // library probe needs the whole file (its payload section is found through
     // the section-header table at the end), while a package is a container
     // handled entry-by-entry. Anything else falls through to the PE pipeline.
-    let is_android_so = crate::android::is_elf64_aarch64(&prefix)
-        && std::fs::read(input)
-            .map(|bytes| senbei_engine::android::is_protected_libil2cpp(&bytes))
-            .unwrap_or(false);
+    let is_android_so =
+        crate::android::is_elf64_aarch64(&prefix) && crate::android::is_protected_so_file(input);
     let is_android_package = !is_android_so && crate::android::is_app_package(input, &prefix);
 
     if is_meta {

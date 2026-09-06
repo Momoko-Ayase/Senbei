@@ -16,11 +16,12 @@
 //! app (wasm) never touches them.
 
 use std::collections::HashSet;
-use std::io::{BufWriter, Write};
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use flate2::read::DeflateDecoder;
+use memmap2::{Mmap, MmapOptions};
 use senbei_engine::android::{ExtractOptions, extract_stage2, is_protected_libil2cpp};
 use senbei_engine::android::{RestoreOptions, restore_libil2cpp};
 use sha2::{Digest, Sha256};
@@ -30,8 +31,8 @@ use zip::ZipArchive;
 pub const METADATA_FILE_NAME: &str = "global-metadata.dat";
 
 /// Package extensions recognised as Android app packages. Packages are
-/// *containers*: membership is decided by extension plus the zip magic, while
-/// every file pulled out of one is still content-probed like a loose file.
+/// *containers*: membership is decided by extension plus the ZIP magic, while
+/// only `.so` and `global-metadata.dat` entries are read.
 const PACKAGE_EXTENSIONS: [&str; 3] = ["apk", "apks", "xapk"];
 
 /// Whether `prefix` (the first bytes of a file) is an ELF64/AArch64 image.
@@ -65,10 +66,21 @@ pub fn is_app_package(path: &Path, prefix: &[u8]) -> bool {
 /// section-header table at the end); call only after [`is_elf64_aarch64`]
 /// has matched a prefix.
 pub fn is_protected_so_file(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(bytes) = map_read_only(&file, path) else {
         return false;
     };
     is_elf64_aarch64(&bytes) && is_protected_libil2cpp(&bytes)
+}
+
+pub fn file_content_identity(path: &Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    // SAFETY: the file remains open for the mapping lifetime and the mapping
+    // is read-only.
+    let bytes = unsafe { MmapOptions::new().map(&file)? };
+    Ok(content_identity(&bytes))
 }
 
 /// Restore one protected `.so` to `dest`.
@@ -238,19 +250,24 @@ pub fn restore_package(
             }
         }
     }
-    drop(archive);
-
     for (index, name) in direct {
         let label = format!("{}::{}", rel.display(), name.display());
         let dest = out_root.join(rel).join(crate::job::out_name(&name));
-        let mut entry_outcomes =
-            restore_package_entry(package, index, &label, &dest, &temporary, seen, verbose)
-                .with_context(|| format!("extract `{label}`"))?;
+        let mut entry_outcomes = restore_package_entry(
+            &mut archive,
+            index,
+            &label,
+            &dest,
+            &temporary,
+            seen,
+            verbose,
+        )
+        .with_context(|| format!("extract `{label}`"))?;
         outcomes.append(&mut entry_outcomes);
     }
     for (index, name) in nested {
         let nested_label = rel.join(&name);
-        let nested_path = extract_entry(package, index, &temporary, &nested_label)
+        let nested_path = extract_entry(&mut archive, index, &temporary, &nested_label)
             .with_context(|| format!("extract `{}`", nested_label.display()))?;
         let mut nested_archive = open_package(&nested_path)?;
         let mut entries = Vec::new();
@@ -268,7 +285,6 @@ pub fn restore_package(
                 }
             }
         }
-        drop(nested_archive);
         // Keep the nested package's stem in the output layout so two splits
         // carrying same-named entries cannot collide.
         let base = rel.join(name.with_extension(""));
@@ -276,7 +292,7 @@ pub fn restore_package(
             let label = format!("{}::{}", nested_label.display(), entry_name.display());
             let dest = out_root.join(&base).join(crate::job::out_name(&entry_name));
             let mut entry_outcomes = restore_package_entry(
-                &nested_path,
+                &mut nested_archive,
                 nested_index,
                 &label,
                 &dest,
@@ -294,8 +310,8 @@ pub fn restore_package(
 /// Probe one extracted package entry and restore it when it is a target.
 /// Returns one outcome per produced/consumed artifact: the entry itself, plus
 /// an `EmbeddedMetadata` outcome when the restored library carried a blob.
-fn restore_package_entry(
-    package: &Path,
+fn restore_package_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     index: usize,
     label: &str,
     dest: &Path,
@@ -303,11 +319,13 @@ fn restore_package_entry(
     seen: &mut HashSet<String>,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
-    let entry_path = extract_entry(package, index, temporary, Path::new(label))?;
-    let data = std::fs::read(&entry_path).with_context(|| format!("read extracted `{label}`"))?;
+    let entry_path = extract_entry(archive, index, temporary, Path::new(label))?;
+    let entry_file =
+        File::open(&entry_path).with_context(|| format!("open extracted `{label}`"))?;
+    let entry_data = map_read_only(&entry_file, &entry_path)?;
 
-    let is_so = is_elf64_aarch64(&data) && is_protected_libil2cpp(&data);
-    let is_meta = !is_so && senbei_metadata::is_metadata(&data);
+    let is_so = is_elf64_aarch64(&entry_data) && is_protected_libil2cpp(&entry_data);
+    let is_meta = !is_so && senbei_metadata::is_metadata(&entry_data);
     let outcome = |kind, status| EntryOutcome {
         label: label.to_owned(),
         dest: dest.to_path_buf(),
@@ -317,7 +335,7 @@ fn restore_package_entry(
     if !is_so && !is_meta {
         return Ok(vec![outcome(EntryKind::So, EntryStatus::NotTarget)]);
     }
-    if !seen.insert(content_identity(&data)) {
+    if !seen.insert(content_identity(&entry_data)) {
         let kind = if is_so {
             EntryKind::So
         } else {
@@ -327,7 +345,8 @@ fn restore_package_entry(
     }
 
     if is_so {
-        drop(data);
+        drop(entry_data);
+        drop(entry_file);
         return Ok(match restore_so_file(&entry_path, dest, verbose) {
             Ok(embedded) => {
                 let mut outcomes = vec![outcome(EntryKind::So, EntryStatus::Restored)];
@@ -352,7 +371,7 @@ fn restore_package_entry(
 
     // Metadata entry: write only when the restore actually changed tokens —
     // a clean blob needs no copy (same contract as loose metadata files).
-    let kind_and_status = match restore_metadata_bytes(&data) {
+    let kind_and_status = match restore_metadata_bytes(&entry_data) {
         Ok((out, report)) if report.remapped > 0 => {
             let kind = EntryKind::Metadata {
                 remapped: report.remapped,
@@ -396,31 +415,24 @@ fn open_package(path: &Path) -> Result<ZipArchive<std::fs::File>> {
     ZipArchive::new(file).with_context(|| format!("read package `{}`", path.display()))
 }
 
-/// Extract one package entry to the temporary workspace, streaming stored
-/// entries and inflating deflated ones by hand so compression-method
-/// surprises fail loudly instead of producing a truncated file.
-fn extract_entry(
-    package: &Path,
+/// Stream one package entry to a temporary, seekable file. The Android engine
+/// needs random access to ELF section tables, while the ZIP reader itself is
+/// consumed directly without creating an in-memory compressed or decompressed
+/// copy.
+fn extract_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     index: usize,
     temporary: &tempfile::TempDir,
     label: &Path,
 ) -> Result<PathBuf> {
-    let mut archive = open_package(package)?;
-    let mut entry = archive.by_index_raw(index)?;
+    let mut entry = archive.by_index(index)?;
     let key = format!("{}-{index:08x}", label.display());
     // `:` appears in `package::entry` labels and is invalid in Windows file
     // names; sanitize every path-ish separator.
     let destination = temporary.path().join(key.replace(['\\', '/', ':'], "_"));
     let output_size = entry.size();
     let mut output = BufWriter::new(std::fs::File::create(&destination)?);
-    let written = match entry.compression() {
-        zip::CompressionMethod::Stored => std::io::copy(&mut entry, &mut output)?,
-        zip::CompressionMethod::Deflated => {
-            let mut decoder = DeflateDecoder::new(&mut entry);
-            std::io::copy(&mut decoder, &mut output)?
-        }
-        method => bail!("unsupported compression method {method:?} in entry `{key}`"),
-    };
+    let written = std::io::copy(&mut entry, &mut output)?;
     output.flush()?;
     if written != output_size {
         bail!(
@@ -429,6 +441,13 @@ fn extract_entry(
         );
     }
     Ok(destination)
+}
+
+fn map_read_only(file: &File, path: &Path) -> Result<Mmap> {
+    // SAFETY: the file descriptor remains open for the returned mapping's
+    // lifetime, and this mapping is read-only.
+    unsafe { MmapOptions::new().map(file) }
+        .with_context(|| format!("map extracted `{}`", path.display()))
 }
 /// Lowercase hex of a digest output (sha2 0.11's `Array` no longer formats as
 /// hex directly).

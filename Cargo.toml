@@ -23,7 +23,6 @@ license = "AGPL-3.0-only"
 [workspace.dependencies]
 aes = "0.9"
 anyhow = "1"
-flate2 = "1"
 goblin = "0.10"
 indicatif = "0.18"
 libc = "0.2"
