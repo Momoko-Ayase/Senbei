@@ -1,11 +1,9 @@
 [workspace]
 members = [
-    "senbei-android-crypto",
-    "senbei-android-elf",
-    "senbei-android-engine",
-    "senbei-android-metadata",
     "senbei-cli",
     "senbei-crypto",
+    "senbei-elf",
+    "senbei-engine",
     "senbei-io",
     "senbei-metadata",
     "senbei-pe",
@@ -43,11 +41,9 @@ windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
 ] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-senbei-android-crypto = { path = "senbei-android-crypto" }
-senbei-android-elf = { path = "senbei-android-elf" }
-senbei-android-engine = { path = "senbei-android-engine" }
-senbei-android-metadata = { path = "senbei-android-metadata" }
 senbei-crypto = { path = "senbei-crypto" }
+senbei-elf = { path = "senbei-elf" }
+senbei-engine = { path = "senbei-engine" }
 senbei-io = { path = "senbei-io" }
 senbei-metadata = { path = "senbei-metadata" }
 senbei-pe = { path = "senbei-pe" }

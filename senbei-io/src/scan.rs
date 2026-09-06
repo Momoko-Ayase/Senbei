@@ -1,4 +1,4 @@
-use senbei_pe::detect;
+use senbei_engine::detect;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -16,7 +16,7 @@ const DETECT_PREFIX: u64 = 8 * 1024;
 /// Smallest file that can possibly be a target, so anything shorter is skipped
 /// without ever being opened.
 ///
-/// A Crackproof module needs ≥ 4128 bytes for [`senbei_pe::detect`]'s key
+/// A Crackproof module needs ≥ 4128 bytes for [`senbei_engine::detect`]'s key
 /// table (it reads the dword at 4124), so the bound is exact for the unpack
 /// path. An il2cpp `global-metadata.dat` only needs 4 bytes to match its magic,
 /// but its header alone runs to offset 0xB0 and the images/types/methods tables
@@ -25,14 +25,59 @@ const DETECT_PREFIX: u64 = 8 * 1024;
 /// processable is lost.
 const MIN_SIZE: u64 = 4128;
 
-/// File extensions that are bulk data by construction and can never be a PE
-/// image or an il2cpp metadata blob.
-///
-/// This is deliberately a **deny**-list, not an executable allow-list: unknown
-/// extensions are still probed. Extensionless files are handled separately by
-/// [`denied_name`] because asset stores commonly contain tens of thousands of
-/// extensionless chunks; exhaustive probing remains available through
-/// `--scan-all`.
+const METADATA_FILE_NAME: &str = "global-metadata.dat";
+
+fn is_metadata_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(METADATA_FILE_NAME))
+}
+
+fn is_target_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("exe")
+                || ext.eq_ignore_ascii_case("dll")
+                || ext.eq_ignore_ascii_case("so")
+        })
+}
+
+fn is_android_package_name(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("apk")
+                || ext.eq_ignore_ascii_case("apks")
+                || ext.eq_ignore_ascii_case("xapk")
+        })
+}
+
+/// External Windows payloads are consumed through their sibling `.exe`/`.dll`
+/// stub. They are valid input bytes, but are not independent unpack targets.
+pub(crate) fn is_windows_companion(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stub_name) = name.strip_suffix("._") else {
+        return false;
+    };
+    let stub_path = Path::new(stub_name);
+    stub_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+}
+
+pub(crate) fn is_android_entry_name(path: &Path) -> bool {
+    is_metadata_name(path)
+        || path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+}
+
+/// File extensions that are bulk data by construction and can never be a target.
 ///
 /// Set `SENBEI_SCAN_ALL=1` (or pass `--scan-all`) to probe every file regardless.
 const DENY_EXT: &[&str] = &[
@@ -89,9 +134,7 @@ const DENY_EXT: &[&str] = &[
     "sr",
 ];
 
-/// Whether `path` can be skipped from its name alone. Extensionless files and
-/// files whose extension is on [`DENY_EXT`] are not opened during a default
-/// scan. `--scan-all` remains available when exhaustive probing is required.
+/// Whether `path` can be skipped from its name alone.
 fn denied_name(path: &Path) -> bool {
     let Some(ext) = path.extension() else {
         return true;
@@ -151,16 +194,14 @@ pub struct ScanResult {
 /// per-file I/O latency, not bandwidth (that tree lives on a user-mode virtual
 /// disk that tops out near 1,300 IOPS). Thread count barely moves it either.
 ///
-/// So the only lever is **probing fewer files**, which is what [`MIN_SIZE`] and
-/// [`DENY_EXT`] do — both decided from the free directory metadata, before any
-/// file is opened. On that tree they cut 46,446 probes to 1,814 and the scan
-/// from ~40 s to ~2 s while still finding every target.
+/// So the only lever is **probing fewer files**, which is what the target-name
+/// filter and [`MIN_SIZE`] do — both decided before any file is opened.
 ///
 /// The surviving probes (open + short read + magic test) are fanned out across
 /// worker threads. Directory traversal itself stays serial (one cheap `readdir`
 /// pass, no file opens) because it feeds the parallel probe.
 ///
-/// Thread count follows [`crate::unpacker::parallel::thread_cap`] (honoring
+/// Thread count follows [`senbei_engine::thread_cap`] (honoring
 /// `SENBEI_THREADS`, `1` = fully sequential). Output order is independent of
 /// thread count: each worker owns a disjoint contiguous slice of the path list
 /// and writes the matching disjoint slice of the class list, so results are
@@ -224,6 +265,15 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
         if !entry.file_type().is_file() {
             continue;
         }
+        if is_windows_companion(entry.path()) {
+            continue;
+        }
+        if !is_metadata_name(entry.path())
+            && !is_target_extension(entry.path())
+            && !is_android_package_name(entry.path())
+        {
+            continue;
+        }
         if !scan_all {
             // Name checks come first so extensionless asset chunks never
             // trigger even an explicit metadata query.
@@ -247,7 +297,7 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
     // `Some(Class::None)` means "probed, matched neither detector".
     let n = paths.len();
     let mut class: Vec<Option<Class>> = vec![Some(Class::None); n];
-    let workers = senbei_pe::thread_cap().clamp(1, n.max(1));
+    let workers = senbei_engine::thread_cap().clamp(1, n.max(1));
     if workers <= 1 {
         for (p, c) in paths.iter().zip(class.iter_mut()) {
             *c = classify(p);
@@ -314,9 +364,8 @@ pub fn scan_all_env() -> bool {
     }
 }
 
-/// Classify one file by content. Reads a short prefix once and tests the
-/// Crackproof detector first, then the il2cpp metadata magic, then the
-/// Android probes. Returns `None` when the file could not be classified at
+/// Classify one named candidate by content. Reads a short prefix once and tests
+/// the detector for that platform. Returns `None` when the file could not be classified at
 /// all — an I/O error opening it (locked, permissions) or a panic inside a
 /// detector — so the caller counts it as a probe error rather than a clean
 /// "not a target" skip.
@@ -337,21 +386,30 @@ pub fn scan_all_env() -> bool {
 fn classify(path: &Path) -> Option<Class> {
     let head = read_prefix(path, DETECT_PREFIX)?;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if detect(&head).is_some() {
-            return Class::Crackproof;
+        if is_android_package_name(path) && crate::android::is_app_package(path, &head) {
+            return Class::AndroidPackage;
         }
-        if senbei_metadata::is_metadata(&head) {
+        if is_metadata_name(path) && senbei_metadata::is_metadata(&head) {
             return Class::Metadata;
         }
-        if crate::android::is_elf64_aarch64(&head)
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+            && detect(&head).is_some()
+        {
+            return Class::Crackproof;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+            && crate::android::is_elf64_aarch64(&head)
             && std::fs::read(path)
-                .map(|bytes| senbei_android_engine::is_protected_libil2cpp(&bytes))
+                .map(|bytes| senbei_engine::android::is_protected_libil2cpp(&bytes))
                 .unwrap_or(false)
         {
             return Class::AndroidSo;
-        }
-        if crate::android::is_app_package(path, &head) {
-            return Class::AndroidPackage;
         }
         Class::None
     }));
@@ -403,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn extensionless_targets_require_exhaustive_scan() {
+    fn extensionless_targets_are_not_candidates() {
         let td = tempfile::tempdir().unwrap();
         let root = td.path();
         let mut blob = vec![0u8; MIN_SIZE as usize + 1];
@@ -414,7 +472,7 @@ mod tests {
         assert!(filtered.metadata.is_empty());
 
         let exhaustive = find_targets_opts(root, true);
-        assert_eq!(exhaustive.metadata.len(), 1);
+        assert!(exhaustive.metadata.is_empty());
     }
 
     /// A file below the Crackproof key-table bound is skipped without being
@@ -478,5 +536,17 @@ mod tests {
             "the probed non-target counts as skipped"
         );
         assert_eq!(scan.stats.walk_errors, 0);
+    }
+
+    #[test]
+    fn companion_payload_is_not_counted_as_skipped() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("app.exe"), vec![0u8; MIN_SIZE as usize]).unwrap();
+        std::fs::write(root.join("app.exe._"), vec![0u8; MIN_SIZE as usize]).unwrap();
+
+        let scan = find_targets_opts(root, false);
+        assert_eq!(scan.stats.skipped, 1, "only the stub was probed");
+        assert!(is_windows_companion(&root.join("app.exe._")));
     }
 }

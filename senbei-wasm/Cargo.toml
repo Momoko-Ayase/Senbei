@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 senbei-io = { path = "../senbei-io" }
 senbei-metadata = { path = "../senbei-metadata" }
-senbei-pe = { path = "../senbei-pe" }
+senbei-engine = { path = "../senbei-engine" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 

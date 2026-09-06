@@ -1,4 +1,4 @@
-use senbei_pe as unpacker;
+use senbei_engine as unpacker;
 use std::path::{Path, PathBuf};
 
 /// Crackproof header key table lives at this fixed file offset. For the
@@ -818,7 +818,7 @@ pub fn run_file_v(
     // handled entry-by-entry. Anything else falls through to the PE pipeline.
     let is_android_so = crate::android::is_elf64_aarch64(&prefix)
         && std::fs::read(input)
-            .map(|bytes| senbei_android_engine::is_protected_libil2cpp(&bytes))
+            .map(|bytes| senbei_engine::android::is_protected_libil2cpp(&bytes))
             .unwrap_or(false);
     let is_android_package = !is_android_so && crate::android::is_app_package(input, &prefix);
 

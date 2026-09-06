@@ -1,6 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use senbei_pe::{IntegrityReport, Kind};
+use senbei_engine::{IntegrityReport, Kind};
 use std::path::Path;
 
 /// Create a progress bar for `n` items. Hidden when `quiet` is true.

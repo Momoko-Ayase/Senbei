@@ -1,5 +1,6 @@
 //! Cryptographic, checksum, compression, and bytecode primitives.
 
+pub mod android;
 pub mod bytecode;
 pub mod crc32;
 pub mod primitives;

@@ -6,4 +6,5 @@ license.workspace = true
 description = "Cryptographic and compression primitives for Senbei"
 
 [dependencies]
+aes.workspace = true
 thiserror.workspace = true

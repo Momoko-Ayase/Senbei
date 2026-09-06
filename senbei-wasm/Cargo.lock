@@ -429,7 +429,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "senbei-android-crypto"
+name = "senbei-crypto"
 version = "1.2.0"
 dependencies = [
  "aes",
@@ -437,44 +437,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "senbei-android-elf"
-version = "1.2.0"
-dependencies = [
- "memmap2",
- "senbei-android-crypto",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "senbei-android-engine"
+name = "senbei-engine"
 version = "1.2.0"
 dependencies = [
  "goblin",
  "memmap2",
- "senbei-android-crypto",
+ "senbei-crypto",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "senbei-android-metadata"
-version = "1.2.0"
-dependencies = [
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "senbei-crypto"
-version = "1.2.0"
-dependencies = [
  "thiserror",
 ]
 
@@ -487,11 +459,8 @@ dependencies = [
  "indicatif",
  "libc",
  "owo-colors",
- "senbei-android-elf",
- "senbei-android-engine",
- "senbei-android-metadata",
+ "senbei-engine",
  "senbei-metadata",
- "senbei-pe",
  "sha2",
  "tempfile",
  "walkdir",
@@ -502,12 +471,8 @@ dependencies = [
 [[package]]
 name = "senbei-metadata"
 version = "1.2.0"
-
-[[package]]
-name = "senbei-pe"
-version = "1.2.0"
 dependencies = [
- "senbei-crypto",
+ "serde",
  "thiserror",
 ]
 
@@ -516,9 +481,9 @@ name = "senbei-wasm"
 version = "1.2.0"
 dependencies = [
  "console_error_panic_hook",
+ "senbei-engine",
  "senbei-io",
  "senbei-metadata",
- "senbei-pe",
  "wasm-bindgen",
 ]
 

@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Unity il2cpp metadata de-obfuscation for Senbei"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

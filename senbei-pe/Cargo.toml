@@ -3,8 +3,7 @@ name = "senbei-pe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "PE detection, unpacking, and validation for Senbei"
+description = "PE format parsing and address mapping for Senbei"
 
 [dependencies]
-senbei-crypto.workspace = true
 thiserror.workspace = true

@@ -101,12 +101,12 @@ impl MetadataResult {
     }
 }
 
-fn kind_str(kind: senbei_pe::Kind) -> &'static str {
+fn kind_str(kind: senbei_engine::Kind) -> &'static str {
     match kind {
-        senbei_pe::Kind::NativeExe => "native-exe",
-        senbei_pe::Kind::ManagedExe => "managed-exe",
-        senbei_pe::Kind::NativeDll => "native-dll",
-        senbei_pe::Kind::ManagedDll => "managed-dll",
+        senbei_engine::Kind::NativeExe => "native-exe",
+        senbei_engine::Kind::ManagedExe => "managed-exe",
+        senbei_engine::Kind::NativeDll => "native-dll",
+        senbei_engine::Kind::ManagedDll => "managed-dll",
     }
 }
 
@@ -120,7 +120,7 @@ pub fn detect(input: &[u8]) -> Option<String> {
     if senbei_metadata::is_metadata(input) {
         return Some("metadata".to_string());
     }
-    senbei_pe::detect(input).map(|d| kind_str(d.kind).to_string())
+    senbei_engine::detect(input).map(|d| kind_str(d.kind).to_string())
 }
 
 /// Unpack a protected module.
