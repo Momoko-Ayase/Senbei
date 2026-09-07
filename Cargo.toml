@@ -17,7 +17,7 @@ resolver = "2"
 [workspace.package]
 version = "1.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98.1"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]

@@ -130,13 +130,9 @@ fn decrypt_record(raw: &[u8], index: usize, state: u32) -> Result<Record> {
     let mut accumulator = 0x7993_4cf6_u32;
     let mut feedback = 0xf02f_7685_u32;
     let mut words = [0_u32; RECORD_SIZE / 4];
-    for (word_index, chunk) in raw.chunks_exact(4).enumerate() {
+    for (word_index, chunk) in raw.as_chunks::<4>().0.iter().enumerate() {
         feedback = feedback.wrapping_mul(feedback);
-        let cipher = u32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| Error::Invalid("record word has an invalid size".to_owned()))?,
-        );
+        let cipher = u32::from_le_bytes(*chunk);
         let mut value = gf32_mul_fixed(cipher ^ (feedback >> 3)) ^ index_mask;
         value = value.wrapping_add(accumulator).wrapping_add(state);
         value = value.wrapping_sub(mix >> ((word_index * 4 + 3) & 5));

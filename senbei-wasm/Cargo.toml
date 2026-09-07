@@ -2,6 +2,7 @@
 name = "senbei-wasm"
 version = "1.2.0"
 edition = "2024"
+rust-version = "1.98.1"
 description = "WebAssembly bindings for senbei (browser frontend assets live in web/)"
 license = "AGPL-3.0-only"
 

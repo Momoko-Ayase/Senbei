@@ -177,18 +177,14 @@ fn decrypt_header(raw: &[u8], constant: u32) -> Result<Stage1Header> {
 }
 
 fn decrypt_words(ciphertext: &[u8], key: u32, constant: u32) -> Result<Vec<u8>> {
-    if ciphertext.len() % 4 != 0 {
+    if !ciphertext.len().is_multiple_of(4) {
         return invalid("Stage 1 word cipher input is not 4-byte aligned");
     }
     let mut plaintext = ciphertext.to_vec();
-    for (index, chunk) in plaintext.chunks_exact_mut(4).enumerate() {
+    for (index, chunk) in plaintext.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let index = u32::try_from(index)
             .map_err(|_| Error::Invalid("Stage 1 word index exceeds u32".to_owned()))?;
-        let mut word = u32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| Error::Invalid("Stage 1 word has an invalid size".to_owned()))?,
-        );
+        let mut word = u32::from_le_bytes(*chunk);
         word = word.wrapping_add(index.wrapping_add(3).wrapping_mul(key));
         word ^= constant.wrapping_mul(index.wrapping_add(1));
         chunk.copy_from_slice(&word.to_le_bytes());

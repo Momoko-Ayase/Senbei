@@ -477,7 +477,8 @@ fn restore_hidden_symbols(
     dynstr: SectionHeader,
     patch_data: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, HiddenSymbolReport)> {
-    if dynsym.entry_size != ELF64_SYMBOL_SIZE as u64 || dynsym.size % ELF64_SYMBOL_SIZE as u64 != 0
+    if dynsym.entry_size != ELF64_SYMBOL_SIZE as u64
+        || !dynsym.size.is_multiple_of(ELF64_SYMBOL_SIZE as u64)
     {
         return invalid("unexpected .dynsym entry layout");
     }
@@ -584,11 +585,13 @@ fn restore_hidden_symbols(
 }
 
 fn dynamic_symbol_names(symbols: &[u8], strings: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if symbols.len() % ELF64_SYMBOL_SIZE != 0 {
+    if !symbols.len().is_multiple_of(ELF64_SYMBOL_SIZE) {
         return invalid("dynamic symbol table is not entry-aligned");
     }
     symbols
-        .chunks_exact(ELF64_SYMBOL_SIZE)
+        .as_chunks::<ELF64_SYMBOL_SIZE>()
+        .0
+        .iter()
         .map(|symbol| {
             let name_offset = read_u32(symbol, 0)? as usize;
             Ok(read_c_string(strings, name_offset, strings.len())?.to_vec())
@@ -698,7 +701,7 @@ fn patch_dynamic_tags(
     dynamic: SectionHeader,
     values: &BTreeMap<u64, u64>,
 ) -> Result<()> {
-    if dynamic.size % 0x10 != 0 {
+    if !dynamic.size.is_multiple_of(0x10) {
         return invalid(".dynamic size is not entry-aligned");
     }
     let start = usize_from_u64(dynamic.offset, ".dynamic offset")?;
@@ -732,7 +735,7 @@ fn patch_dynamic_tags(
 }
 
 fn dynamic_contains_tag(output: &[u8], dynamic: SectionHeader, wanted: u64) -> Result<bool> {
-    if dynamic.size % 0x10 != 0 {
+    if !dynamic.size.is_multiple_of(0x10) {
         return invalid(".dynamic size is not entry-aligned");
     }
     let start = usize_from_u64(dynamic.offset, ".dynamic offset")?;
@@ -1418,13 +1421,12 @@ fn validate_restored_binary(
         rela_plt.size / ELF64_RELA_SIZE as u64,
         "restored PLT relocation count",
     )?;
-    if let Some(expected) = materialization {
-        if dynamic_symbols != expected.new_symbol_count
+    if let Some(expected) = materialization
+        && (dynamic_symbols != expected.new_symbol_count
             || dynamic_relocations != expected.rela_dyn_count
-            || pltgot_relocations != expected.rela_plt_count
-        {
-            return invalid("restored ELF table counts do not match materialization report");
-        }
+            || pltgot_relocations != expected.rela_plt_count)
+    {
+        return invalid("restored ELF table counts do not match materialization report");
     }
     Ok(ValidationReport {
         format: "ELF64".to_owned(),

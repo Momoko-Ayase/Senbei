@@ -396,7 +396,7 @@ impl<'a> Unpacker<'a> {
                 // non-critical for false-positive rejection.
                 if v8 < info6 {
                     let delta = info6.wrapping_sub(v8);
-                    if delta <= 0x1000 && delta % 0x200 == 0 {
+                    if delta <= 0x1000 && delta.is_multiple_of(0x200) {
                         anchor = Some(probe);
                         break;
                     }

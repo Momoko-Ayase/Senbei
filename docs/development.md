@@ -2,7 +2,7 @@
 
 ## Building
 
-The pinned Rust toolchain is defined in `rust-toolchain.toml`. Build the CLI with `cargo build --release`; the binary is written to `target/release/senbei.exe` on Windows.
+Rust 1.98.1 is required and pinned in `rust-toolchain.toml`. Build the CLI with `cargo build --release`; the binary is written to `target/release/senbei.exe` on Windows.
 
 The workspace crates are portable where their APIs are pure. The browser binding is outside the workspace and is checked with `cargo check --manifest-path senbei-wasm/Cargo.toml` or built with `wasm-pack`.
 

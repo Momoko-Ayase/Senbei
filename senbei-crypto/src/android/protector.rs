@@ -552,7 +552,7 @@ pub fn transform_segment(
     let mut state = seed;
     let mut left = 0xe34e_ac63_u32;
     let mut right = 0x07b4_8238_u32;
-    for (index, chunk) in transformed.chunks_exact_mut(4).enumerate() {
+    for (index, chunk) in transformed.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let index32 = u32::try_from(index)
             .map_err(|_| Error::Invalid("segment word index exceeds u32".to_owned()))?;
         left = state
@@ -564,10 +564,7 @@ pub fn transform_segment(
             .wrapping_add(right.wrapping_sub(0x1605_a81c).wrapping_mul(right))
             .wrapping_shl(index32 & 7);
         state = left ^ right;
-        let bytes: [u8; 4] = chunk
-            .try_into()
-            .map_err(|_| Error::Invalid("invalid transformed word".to_owned()))?;
-        let mut value = u32::from_le_bytes(bytes);
+        let mut value = u32::from_le_bytes(*chunk);
         value = value.wrapping_add(0xb43b_9baf_u32.wrapping_mul(index32 & 0x0d));
         value ^= 0xaf57_f7fb_u32.wrapping_mul(index32 & 3);
         value = value.wrapping_sub(state) ^ state;
@@ -577,13 +574,10 @@ pub fn transform_segment(
     if decrypt_aes {
         let cipher = Aes256::new_from_slice(aes_key)
             .map_err(|_| Error::Invalid("invalid AES-256 key length".to_owned()))?;
-        let aligned_size = transformed.len() & !0x0f;
         let mut previous = [0_u8; 16];
-        for chunk in transformed[..aligned_size].chunks_exact_mut(16) {
-            let mut ciphertext = [0_u8; 16];
-            ciphertext.copy_from_slice(chunk);
-            // chunk is exactly one block (chunks_exact_mut(16)).
-            cipher.decrypt_block(chunk.try_into().expect("chunk is one block"));
+        for chunk in transformed.as_chunks_mut::<16>().0 {
+            let ciphertext = *chunk;
+            cipher.decrypt_block((&mut *chunk).into());
             for (byte, prior) in chunk.iter_mut().zip(previous) {
                 *byte ^= prior;
             }
