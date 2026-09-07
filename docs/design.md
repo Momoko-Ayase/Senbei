@@ -32,7 +32,7 @@ senbei-wasm/src/
 
 `senbei-engine/src/windows/` contains PE detection, layout discovery, EXE and DLL restoration, deterministic block parallelism, and structural integrity checks. Candidate layouts are trial-decrypted and validated before an output is accepted.
 
-External companion inputs are reconstructed as `stub[..4096]` followed by the matching `._` payload. The stub's export and TLS data is overlaid after unpacking because those regions are not present in the encrypted companion.
+External companion inputs are reconstructed as `stub[..4096]` followed by the matching `._` payload. The stub's export, TLS, and declared CLR regions are overlaid after unpacking because those regions are not present in the encrypted companion. Managed restoration follows the COR20 directory and referenced metadata, resources, and vtable fixups through each file's RVA mapping, preserving the decrypted method bodies.
 
 ## Android Engine
 

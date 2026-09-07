@@ -149,6 +149,13 @@ pub enum UnpackError {
         buffer_len: usize,
     },
 
+    #[error("managed stub {region} restoration failed: {source}")]
+    ManagedStubRestoreFailed {
+        region: &'static str,
+        #[source]
+        source: senbei_pe::Error,
+    },
+
     #[error(
         "EXE checksum descriptor at 0x{descriptor:08X} points outside input (offset {offset}, size {size}, input length {image_len})"
     )]

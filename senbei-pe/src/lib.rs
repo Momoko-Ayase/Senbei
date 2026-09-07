@@ -139,6 +139,36 @@ pub fn rva_to_offset(data: &[u8], headers: Headers, rva: u32) -> Result<usize> {
     Err(Error::OutOfBounds)
 }
 
+/// Map a complete RVA range backed by file bytes in the headers or one section.
+/// Unlike a virtual mapping, this rejects a section's zero-filled tail.
+pub fn rva_range(
+    data: &[u8],
+    headers: Headers,
+    rva: u32,
+    size: u32,
+) -> Result<std::ops::Range<usize>> {
+    let header_size = read_u32(data, headers.pe_offset + 24 + 60)?;
+    let offset = if rva < header_size && size <= header_size - rva {
+        rva
+    } else {
+        sections(data, headers)?
+            .into_iter()
+            .find_map(|section| {
+                let delta = rva.checked_sub(section.virtual_address)?;
+                if delta >= section.raw_size || size > section.raw_size - delta {
+                    return None;
+                }
+                section.raw_offset.checked_add(delta)
+            })
+            .ok_or(Error::OutOfBounds)?
+    } as usize;
+    let end = offset
+        .checked_add(size as usize)
+        .ok_or(Error::OutOfBounds)?;
+    data.get(offset..end).ok_or(Error::OutOfBounds)?;
+    Ok(offset..end)
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let bytes: [u8; 2] = data
         .get(offset..offset + 2)
@@ -164,4 +194,40 @@ fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
         .try_into()
         .map_err(|_| Error::OutOfBounds)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rva_ranges_require_file_backing_for_every_byte() {
+        let mut data = [0u8; 0x400];
+        let headers = Headers {
+            pe_offset: 0x40,
+            is_pe32_plus: false,
+            image_base: 0,
+            size_of_image: 0x2000,
+            entry_rva: 0x1000,
+            sections_offset: 0x100,
+            sections: 1,
+        };
+        for (offset, value) in [
+            (0x94, 0x200u32),
+            (0x108, 0x100),
+            (0x10c, 0x1000),
+            (0x110, 0x80),
+            (0x114, 0x200),
+        ] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(rva_range(&data, headers, 0x1000, 0x80), Ok(0x200..0x280));
+        assert_eq!(rva_range(&data, headers, 0x100, 0x100), Ok(0x100..0x200));
+        for (rva, size) in [(0x1070, 0x20), (0x1080, 1), (0x1f0, 0x20), (u32::MAX, 4)] {
+            assert_eq!(
+                rva_range(&data, headers, rva, size),
+                Err(Error::OutOfBounds)
+            );
+        }
+    }
 }

@@ -142,6 +142,97 @@ pub(crate) fn overlay_exports_from_stub(out: &mut [u8], stub: &[u8]) {
     }
 }
 
+/// Restore the CLR regions retained by an external-companion loader stub.
+/// Method bodies come from the unpacked payload and must not be overlaid.
+fn restore_managed_from_stub(out: &mut [u8], stub: &[u8]) -> Result<(), unpacker::UnpackError> {
+    let failure =
+        |region, source| unpacker::UnpackError::ManagedStubRestoreFailed { region, source };
+    let source_headers = senbei_pe::parse(stub).map_err(|e| failure("PE headers", e))?;
+    let (clr_rva, clr_size) = senbei_pe::data_directory(stub, source_headers, 14)
+        .map_err(|e| failure("CLR directory", e))?;
+    if clr_rva == 0 && clr_size == 0 {
+        return Ok(());
+    }
+    if clr_rva == 0 || clr_size < 0x48 {
+        return Err(failure("CLR directory", senbei_pe::Error::Invalid));
+    }
+    let destination_headers = senbei_pe::parse(out).map_err(|e| failure("output PE headers", e))?;
+    senbei_pe::data_directory(out, destination_headers, 14)
+        .map_err(|e| failure("output CLR directory", e))?;
+    let cor = senbei_pe::rva_range(stub, source_headers, clr_rva, 0x48)
+        .map_err(|e| failure("COR20 header", e))?;
+    if read_u32(stub, cor.start) != Some(0x48) {
+        return Err(failure("COR20 header", senbei_pe::Error::Invalid));
+    }
+    let range_pair = |rva, size, region| {
+        let source = senbei_pe::rva_range(stub, source_headers, rva, size)
+            .map_err(|e| failure(region, e))?;
+        let destination = senbei_pe::rva_range(out, destination_headers, rva, size)
+            .map_err(|e| failure(region, e))?;
+        Ok::<_, unpacker::UnpackError>((source, destination))
+    };
+    let mut copies = vec![range_pair(clr_rva, 0x48, "COR20 header")?];
+    for (field, region) in [
+        (0x08, "metadata"),
+        (0x18, "resources"),
+        (0x20, "strong-name signature"),
+        (0x28, "code-manager table"),
+        (0x30, "vtable fixups"),
+        (0x38, "export address jumps"),
+        (0x40, "managed native header"),
+    ] {
+        let rva = read_u32(stub, cor.start + field)
+            .ok_or_else(|| failure(region, senbei_pe::Error::OutOfBounds))?;
+        let size = read_u32(stub, cor.start + field + 4)
+            .ok_or_else(|| failure(region, senbei_pe::Error::OutOfBounds))?;
+        if field != 0x08 && rva == 0 && size == 0 {
+            continue;
+        }
+        if rva == 0 || size == 0 {
+            return Err(failure(region, senbei_pe::Error::Invalid));
+        }
+        let (source, destination) = range_pair(rva, size, region)?;
+        if field == 0x08 && !stub[source.clone()].starts_with(b"BSJB") {
+            return Err(failure(region, senbei_pe::Error::Invalid));
+        }
+        if field == 0x30 {
+            if !size.is_multiple_of(8) {
+                return Err(failure(region, senbei_pe::Error::Invalid));
+            }
+            for fixup in stub[source.clone()].as_chunks::<8>().0 {
+                let slots_rva =
+                    u32::from_le_bytes(fixup[..4].try_into().expect("eight-byte fixup"));
+                let count = u16::from_le_bytes([fixup[4], fixup[5]]) as u32;
+                let flags = u16::from_le_bytes([fixup[6], fixup[7]]);
+                let width = match flags & 3 {
+                    1 => 4,
+                    2 => 8,
+                    _ => return Err(failure(region, senbei_pe::Error::Invalid)),
+                };
+                if count != 0 {
+                    copies.push(range_pair(slots_rva, count * width, "vtable slots")?);
+                }
+            }
+        }
+        copies.push((source, destination));
+    }
+    // Validate all referenced ranges before changing the output.
+    for (source, destination) in copies {
+        out[destination].copy_from_slice(&stub[source]);
+    }
+    let directory = destination_headers.pe_offset
+        + 24
+        + if destination_headers.is_pe32_plus {
+            112
+        } else {
+            96
+        }
+        + 14 * 8;
+    out[directory..directory + 4].copy_from_slice(&clr_rva.to_le_bytes());
+    out[directory + 4..directory + 8].copy_from_slice(&clr_size.to_le_bytes());
+    Ok(())
+}
+
 /// Restore the TLS directory from the loader `stub` onto the unpacked image
 /// `out`, for the external-companion layout.
 ///
@@ -413,6 +504,7 @@ fn unpack_bytes_impl(
     if spliced.is_some() {
         overlay_exports_from_stub(&mut out, input);
         restore_tls_from_stub(&mut out, input);
+        restore_managed_from_stub(&mut out, input)?;
     }
     let integrity = unpacker::check_integrity(&out);
     Ok(UnpackedImage {
@@ -440,6 +532,7 @@ pub fn unpack_one_v(
         // re-installs at runtime; the ordinary loader needs it or thread_local
         // access crashes (see [`restore_tls_from_stub`]).
         restore_tls_from_stub(&mut out, &stub);
+        restore_managed_from_stub(&mut out, &stub)?;
     }
     let report = unpacker::check_integrity(&out);
     if let Some(parent) = dest.parent() {
@@ -495,5 +588,90 @@ mod tests {
         let stub = stub_with_header(&[1_u8; 32], 0);
         let short_companion = vec![1_u8; 16];
         assert!(splice_companion(&stub, &short_companion).is_none());
+    }
+
+    fn managed_fixture(is_pe32_plus: bool, raw: usize) -> Vec<u8> {
+        let mut data = vec![0; raw + 0x600];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let optional_size = if is_pe32_plus { 0xf0u16 } else { 0xe0 };
+        let section = 0x98 + optional_size as usize;
+        let dirs = 0x98 + if is_pe32_plus { 112 } else { 96 };
+        for (offset, value) in [
+            (0x86, 1u16),
+            (0x94, optional_size),
+            (0x98, if is_pe32_plus { 0x20b } else { 0x10b }),
+            (raw + 0x204, 2),
+            (raw + 0x206, if is_pe32_plus { 2 } else { 1 }),
+        ] {
+            data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (0x3c, 0x80u32),
+            (0xd0, 0x3000),
+            (0xd4, 0x400),
+            (dirs + 14 * 8, 0x2010),
+            (dirs + 14 * 8 + 4, 0x48),
+            (section + 8, 0x600),
+            (section + 12, 0x2000),
+            (section + 16, 0x600),
+            (section + 20, raw as u32),
+            (raw + 0x10, 0x48),
+            (raw + 0x18, 0x2100),
+            (raw + 0x1c, 0x20),
+            (raw + 0x28, 0x2180),
+            (raw + 0x2c, 8),
+            (raw + 0x40, 0x2200),
+            (raw + 0x44, 8),
+            (raw + 0x200, 0x2280),
+            (raw + 0x280, 0x0600_0001),
+        ] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        data[raw + 0x100..raw + 0x104].copy_from_slice(b"BSJB");
+        data[raw + 0x180..raw + 0x188].copy_from_slice(b"resource");
+        data
+    }
+
+    #[test]
+    fn managed_companion_restores_rva_mapped_regions_without_overwriting_il() {
+        for is_pe32_plus in [false, true] {
+            let stub = managed_fixture(is_pe32_plus, 0x600);
+            let mut out = managed_fixture(is_pe32_plus, 0x400);
+            out[0x400..].fill(0xcc);
+            restore_managed_from_stub(&mut out, &stub).unwrap();
+            for (offset, size) in [
+                (0x10, 0x48),
+                (0x100, 0x20),
+                (0x180, 8),
+                (0x200, 8),
+                (0x280, if is_pe32_plus { 16 } else { 8 }),
+            ] {
+                assert_eq!(
+                    &out[0x400 + offset..0x400 + offset + size],
+                    &stub[0x600 + offset..0x600 + offset + size]
+                );
+            }
+            assert!(out[0x700..0x740].iter().all(|&b| b == 0xcc));
+        }
+    }
+
+    #[test]
+    fn managed_companion_rejects_invalid_metadata_and_unbacked_vtable_slots() {
+        for broken_metadata in [true, false] {
+            let mut stub = managed_fixture(false, 0x600);
+            if broken_metadata {
+                stub[0x700..0x704].fill(0);
+            } else {
+                stub[0x800..0x804].copy_from_slice(&0x2600u32.to_le_bytes());
+            }
+            let mut out = managed_fixture(false, 0x400);
+            let before = out.clone();
+            assert!(matches!(
+                restore_managed_from_stub(&mut out, &stub),
+                Err(unpacker::UnpackError::ManagedStubRestoreFailed { .. })
+            ));
+            assert_eq!(out, before);
+        }
     }
 }

@@ -1,6 +1,27 @@
 use super::super::super::layout;
 use super::*;
 
+fn stage_key_rounds(data: &[u8], table: u32, slots: usize) -> Result<u32, UnpackError> {
+    let offset = table as usize;
+    let size = slots.saturating_mul(16);
+    let descriptors = offset
+        .checked_add(size)
+        .and_then(|end| data.get(offset..end))
+        .ok_or(UnpackError::BufferRangeOutOfBounds {
+            operation: BufferOperation::Read,
+            offset,
+            size,
+            buffer_len: data.len(),
+        })?;
+    // The loader stops at the first empty helper, even if later slots are nonempty.
+    Ok(descriptors
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .take_while(|descriptor| get_u32(descriptor.as_slice(), 4) > 4)
+        .count() as u32)
+}
+
 impl<'a> Unpacker<'a> {
     /// PE32 (32-bit) unpack pipeline. The shared Stage 1/2 setup (info decrypt,
     /// payload decrypt, raw copy, header restore) has already run in `run()`
@@ -224,11 +245,15 @@ impl<'a> Unpacker<'a> {
 
         // ---- ForthStage ----
         let second_stage_cs = self.calculate_checksum(second_stage_cs_addr);
+        let dp_base = ss.wrapping_add(dp_base_off);
+        let forth_key_rounds = stage_key_rounds(&self.decompressed, dp_base, 4)?;
         let forth_stage_key = advance_key(
             get_u32(&self.decompressed, ss.wrapping_add(forth_key_off)),
-            4,
+            forth_key_rounds,
         );
-        let dp_base = ss.wrapping_add(dp_base_off);
+        if verbose {
+            println!("  fourth-stage key rounds = {forth_key_rounds}");
+        }
         let forth_addr = dp_base.wrapping_add(0x40);
         let fk = header_checksum ^ second_stage_cs ^ forth_stage_key;
         if let Err(reason) = self.decrypt_and_decompress_data(forth_addr, fk, None) {
@@ -313,6 +338,11 @@ impl<'a> Unpacker<'a> {
         )?;
 
         let seven_cs = self.calculate_checksum(seven_stage_cs_addr);
+        let eighth_key_rounds =
+            stage_key_rounds(&self.decompressed, dp_base.wrapping_add(0x80), 4)?;
+        if verbose {
+            println!("  eighth-stage key rounds = {eighth_key_rounds}");
+        }
         let eighth_addr = dp_base.wrapping_add(0xC0);
         let eighth_dsz = get_u32(&self.decompressed, eighth_addr.wrapping_add(12));
         let eighth_src = get_u32(&self.decompressed, eighth_addr);
@@ -381,7 +411,7 @@ impl<'a> Unpacker<'a> {
             self.decompressed[eighth_addr as usize..(eighth_addr + 16) as usize]
                 .copy_from_slice(&eighth_pair_bak);
             let raw = get_u32(&self.decompressed, seven_start_actual.wrapping_add(ek_off));
-            let test_key = advance_key(raw, 3);
+            let test_key = advance_key(raw, eighth_key_rounds);
             let fk8 = header_checksum ^ fifth_cs ^ seven_cs ^ test_key;
             let result = primitives::decrypt_and_decompress_data(
                 &mut self.decompressed,
@@ -445,7 +475,7 @@ impl<'a> Unpacker<'a> {
                 let mut best: Option<(u32 /*dist*/, u32 /*off*/)> = None;
                 let mut o = 0u32;
                 let dlen = self.decompressed.len() as u32;
-                while o + 8 <= eighth_dsz.saturating_sub(0x4B4u32.saturating_sub(0x30)) {
+                while o + 8 <= eighth_dsz {
                     let fc = get_u32(&self.decompressed, eighth_start.wrapping_add(o));
                     let sz = get_u32(&self.decompressed, eighth_start.wrapping_add(o + 4));
                     if fc > info3
@@ -454,8 +484,9 @@ impl<'a> Unpacker<'a> {
                         && (0x10..=0x200).contains(&sz)
                         && (sz & 0xF) == 0
                     {
-                        // Cluster base must leave room for the +0x4B4 LFSR slot
-                        // (even if the exact LFSR is later adjusted by scan).
+                        // Compact stages place the decryptor closer to this
+                        // cluster. Only the config fields must fit here; the
+                        // actual LFSR location is trial-validated below.
                         if o >= 0x30 {
                             let base = o - 0x30;
                             if base.wrapping_add(0x4C) <= eighth_dsz {
@@ -1059,5 +1090,38 @@ impl<'a> Unpacker<'a> {
         let compact = layout::compact_memory_image_to_pe(&out, pe_off)
             .ok_or(UnpackError::Pe32OutputLayoutInvalid)?;
         Ok(compact)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_key_rounds_follow_active_descriptor_prefix() {
+        for (sizes, expected) in [
+            ([0, 0x45, 0x45, 0x45], 0),
+            ([0x45, 4, 0x45, 0x45], 1),
+            ([0x45, 0x45, 0x45, 3], 3),
+            ([0x45, 0x45, 0x45, 0x45], 4),
+        ] {
+            let mut data = [0u8; 80];
+            for (index, size) in sizes.into_iter().enumerate() {
+                write_u32(&mut data, 16 + index as u32 * 16 + 4, size);
+            }
+            assert_eq!(stage_key_rounds(&data, 16, 4).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn stage_key_rounds_reject_truncated_tables() {
+        assert!(matches!(
+            stage_key_rounds(&[0u8; 63], 0, 4),
+            Err(UnpackError::BufferRangeOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            stage_key_rounds(&[0u8; 64], u32::MAX, 4),
+            Err(UnpackError::BufferRangeOutOfBounds { .. })
+        ));
     }
 }

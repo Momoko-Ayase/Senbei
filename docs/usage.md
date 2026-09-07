@@ -25,6 +25,8 @@ If a restored library contains embedded metadata, the unwrapped blob is written 
 
 Folder mode walks recursively, skips directories named `unpack`, and mirrors recognized outputs below `<root>/unpack/` or `--out DIR`. Windows candidates are `.exe`, `.dll`, and `global-metadata.dat`; Android candidates are `.so` and `global-metadata.dat`. A matching `.exe._` or `.dll._` payload is consumed by its stub and is excluded from the skipped count.
 
+Managed DLL companions retain CLR metadata and related runtime tables in the original DLL. Both the DLL and its matching `._` file must be available; Senbei restores the declared CLR regions from the DLL while retaining method bodies decrypted from the companion. Invalid or missing referenced regions are reported as errors.
+
 The summary has the form `12 unpacked · 3 skipped · 0 errors · 1 suspect · 2 metadata`; the package count is appended when packages were opened. Each file is isolated so one failed target does not stop the folder run.
 
 ## Integrity Check
