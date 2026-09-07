@@ -1,6 +1,7 @@
 use super::error::{Error, Result, invalid};
 
 pub(crate) const SHT_NOBITS: u32 = 8;
+pub(crate) const SHT_STRTAB: u32 = 3;
 pub(crate) const SHT_LOUSER: u32 = 0x8000_0000;
 pub(crate) const SHF_ALLOC: u64 = 2;
 
@@ -145,13 +146,18 @@ impl ElfLayout {
                 ));
             }
         };
-        Ok(Self {
+        let layout = Self {
             entrypoint,
             program_headers,
             section_headers,
             section_name_index,
             private_section_index,
-        })
+        };
+        // Section roles are resolved from the ELF's own string table. Validate
+        // it at the format boundary so callers cannot silently continue with
+        // fabricated or lossy section names.
+        layout.section_names(data)?;
+        Ok(layout)
     }
 
     pub fn private_section(&self) -> Result<SectionHeader> {
@@ -191,21 +197,57 @@ impl ElfLayout {
             .ok_or_else(|| Error::Invalid("ELF has no PT_LOAD file range".to_owned()))
     }
 
+    /// Resolve every section's name from the ELF `shstrtab` section.
+    ///
+    /// The returned names are source data, not role labels supplied by the
+    /// caller. Any malformed string-table reference is an input error.
     pub fn section_names(&self, data: &[u8]) -> Result<Vec<String>> {
-        let table = self.section_headers[self.section_name_index];
+        let table = self
+            .section_headers
+            .get(self.section_name_index)
+            .copied()
+            .ok_or_else(|| Error::Invalid("ELF section-name index is out of range".to_owned()))?;
+        if table.section_type != SHT_STRTAB {
+            return invalid(format!(
+                "ELF section-name table has unexpected type 0x{:x}",
+                table.section_type
+            ));
+        }
         let strings = slice_u64(data, table.offset, table.size)?;
+        if strings.is_empty() || strings[0] != 0 {
+            return invalid("ELF section-name table does not start with NUL");
+        }
+        if strings.last().copied() != Some(0) {
+            return invalid("ELF section-name table is not NUL terminated");
+        }
         self.section_headers
             .iter()
-            .map(|section| {
+            .enumerate()
+            .map(|(index, section)| {
                 let offset = section.name as usize;
                 if offset >= strings.len() {
-                    return Ok(String::new());
+                    return invalid(format!(
+                        "ELF section {index} name offset 0x{offset:x} exceeds section-name table"
+                    ));
                 }
                 let end = strings[offset..]
                     .iter()
                     .position(|&byte| byte == 0)
-                    .map_or(strings.len(), |length| offset + length);
-                Ok(String::from_utf8_lossy(&strings[offset..end]).into_owned())
+                    .map(|length| offset + length)
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "ELF section {index} name at 0x{offset:x} is unterminated"
+                        ))
+                    })?;
+                let name = std::str::from_utf8(&strings[offset..end]).map_err(|error| {
+                    Error::Invalid(format!(
+                        "ELF section {index} name at 0x{offset:x} is not UTF-8: {error}"
+                    ))
+                })?;
+                if index == 0 && section.name != 0 {
+                    return invalid("ELF null section has a nonzero name offset");
+                }
+                Ok(name.to_owned())
             })
             .collect()
     }
@@ -298,4 +340,101 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> Result<u64> {
         .checked_add(alignment - 1)
         .map(|aligned| aligned & !(alignment - 1))
         .ok_or_else(|| Error::Invalid("alignment overflow".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(name_index: u32) -> ElfLayout {
+        ElfLayout {
+            entrypoint: 0,
+            program_headers: Vec::new(),
+            section_headers: vec![
+                SectionHeader {
+                    name: 0,
+                    section_type: 0,
+                    flags: 0,
+                    address: 0,
+                    offset: 0,
+                    size: 0,
+                    link: 0,
+                    info: 0,
+                    alignment: 0,
+                    entry_size: 0,
+                },
+                SectionHeader {
+                    name: name_index,
+                    section_type: 1,
+                    flags: 0,
+                    address: 0,
+                    offset: 0,
+                    size: 0,
+                    link: 0,
+                    info: 0,
+                    alignment: 0,
+                    entry_size: 0,
+                },
+                SectionHeader {
+                    name: 1,
+                    section_type: SHT_STRTAB,
+                    flags: 0,
+                    address: 0,
+                    offset: 0,
+                    size: 8,
+                    link: 0,
+                    info: 0,
+                    alignment: 1,
+                    entry_size: 0,
+                },
+            ],
+            section_name_index: 2,
+            private_section_index: usize::MAX,
+        }
+    }
+
+    #[test]
+    fn section_names_resolve_from_elf_string_table() {
+        let names = layout(1)
+            .section_names(b"\0text\0\0\0")
+            .expect("valid names");
+        assert_eq!(names, ["", "text", "text"]);
+    }
+
+    #[test]
+    fn section_names_reject_out_of_range_name_offsets() {
+        let error = layout(8)
+            .section_names(b"\0text\0\0\0")
+            .expect_err("invalid offset");
+        assert!(error.to_string().contains("exceeds section-name table"));
+    }
+
+    #[test]
+    fn section_names_reject_invalid_utf8() {
+        let mut elf_layout = layout(1);
+        elf_layout.section_headers[1].name = 1;
+        let error = elf_layout
+            .section_names(b"\0\xff\0\0\0\0\0\0")
+            .expect_err("invalid UTF-8");
+        assert!(error.to_string().contains("is not UTF-8"));
+    }
+
+    #[test]
+    fn section_names_reject_non_string_table() {
+        let mut elf_layout = layout(1);
+        elf_layout.section_headers[2].section_type = 1;
+        let error = elf_layout
+            .section_names(b"\0text\0\0\0")
+            .expect_err("wrong section type");
+        assert!(error.to_string().contains("unexpected type"));
+    }
+
+    #[test]
+    fn section_names_reject_unterminated_table() {
+        let elf_layout = layout(1);
+        let error = elf_layout
+            .section_names(b"\0text\0\x01\x01")
+            .expect_err("unterminated table");
+        assert!(error.to_string().contains("not NUL terminated"));
+    }
 }
