@@ -14,6 +14,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Crypto(#[from] senbei_crypto::android::Error),
+    #[error(transparent)]
+    Elf(#[from] senbei_elf::Error),
     #[error("{0}")]
     Invalid(String),
 }

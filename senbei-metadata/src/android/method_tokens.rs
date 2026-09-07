@@ -2,10 +2,11 @@
 
 use serde::Serialize;
 
+use crate::common::MAGIC;
+
 /// Seed embedded in the current `libil2cpp` module `0x0C`.
 pub const DEFAULT_METHOD_TOKEN_SEED: u32 = 0xa6fa_e968;
 
-const MAGIC: u32 = 0xfab1_1baf;
 const SUPPORTED_V29: u32 = 29;
 const SUPPORTED_V31: u32 = 31;
 const HDR_METHODS: usize = 0x30;

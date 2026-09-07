@@ -1,6 +1,4 @@
-use memmap2::MmapOptions;
 use senbei_engine::detect;
-use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -27,56 +25,10 @@ const DETECT_PREFIX: u64 = 8 * 1024;
 /// processable is lost.
 const MIN_SIZE: u64 = 4128;
 
-const METADATA_FILE_NAME: &str = "global-metadata.dat";
-
 fn is_metadata_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(METADATA_FILE_NAME))
-}
-
-fn is_target_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("exe")
-                || ext.eq_ignore_ascii_case("dll")
-                || ext.eq_ignore_ascii_case("so")
-        })
-}
-
-fn is_android_package_name(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("apk")
-                || ext.eq_ignore_ascii_case("apks")
-                || ext.eq_ignore_ascii_case("xapk")
-        })
-}
-
-/// External Windows payloads are consumed through their sibling `.exe`/`.dll`
-/// stub. They are valid input bytes, but are not independent unpack targets.
-pub(crate) fn is_windows_companion(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some(stub_name) = name.strip_suffix("._") else {
-        return false;
-    };
-    let stub_path = Path::new(stub_name);
-    stub_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
-}
-
-pub(crate) fn is_android_entry_name(path: &Path) -> bool {
-    is_metadata_name(path)
-        || path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+        .is_some_and(|name| name.eq_ignore_ascii_case(crate::METADATA_FILE_NAME))
 }
 
 /// Content classification of a single file.
@@ -182,7 +134,7 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
         // Skip reparse-point directories (junctions, symlink-dirs): they point
         // outside the scanned tree — walking one would silently unpack an
         // entire foreign tree (e.g. a `samples` junction into the golden corpus).
-        !is_reparse_point(e)
+        !crate::windows::is_reparse_point(e)
     }) {
         let entry = match entry {
             Ok(e) => e,
@@ -194,12 +146,13 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
         if !entry.file_type().is_file() {
             continue;
         }
-        if is_windows_companion(entry.path()) {
+        if crate::windows::is_companion(entry.path()) {
             continue;
         }
         if !is_metadata_name(entry.path())
-            && !is_target_extension(entry.path())
-            && !is_android_package_name(entry.path())
+            && !crate::windows::is_pe_extension(entry.path())
+            && !crate::android::is_so_name(entry.path())
+            && !crate::android::is_package_name(entry.path())
         {
             continue;
         }
@@ -258,26 +211,6 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
     result
 }
 
-/// True if a walked directory entry is a reparse point (junction or symlink).
-///
-/// `DirEntry::file_type` only flags true symlinks; NTFS junctions report as
-/// ordinary directories, so without this check the walker descends into them.
-/// Off-Windows there are no junctions — symlink dirs are already excluded
-/// because `follow_links` is off (their `file_type().is_dir()` is false).
-#[cfg(windows)]
-fn is_reparse_point(e: &walkdir::DirEntry) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    e.metadata()
-        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_e: &walkdir::DirEntry) -> bool {
-    false
-}
-
 /// Whether the size pre-filter is disabled via `SENBEI_SCAN_ALL`. Any value
 /// other than `0`/empty enables probing small selected target names. It never
 /// expands the platform filename boundary.
@@ -309,33 +242,18 @@ pub fn scan_all_env() -> bool {
 fn classify(path: &Path) -> Option<Class> {
     let head = read_prefix(path, DETECT_PREFIX)?;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if is_android_package_name(path) && crate::android::is_app_package(path, &head) {
+        if crate::android::is_package_name(path) && crate::android::is_app_package(path, &head) {
             return Class::AndroidPackage;
         }
         if is_metadata_name(path) && senbei_metadata::is_metadata(&head) {
             return Class::Metadata;
         }
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
-            && detect(&head).is_some()
-        {
+        if crate::windows::is_pe_extension(path) && detect(&head).is_some() {
             return Class::Crackproof;
         }
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+        if crate::android::is_so_name(path)
             && crate::android::is_elf64_aarch64(&head)
-            && File::open(path)
-                .and_then(|file| {
-                    // SAFETY: the file remains open for the mapping lifetime
-                    // and the mapping is read-only.
-                    unsafe { MmapOptions::new().map(&file) }
-                })
-                .map(|bytes| senbei_engine::android::is_protected_libil2cpp(&bytes))
-                .unwrap_or(false)
+            && crate::android::is_protected_so_file(path)
         {
             return Class::AndroidSo;
         }
@@ -366,7 +284,9 @@ mod tests {
             "global-metadata.dat",
         ] {
             assert!(
-                is_metadata_name(Path::new(p)) || is_target_extension(Path::new(p)),
+                is_metadata_name(Path::new(p))
+                    || crate::windows::is_pe_extension(Path::new(p))
+                    || crate::android::is_so_name(Path::new(p)),
                 "{p} should be a candidate"
             );
         }
@@ -379,7 +299,9 @@ mod tests {
             "a.ab",
         ] {
             assert!(
-                !is_metadata_name(Path::new(p)) && !is_target_extension(Path::new(p)),
+                !is_metadata_name(Path::new(p))
+                    && !crate::windows::is_pe_extension(Path::new(p))
+                    && !crate::android::is_so_name(Path::new(p)),
                 "{p} must not be a candidate"
             );
         }
@@ -472,7 +394,7 @@ mod tests {
 
         let scan = find_targets_opts(root, false);
         assert_eq!(scan.stats.skipped, 1, "only the stub was probed");
-        assert!(is_windows_companion(&root.join("app.exe._")));
+        assert!(crate::windows::is_companion(&root.join("app.exe._")));
     }
 
     #[test]

@@ -12,18 +12,21 @@ Single-platform source stays directly under `src/`. Multi-platform crates keep p
 senbei-cli/src/main.rs
 senbei-crypto/src/
 senbei-crypto/src/android/
+senbei-crypto/src/windows/
 senbei-elf/src/
 senbei-engine/src/windows/
 senbei-engine/src/android/
 senbei-io/src/
 senbei-io/src/android/
+senbei-io/src/windows/
+senbei-metadata/src/
 senbei-metadata/src/windows/
 senbei-metadata/src/android/
 senbei-pe/src/
 senbei-wasm/src/
 ```
 
-`senbei-pe` and `senbei-elf` are format crates only. They do not depend on the unpacking engines, filesystem code, or platform protection logic.
+`senbei-pe` and `senbei-elf` own validated format models, address mapping, and ELF dynamic hash helpers. They do not depend on the unpacking engines, filesystem code, or platform protection logic.
 
 ## Windows Engine
 
@@ -35,13 +38,13 @@ External companion inputs are reconstructed as `stub[..4096]` followed by the ma
 
 `senbei-engine/src/android/extract/` decrypts the stage-1 header and stage-2 record streams and writes a temporary module workspace. `senbei-engine/src/android/restore/` applies decoded image and fixup containers to the hollowed ELF and rebuilds dynamic-linker tables. Both phases validate bounds and table placement before writing output.
 
-Android protection primitives are in `senbei-crypto/src/android/`. Android metadata restoration is in `senbei-metadata/src/android/` and only rewrites MethodDef token fields. The Windows structural metadata transform is in `senbei-metadata/src/windows/`.
+Windows protection primitives are in `senbei-crypto/src/windows/`, while Android protection primitives are in `senbei-crypto/src/android/`. Android seeded metadata restoration is in `senbei-metadata/src/android/`; the structural MethodDef transform is shared at the metadata crate root because both platform paths use it.
 
 Android ELF dynamic tables are located from the input section table and its actual file ranges. When the original gap is too small, restoration adds a validated read-only `PT_LOAD` after the existing load image and updates the dynamic tags; it never overwrites an adjacent section or emits a partial image.
 
 ## Scanning and Packages
 
-Folder scanning uses platform target names to avoid opening bulk assets: Windows candidates are `.exe`, `.dll`, and `global-metadata.dat`; Android candidates are `.so` and `global-metadata.dat`. A Windows `.exe._` or `.dll._` companion is auxiliary input for its sibling stub and is excluded from the skipped count.
+Folder scanning uses platform target names to avoid opening bulk assets: Windows candidates are `.exe`, `.dll`, and `global-metadata.dat`; Android candidates are `.so` and `global-metadata.dat`. The shared walker is in `senbei-io/src/scan.rs`; platform name filters and PE companion byte adaptation are in `senbei-io/src/windows/`, and Android package adaptation is in `senbei-io/src/android/`. A Windows `.exe._` or `.dll._` companion is auxiliary input for its sibling stub and is excluded from the skipped count.
 
 APK, APKS, and XAPK files are containers. Senbei reads their ZIP manifests first, follows nested APK entries when necessary, and extracts only `.so` and exact `global-metadata.dat` entries. Extraction streams directly to temporary files, so compressed and decompressed copies are not held in memory together.
 

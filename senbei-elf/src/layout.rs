@@ -1,14 +1,14 @@
-use super::error::{Error, Result, invalid};
+use crate::{Error, Result, invalid};
 
-pub(crate) const SHT_NOBITS: u32 = 8;
-pub(crate) const SHT_STRTAB: u32 = 3;
-pub(crate) const SHT_LOUSER: u32 = 0x8000_0000;
-pub(crate) const SHF_ALLOC: u64 = 2;
+pub const SHT_NOBITS: u32 = 8;
+pub const SHT_STRTAB: u32 = 3;
+pub const SHT_LOUSER: u32 = 0x8000_0000;
+pub const SHF_ALLOC: u64 = 2;
 const PT_LOAD: u32 = 1;
-pub(crate) const PF_R: u32 = 4;
+pub const PF_R: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LoadSegment {
+pub struct LoadSegment {
     pub offset: u64,
     pub virtual_address: u64,
     pub file_size: u64,
@@ -18,7 +18,7 @@ pub(crate) struct LoadSegment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SectionHeader {
+pub struct SectionHeader {
     pub name: u32,
     pub section_type: u32,
     pub flags: u64,
@@ -66,7 +66,7 @@ impl SectionHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ElfLayout {
+pub struct ElfLayout {
     pub entrypoint: u64,
     pub program_header_offset: usize,
     pub program_header_size: usize,
@@ -83,7 +83,7 @@ impl ElfLayout {
         if ident[..4] != *b"\x7fELF" || ident[4] != 2 || ident[5] != 1 {
             return invalid("input is not a little-endian ELF64 file");
         }
-        if read_u16(data, 0x12)? != 0xb7 {
+        if read_u16(data, 0x12)? != crate::AARCH64_MACHINE {
             return invalid("input is not an AArch64 ELF");
         }
         let entrypoint = read_u64(data, 0x18)?;
@@ -394,7 +394,7 @@ impl ElfLayout {
     }
 }
 
-pub(crate) fn slice(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
+pub fn slice(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
     let end = offset
         .checked_add(size)
         .ok_or_else(|| Error::Invalid("byte range overflow".to_owned()))?;
@@ -405,7 +405,7 @@ pub(crate) fn slice(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
     })
 }
 
-pub(crate) fn slice_u64(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
+pub fn slice_u64(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
     slice(
         data,
         usize_from_u64(offset, "file offset")?,
@@ -413,46 +413,46 @@ pub(crate) fn slice_u64(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
     )
 }
 
-pub(crate) fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
+pub fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let bytes: [u8; 2] = slice(data, offset, 2)?
         .try_into()
         .map_err(|_| Error::Invalid("invalid u16 range".to_owned()))?;
     Ok(u16::from_le_bytes(bytes))
 }
 
-pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
+pub fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
     let bytes: [u8; 4] = slice(data, offset, 4)?
         .try_into()
         .map_err(|_| Error::Invalid("invalid u32 range".to_owned()))?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-pub(crate) fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
+pub fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
     let bytes: [u8; 8] = slice(data, offset, 8)?
         .try_into()
         .map_err(|_| Error::Invalid("invalid u64 range".to_owned()))?;
     Ok(u64::from_le_bytes(bytes))
 }
 
-pub(crate) fn read_i64(data: &[u8], offset: usize) -> Result<i64> {
+pub fn read_i64(data: &[u8], offset: usize) -> Result<i64> {
     let bytes: [u8; 8] = slice(data, offset, 8)?
         .try_into()
         .map_err(|_| Error::Invalid("invalid i64 range".to_owned()))?;
     Ok(i64::from_le_bytes(bytes))
 }
 
-pub(crate) fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
+pub fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::Invalid(format!("{field} 0x{value:x} exceeds usize")))
 }
 
-pub(crate) fn checked_index(base: usize, index: usize, stride: usize) -> Result<usize> {
+pub fn checked_index(base: usize, index: usize, stride: usize) -> Result<usize> {
     index
         .checked_mul(stride)
         .and_then(|value| base.checked_add(value))
         .ok_or_else(|| Error::Invalid("table index overflow".to_owned()))
 }
 
-pub(crate) fn align_up(value: u64, alignment: u64) -> Result<u64> {
+pub fn align_up(value: u64, alignment: u64) -> Result<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {
         return invalid(format!("invalid alignment {alignment}"));
     }

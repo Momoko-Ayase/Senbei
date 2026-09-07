@@ -27,8 +27,7 @@
 //! metadata (its tokens already equal `local_index + 1`), so it is safe to run on
 //! any il2cpp game — `remapped == 0` then reports that nothing changed.
 
-/// il2cpp `global-metadata.dat` sanity magic (`Il2CppGlobalMetadataHeader.sanity`).
-const MAGIC: u32 = 0xFAB1_1BAF;
+use crate::common::MAGIC;
 
 /// Metadata format version this de-obfuscator understands. The struct strides
 /// and header field offsets below are specific to it; other versions are left

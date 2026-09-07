@@ -10,5 +10,13 @@ pub use windows::{
 
 /// Deterministic worker-thread cap shared by filesystem scanning and engines.
 pub fn thread_cap() -> usize {
-    windows::thread_cap()
+    if let Ok(value) = std::env::var("SENBEI_THREADS")
+        && let Ok(count) = value.trim().parse::<usize>()
+        && count >= 1
+    {
+        return count;
+    }
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
 }

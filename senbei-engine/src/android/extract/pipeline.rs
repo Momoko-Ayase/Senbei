@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{File, create_dir_all};
-use std::io::Write;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapOptions;
 use senbei_crypto::android::{Module9bConfig, decode_container};
 use serde_json::to_vec_pretty;
-use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 
+use super::super::common;
 use super::error::{Error, Result, invalid};
 use super::report::{
     ArtifactReport, DecoderReport, ExtractionReport, ModuleRegistryEntry, RecordReport,
@@ -86,7 +84,7 @@ pub fn extract_stage2(options: &ExtractOptions) -> Result<ExtractionReport> {
             return invalid("refusing to overwrite the protected ELF with Stage 2 output");
         }
     }
-    create_dir_all(&output_dir)
+    std::fs::create_dir_all(&output_dir)
         .map_err(|source| Error::io("create Stage 2 output directory", &output_dir, source))?;
 
     let file = File::open(&input_path)
@@ -497,42 +495,14 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    create_dir_all(parent)
-        .map_err(|source| Error::io("create output directory", parent, source))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|source| Error::io("create temporary output", parent, source))?;
-    temporary
-        .write_all(data)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|source| Error::io("write temporary output", temporary.path(), source))?;
-    temporary
-        .persist(path)
-        .map_err(|error| Error::io("replace output", path, error.error))?;
-    Ok(())
+    common::write_atomic(path, data)
+        .map_err(|source| Error::io("write temporary output", path, source))
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .map_err(|source| Error::io("query current directory", path, source))
-    }
+    common::absolute(path).map_err(|source| Error::io("query current directory", path, source))
 }
 
 fn sha256(data: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(data);
-    hex_digest(&digest.finalize())
-}
-/// Lowercase hex of a digest output (sha2 0.11's `Array` no longer formats as
-/// hex directly).
-fn hex_digest(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for byte in data {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    common::sha256(data)
 }

@@ -15,23 +15,12 @@ pub fn unpack(input: &[u8]) -> Result<Vec<u8>, UnpackError> {
 /// Used by the new-layout managed (CLR) metadata restore to locate the COR20
 /// header and BSJB MetaData stream in the original protected file.
 fn prot_rva_to_off(file_data: &[u8], pe_header: u32, rva: u32) -> Option<u32> {
-    let nsec = get_u16(file_data, pe_header + 6) as u32;
-    let opt = get_u16(file_data, pe_header + 20) as u32;
-    let tab = pe_header + 24 + opt;
-    for i in 0..nsec {
-        let s = tab + i * 40;
-        if (s as usize + 24) > file_data.len() {
-            return None;
-        }
-        let va = get_u32(file_data, s + 12);
-        let vs = get_u32(file_data, s + 8);
-        let rsz = get_u32(file_data, s + 16);
-        let rp = get_u32(file_data, s + 20);
-        if va <= rva && rva < va + vs.max(rsz) {
-            return Some(rp + (rva - va));
-        }
+    let headers = senbei_pe::parse(file_data).ok()?;
+    if headers.pe_offset != pe_header as usize {
+        return None;
     }
-    None
+    let offset = senbei_pe::rva_to_offset(file_data, headers, rva).ok()?;
+    u32::try_from(offset).ok()
 }
 
 pub fn unpack_v(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError> {

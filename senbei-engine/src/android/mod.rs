@@ -1,5 +1,6 @@
 //! Android AArch64 extraction and ELF restoration.
 
+mod common;
 mod extract;
 mod restore;
 

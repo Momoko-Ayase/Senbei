@@ -22,43 +22,54 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
+use senbei_crypto::hex_digest;
 use senbei_engine::android::{ExtractOptions, extract_stage2, is_protected_libil2cpp};
 use senbei_engine::android::{RestoreOptions, restore_libil2cpp};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-/// File name of an il2cpp metadata blob (a platform-standard technology name).
-pub const METADATA_FILE_NAME: &str = "global-metadata.dat";
+pub use crate::METADATA_FILE_NAME;
 
 /// Package extensions recognised as Android app packages. Packages are
 /// *containers*: membership is decided by extension plus the ZIP magic, while
 /// only `.so` and `global-metadata.dat` entries are read.
 const PACKAGE_EXTENSIONS: [&str; 3] = ["apk", "apks", "xapk"];
 
-/// Whether `prefix` (the first bytes of a file) is an ELF64/AArch64 image.
-/// Only those can be protected Android libraries, so the folder scan uses this
-/// cheap check to decide when the full-file protection probe is worth its
-/// read.
-pub fn is_elf64_aarch64(prefix: &[u8]) -> bool {
-    prefix.len() >= 20
-        && prefix[0..4] == [0x7f, b'E', b'L', b'F']
-        && prefix[4] == 2 // ELFCLASS64
-        && prefix[5] == 1 // ELFDATA2LSB
-        && u16::from_le_bytes([prefix[18], prefix[19]]) == 0xB7 // EM_AARCH64
-}
-
-/// Whether `path` is an Android app package: a recognised package extension
-/// and the local-file-header zip magic in `prefix`.
-pub fn is_app_package(path: &Path, prefix: &[u8]) -> bool {
-    let is_package_ext = path
-        .extension()
+pub(crate) fn is_package_name(path: &Path) -> bool {
+    path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| {
             PACKAGE_EXTENSIONS
                 .iter()
                 .any(|ext| value.eq_ignore_ascii_case(ext))
-        });
-    is_package_ext && prefix.starts_with(b"PK\x03\x04")
+        })
+}
+
+pub(crate) fn is_so_name(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("so"))
+}
+
+pub(crate) fn is_android_entry_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(METADATA_FILE_NAME))
+        || is_so_name(path)
+}
+
+/// Whether `prefix` (the first bytes of a file) is an ELF64/AArch64 image.
+/// Only those can be protected Android libraries, so the folder scan uses this
+/// cheap check to decide when the full-file protection probe is worth its
+/// read.
+pub fn is_elf64_aarch64(prefix: &[u8]) -> bool {
+    senbei_elf::is_aarch64_prefix(prefix)
+}
+
+/// Whether `path` is an Android app package: a recognised package extension
+/// and the local-file-header zip magic in `prefix`.
+pub fn is_app_package(path: &Path, prefix: &[u8]) -> bool {
+    is_package_name(path) && prefix.starts_with(b"PK\x03\x04")
 }
 
 /// Probe a file on disk: true when it is a protected AArch64 library.
@@ -245,7 +256,7 @@ pub fn restore_package(
                 nested.push((index, name));
             }
         } else {
-            if crate::scan::is_android_entry_name(&name) {
+            if is_android_entry_name(&name) {
                 direct.push((index, name));
             }
         }
@@ -280,7 +291,7 @@ pub fn restore_package(
                 let Some(entry_name) = entry_name else {
                     bail!("unsafe entry path in `{}`", nested_label.display());
                 };
-                if crate::scan::is_android_entry_name(&entry_name) {
+                if is_android_entry_name(&entry_name) {
                     entries.push((nested_index, entry_name));
                 }
             }
@@ -398,14 +409,14 @@ pub fn embedded_metadata_dest(restored_so: &Path) -> PathBuf {
 }
 
 /// Write a metadata blob, creating the parent directory. The restore writes
-/// its own output atomically; metadata blobs go through the job layer's
-/// atomic write to share the mid-write failure semantics.
+/// its own output atomically; metadata blobs use the shared orchestration
+/// atomic writer to keep the same mid-write failure semantics.
 fn write_metadata_blob(dest: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create `{}`", parent.display()))?;
     }
-    crate::job::write_atomic(dest, data)
+    crate::atomic::write_atomic(dest, data)
         .map_err(anyhow::Error::from)
         .context("write metadata output")
 }
@@ -448,13 +459,4 @@ fn map_read_only(file: &File, path: &Path) -> Result<Mmap> {
     // lifetime, and this mapping is read-only.
     unsafe { MmapOptions::new().map(file) }
         .with_context(|| format!("map extracted `{}`", path.display()))
-}
-/// Lowercase hex of a digest output (sha2 0.11's `Array` no longer formats as
-/// hex directly).
-fn hex_digest(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for byte in data {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }

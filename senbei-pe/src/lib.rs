@@ -92,6 +92,34 @@ pub fn sections(data: &[u8], headers: Headers) -> Result<Vec<Section>> {
         .collect()
 }
 
+/// Read one PE data-directory entry as `(RVA, size)`.
+pub fn data_directory(data: &[u8], headers: Headers, index: u16) -> Result<(u32, u32)> {
+    let directory_base = headers
+        .pe_offset
+        .checked_add(24)
+        .and_then(|offset| offset.checked_add(if headers.is_pe32_plus { 112 } else { 96 }))
+        .ok_or(Error::OutOfBounds)?;
+    let offset = directory_base
+        .checked_add(
+            usize::from(index)
+                .checked_mul(8)
+                .ok_or(Error::OutOfBounds)?,
+        )
+        .ok_or(Error::OutOfBounds)?;
+    Ok((read_u32(data, offset)?, read_u32(data, offset + 4)?))
+}
+
+/// Return the COFF characteristics bit field.
+pub fn characteristics(data: &[u8], headers: Headers) -> Result<u16> {
+    read_u16(
+        data,
+        headers
+            .pe_offset
+            .checked_add(22)
+            .ok_or(Error::OutOfBounds)?,
+    )
+}
+
 pub fn rva_to_offset(data: &[u8], headers: Headers, rva: u32) -> Result<usize> {
     if rva < headers.sections_offset as u32 {
         return Ok(rva as usize);

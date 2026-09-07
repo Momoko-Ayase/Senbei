@@ -419,12 +419,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "senbei-engine"
+name = "senbei-elf"
 version = "1.2.0"
 dependencies = [
  "goblin",
+ "thiserror",
+]
+
+[[package]]
+name = "senbei-engine"
+version = "1.2.0"
+dependencies = [
  "memmap2",
  "senbei-crypto",
+ "senbei-elf",
+ "senbei-pe",
  "serde",
  "serde_json",
  "sha2",
@@ -441,8 +450,11 @@ dependencies = [
  "libc",
  "memmap2",
  "owo-colors",
+ "senbei-crypto",
+ "senbei-elf",
  "senbei-engine",
  "senbei-metadata",
+ "senbei-pe",
  "sha2",
  "tempfile",
  "walkdir",
@@ -455,6 +467,13 @@ name = "senbei-metadata"
 version = "1.2.0"
 dependencies = [
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "senbei-pe"
+version = "1.2.0"
+dependencies = [
  "thiserror",
 ]
 

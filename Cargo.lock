@@ -431,9 +431,10 @@ dependencies = [
 name = "senbei-engine"
 version = "1.2.0"
 dependencies = [
- "goblin",
  "memmap2",
  "senbei-crypto",
+ "senbei-elf",
+ "senbei-pe",
  "serde",
  "serde_json",
  "sha2",
@@ -450,8 +451,11 @@ dependencies = [
  "libc",
  "memmap2",
  "owo-colors",
+ "senbei-crypto",
+ "senbei-elf",
  "senbei-engine",
  "senbei-metadata",
+ "senbei-pe",
  "sha2",
  "tempfile",
  "walkdir",

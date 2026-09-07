@@ -12,35 +12,19 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use super::super::common;
 use super::artifact::load_artifacts;
 use super::error::{Error, Result, invalid};
-use super::hash::{build_gnu_hash, build_sysv_hash};
-use super::layout::{
-    ElfLayout, LoadSegment, PF_R, SHF_ALLOC, SHT_LOUSER, SHT_NOBITS, SectionHeader, align_up,
-    read_i64, read_u32, read_u64, slice, slice_u64, usize_from_u64,
+use senbei_elf::{
+    DT_GNU_HASH, DT_HASH, DT_JMPREL, DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELASZ, DT_STRSZ,
+    DT_STRTAB, DT_SYMTAB, DT_VERNEED, DT_VERSYM, ELF64_RELA_SIZE, ELF64_SYMBOL_SIZE, ElfLayout,
+    LoadSegment, PF_R, R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT,
+    R_AARCH64_RELATIVE, SHF_ALLOC, SHT_LOUSER, SHT_NOBITS, SectionHeader, VER_NDX_GLOBAL, align_up,
+    build_gnu_hash, build_sysv_hash, read_i64, read_u32, read_u64, slice, slice_u64,
+    usize_from_u64,
 };
 
 const CHUNK_SIZE: usize = 16 * 1024 * 1024;
-const ELF64_SYMBOL_SIZE: usize = 0x18;
-const ELF64_RELA_SIZE: usize = 0x18;
-const R_AARCH64_ABS64: u32 = 0x101;
-const R_AARCH64_GLOB_DAT: u32 = 0x401;
-const R_AARCH64_JUMP_SLOT: u32 = 0x402;
-const R_AARCH64_RELATIVE: u32 = 0x403;
-const VER_NDX_GLOBAL: u16 = 1;
-
-const DT_PLTRELSZ: u64 = 2;
-const DT_HASH: u64 = 4;
-const DT_STRTAB: u64 = 5;
-const DT_SYMTAB: u64 = 6;
-const DT_RELA: u64 = 7;
-const DT_RELASZ: u64 = 8;
-const DT_STRSZ: u64 = 10;
-const DT_JMPREL: u64 = 23;
-const DT_GNU_HASH: u64 = 0x6fff_fef5;
-const DT_VERSYM: u64 = 0x6fff_fff0;
-const DT_RELACOUNT: u64 = 0x6fff_fff9;
-const DT_VERNEED: u64 = 0x6fff_fffe;
 
 /// Inputs and optional diagnostics for one `libil2cpp.so` restoration.
 #[derive(Debug, Clone)]
@@ -187,9 +171,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn sha256_bytes(data: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(data);
-    hex_digest(&digest.finalize())
+    common::sha256(data)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -205,7 +187,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(hex_digest(&digest.finalize()))
+    Ok(senbei_crypto::hex_digest(&digest.finalize()))
 }
 
 fn copy_range(source: &[u8], output: &mut File, size: usize, path: &Path) -> Result<()> {
@@ -286,7 +268,7 @@ impl FileLayoutWriter<'_> {
                 "decoded write 0x{virtual_address:x}..0x{end:x} is not covered by PT_LOAD memory"
             ));
         }
-        usize_from_u64(written, "written byte count")
+        Ok(usize_from_u64(written, "written byte count")?)
     }
 }
 
@@ -772,18 +754,8 @@ fn dynamic_contains_tag(output: &[u8], dynamic: SectionHeader, wanted: u64) -> R
 }
 
 fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, usize>> {
-    const REQUIRED: [&str; 8] = [
-        ".dynsym",
-        ".gnu.version",
-        ".gnu.version_r",
-        ".gnu.hash",
-        ".dynstr",
-        ".rela.dyn",
-        ".rela.plt",
-        ".dynamic",
-    ];
-    let mut result = HashMap::with_capacity(REQUIRED.len());
-    for required in REQUIRED {
+    let mut result = HashMap::with_capacity(senbei_elf::DYNAMIC_SECTION_NAMES.len());
+    for required in senbei_elf::DYNAMIC_SECTION_NAMES {
         let indices = names
             .iter()
             .enumerate()
@@ -952,7 +924,7 @@ fn metadata_mapping_length(
     let end = extension_start
         .checked_add(cursor)
         .ok_or_else(|| Error::Invalid("dynamic-table mapping end overflow".to_owned()))?;
-    usize_from_u64(end, "dynamic-table mapping length")
+    Ok(usize_from_u64(end, "dynamic-table mapping length")?)
 }
 
 fn table_placements(
@@ -1467,29 +1439,11 @@ fn validate_restored_binary(
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .map_err(|error| Error::io("query current directory", path, error))
-    }
+    common::absolute(path).map_err(|error| Error::io("query current directory", path, error))
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| Error::io("create output directory", parent, error))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| Error::io("create temporary file", parent, error))?;
-    temporary
-        .write_all(data)
-        .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|error| Error::io("write temporary file", temporary.path(), error))?;
-    temporary
-        .persist(path)
-        .map_err(|error| Error::io("replace output", path, error.error))?;
-    Ok(())
+    common::write_atomic(path, data).map_err(|error| Error::io("write temporary file", path, error))
 }
 
 /// Restore the current protected `libil2cpp.so` without executing protector code.
@@ -1723,16 +1677,6 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })
 }
-/// Lowercase hex of a digest output (sha2 0.11's `Array` no longer formats as
-/// hex directly).
-fn hex_digest(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for byte in data {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

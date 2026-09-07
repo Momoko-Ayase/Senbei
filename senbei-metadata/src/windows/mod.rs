@@ -1,5 +1,3 @@
-//! Windows metadata restoration.
+//! Compatibility namespace for the shared structural metadata transform.
 
-mod metadata;
-
-pub use metadata::*;
+pub use crate::structural::*;

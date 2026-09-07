@@ -4,9 +4,9 @@
 //! Each free function is self-contained: it takes the relevant byte buffer(s)
 //! and parameters explicitly, with no coupling to the EXE `Unpacker` struct.
 
+use super::tables::{COLUMMIX1, COLUMMIX2, COLUMMIX3, COLUMMIX4, SBOX};
 use crate::bytecode::{Op, OpsLut};
 use crate::crc32;
-use crate::tables::{COLUMMIX1, COLUMMIX2, COLUMMIX3, COLUMMIX4, SBOX};
 use std::cell::RefCell;
 
 thread_local! {

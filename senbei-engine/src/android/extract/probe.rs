@@ -7,9 +7,6 @@ use super::stage1::{self, DEFAULT_CIPHER_CONSTANT, DEFAULT_OUTER_SIZE};
 /// Return whether `data` has a supported protected AArch64 IL2CPP layout.
 #[must_use]
 pub fn is_protected_libil2cpp(data: &[u8]) -> bool {
-    if !stage1::looks_protected(data) {
-        return false;
-    }
     let Ok(stage1) = stage1::inspect(
         data,
         Path::new("<probe>"),

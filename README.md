@@ -8,7 +8,7 @@ Senbei reads protected input bytes and replays the unpacking algorithm staticall
 
 The workspace contains eight crates: `senbei-cli`, `senbei-crypto`, `senbei-io`, `senbei-metadata`, `senbei-pe`, `senbei-elf`, `senbei-engine`, and `senbei-wasm`.
 
-`senbei-pe` and `senbei-elf` contain only basic format parsing and address mapping. Protection-specific code is in `senbei-engine/src/windows/` and `senbei-engine/src/android/`. Platform-specific crypto and metadata code is grouped under `senbei-crypto/src/android/`, `senbei-metadata/src/windows/`, and `senbei-metadata/src/android/`.
+`senbei-pe` and `senbei-elf` contain validated format parsing, address mapping, and ELF dynamic-table helpers. Protection-specific code is in `senbei-engine/src/windows/` and `senbei-engine/src/android/`. Platform-specific crypto is grouped under `senbei-crypto/src/windows/` and `senbei-crypto/src/android/`; metadata code shared by both platforms stays at the `senbei-metadata` root, with seeded Android code under `src/android/`.
 
 ## Supported Inputs
 

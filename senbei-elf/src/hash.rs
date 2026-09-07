@@ -1,7 +1,7 @@
-use super::error::{Error, Result, invalid};
+use crate::{Error, Result, invalid};
 
 #[must_use]
-pub(crate) fn elf_hash(name: &[u8]) -> u32 {
+pub fn elf_hash(name: &[u8]) -> u32 {
     let mut value = 0_u32;
     for &byte in name {
         value = value.wrapping_shl(4).wrapping_add(u32::from(byte));
@@ -15,13 +15,13 @@ pub(crate) fn elf_hash(name: &[u8]) -> u32 {
 }
 
 #[must_use]
-pub(crate) fn gnu_hash(name: &[u8]) -> u32 {
+pub fn gnu_hash(name: &[u8]) -> u32 {
     name.iter().fold(5381_u32, |value, &byte| {
         value.wrapping_mul(33).wrapping_add(u32::from(byte))
     })
 }
 
-pub(crate) fn build_sysv_hash(names: &[Vec<u8>]) -> Result<Vec<u8>> {
+pub fn build_sysv_hash(names: &[Vec<u8>]) -> Result<Vec<u8>> {
     if names.len() < 2 {
         return invalid("dynamic symbol table is unexpectedly empty");
     }
@@ -60,7 +60,7 @@ pub(crate) fn build_sysv_hash(names: &[Vec<u8>]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-pub(crate) fn build_gnu_hash(names: &[Vec<u8>]) -> Result<Vec<u8>> {
+pub fn build_gnu_hash(names: &[Vec<u8>]) -> Result<Vec<u8>> {
     let hashes = names
         .iter()
         .skip(1)

@@ -19,20 +19,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Worker-thread cap. `SENBEI_THREADS` overrides it (`1` forces the sequential
-/// path); otherwise the host's available parallelism; otherwise 1.
-pub fn thread_cap() -> usize {
-    if let Ok(v) = std::env::var("SENBEI_THREADS")
-        && let Ok(n) = v.trim().parse::<usize>()
-        && n >= 1
-    {
-        return n;
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
 /// Run `f(i, span_base, span)` for every block `i`, fanning out across worker
 /// threads when the spans are disjoint and worthwhile, else sequentially.
 ///
@@ -102,7 +88,7 @@ where
         }
     }
 
-    let cap = thread_cap();
+    let cap = crate::thread_cap();
     let per = min_per_thread.max(1);
     let workers = if cap > 1 && n >= per.saturating_mul(2) {
         cap.min(n / per)

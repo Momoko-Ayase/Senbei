@@ -42,47 +42,26 @@ fn rd_u32(d: &[u8], off: u32) -> Option<u32> {
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// A parsed section-table entry (only the fields we translate against).
-struct Section {
-    va: u32,
-    vsize: u32,
-    raw_ptr: u32,
-    raw_size: u32,
-    chars: u32,
-}
+/// PE format section data used by the integrity policy.
+type Section = senbei_pe::Section;
 
 /// Walk the output's own section table and translate an RVA to a file offset.
 /// Works for both memory-image output (raw_ptr == va) and compacted disk
 /// output (real raw pointers), because it consults whatever the output declares.
 /// Returns the offset only if the translated range `[off, off+need)` lies inside
 /// the file.
-fn rva_to_off(secs: &[Section], file_len: usize, rva: u32, need: u32) -> Option<u32> {
-    for s in secs {
-        // The mapped span is the larger of virtual and raw size, so an RVA that
-        // falls in the virtual tail of a section still resolves.
-        let span = s.vsize.max(s.raw_size);
-        if span == 0 {
-            continue;
-        }
-        if rva >= s.va && rva < s.va.wrapping_add(span) {
-            let delta = rva - s.va;
-            let off = s.raw_ptr.checked_add(delta)?;
-            let end = off.checked_add(need)?;
-            if (end as usize) <= file_len {
-                return Some(off);
-            }
-            return None;
-        }
-    }
-    None
+fn rva_to_off(data: &[u8], headers: senbei_pe::Headers, rva: u32, need: u32) -> Option<u32> {
+    let offset = u32::try_from(senbei_pe::rva_to_offset(data, headers, rva).ok()?).ok()?;
+    let end = offset.checked_add(need)?;
+    (usize::try_from(end).ok()? <= data.len()).then_some(offset)
 }
 
 fn is_executable_rva(secs: &[Section], rva: u32) -> bool {
     secs.iter().any(|section| {
-        let span = section.vsize.max(section.raw_size);
-        rva >= section.va
-            && rva < section.va.wrapping_add(span)
-            && (section.chars & 0x2000_0000) != 0
+        let span = section.virtual_size.max(section.raw_size);
+        rva >= section.virtual_address
+            && rva < section.virtual_address.wrapping_add(span)
+            && (section.characteristics & 0x2000_0000) != 0
     })
 }
 
@@ -151,7 +130,6 @@ pub fn check(out: &[u8]) -> IntegrityReport {
             return r;
         }
     };
-    let opt_hdr_size = rd_u16(out, pe_off.wrapping_add(20)).unwrap_or(0) as u32;
     let opt = pe_off.wrapping_add(24);
     let magic = match rd_u16(out, opt) {
         Some(v) => v,
@@ -181,42 +159,38 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     }
 
     // --- Section table ------------------------------------------------------
-    let sec_table = opt.wrapping_add(opt_hdr_size);
-    let mut secs: Vec<Section> = Vec::new();
-    for i in 0..num_sections {
-        let base = sec_table.wrapping_add(i * 40);
-        // If the table runs past EOF the image is structurally broken.
-        let (vsize, va, raw_size, raw_ptr, chars) = match (
-            rd_u32(out, base.wrapping_add(8)),
-            rd_u32(out, base.wrapping_add(12)),
-            rd_u32(out, base.wrapping_add(16)),
-            rd_u32(out, base.wrapping_add(20)),
-            rd_u32(out, base.wrapping_add(36)),
-        ) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
-            _ => {
-                r.issues
-                    .push("section table extends past end of file".into());
-                return r;
-            }
-        };
-        // Raw data must lie within the file for compacted (disk-layout) output.
-        if raw_size != 0 {
-            let end = raw_ptr.wrapping_add(raw_size) as usize;
-            if end > file_len {
-                r.issues.push(format!(
-                    "section #{i} raw data [0x{raw_ptr:X}..0x{end:X}] exceeds file size 0x{file_len:X}"
-                ));
-            }
+    let headers = match senbei_pe::parse(out) {
+        Ok(headers) => headers,
+        Err(_) => {
+            r.issues
+                .push("section table extends past end of file".into());
+            return r;
         }
-        secs.push(Section {
-            va,
-            vsize,
-            raw_ptr,
-            raw_size,
-            chars,
-        });
-    }
+    };
+    let parsed_sections = match senbei_pe::sections(out, headers) {
+        Ok(sections) => sections,
+        Err(_) => {
+            r.issues
+                .push("section table extends past end of file".into());
+            return r;
+        }
+    };
+    let secs: Vec<Section> = parsed_sections
+        .into_iter()
+        .enumerate()
+        .map(|(i, section)| {
+            if section.raw_size != 0 {
+                let end = section.raw_offset.wrapping_add(section.raw_size) as usize;
+                if end > file_len {
+                    r.issues.push(format!(
+                        "section #{i} raw data [0x{:X}..0x{end:X}] exceeds file size 0x{file_len:X}",
+                        section.raw_offset
+                    ));
+                }
+            }
+            section
+        })
+        .collect();
 
     // --- Managed (CLR) detection ------------------------------------------
     // The COR20 (CLR) data directory, when present and non-zero, marks a managed
@@ -266,7 +240,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
             r.issues.push("entry point RVA is zero".into());
         }
     } else if !is_managed {
-        match rva_to_off(&secs, file_len, ep, 16) {
+        match rva_to_off(out, headers, ep, 16) {
             None => {
                 r.issues.push(format!(
                     "entry point RVA 0x{ep:X} does not map into any section"
@@ -288,8 +262,10 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                 }
                 // The entry must live in an executable section.
                 let exec = secs.iter().any(|s| {
-                    let span = s.vsize.max(s.raw_size);
-                    ep >= s.va && ep < s.va.wrapping_add(span) && (s.chars & 0x2000_0000) != 0
+                    let span = s.virtual_size.max(s.raw_size);
+                    ep >= s.virtual_address
+                        && ep < s.virtual_address.wrapping_add(span)
+                        && (s.characteristics & 0x2000_0000) != 0
                 });
                 if !exec {
                     r.issues.push(format!(
@@ -316,7 +292,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     if !is_managed {
         let imp_rva = rd_u32(out, dd_base.wrapping_add(8)).unwrap_or(0);
         if imp_rva != 0 {
-            match rva_to_off(&secs, file_len, imp_rva, 20) {
+            match rva_to_off(out, headers, imp_rva, 20) {
                 None => r.issues.push(format!(
                     "import directory RVA 0x{imp_rva:X} does not map into any section"
                 )),
@@ -331,7 +307,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                         if name_rva == 0 {
                             break;
                         }
-                        match rva_to_off(&secs, file_len, name_rva, 1) {
+                        match rva_to_off(out, headers, name_rva, 1) {
                             None => r.issues.push(format!(
                                 "import descriptor {i} DLL name RVA 0x{name_rva:X} does not map into any section"
                             )),
@@ -359,7 +335,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     // still refuses to load. Validate: COR20 cb == 0x48, and the MetaData stream
     // begins with the "BSJB" signature.
     if is_managed {
-        match rva_to_off(&secs, file_len, clr_rva, 0x48) {
+        match rva_to_off(out, headers, clr_rva, 0x48) {
             None => r.issues.push(format!(
                 "CLR (COR20) directory RVA 0x{clr_rva:X} does not map into any section"
             )),
@@ -373,7 +349,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                     // MetaData RVA/size live at COR20 + 0x08 / + 0x0C.
                     let md_rva = rd_u32(out, coff.wrapping_add(8)).unwrap_or(0);
                     if md_rva != 0 {
-                        match rva_to_off(&secs, file_len, md_rva, 4) {
+                        match rva_to_off(out, headers, md_rva, 4) {
                             None => r.issues.push(format!(
                                 "CLR MetaData RVA 0x{md_rva:X} does not map into any section"
                             )),
@@ -416,11 +392,11 @@ mod tests {
 
     fn executable_text() -> Vec<Section> {
         vec![Section {
-            va: 0x1000,
-            vsize: 0x4000,
-            raw_ptr: 0x1000,
+            virtual_address: 0x1000,
+            virtual_size: 0x4000,
+            raw_offset: 0x1000,
             raw_size: 0x4000,
-            chars: 0x6000_0020,
+            characteristics: 0x6000_0020,
         }]
     }
 

@@ -1,43 +1,12 @@
 use std::path::Path;
 
-use goblin::elf::{Elf, header::EM_AARCH64};
+use senbei_elf::{AARCH64_MACHINE, Error as ElfError, parse};
 
 use super::error::{Error, Result, invalid};
 
-pub(crate) const SHT_LOUSER: u32 = 0x8000_0000;
+pub(crate) use senbei_elf::SHT_LOUSER;
 pub const DEFAULT_CIPHER_CONSTANT: u32 = 0xbf20_165d;
 pub const DEFAULT_OUTER_SIZE: usize = 0x23c;
-
-pub(crate) fn looks_protected(data: &[u8]) -> bool {
-    let Ok(elf) = Elf::parse(data) else {
-        return false;
-    };
-    if elf.header.e_machine != EM_AARCH64
-        || elf
-            .section_headers
-            .iter()
-            .filter(|section| section.sh_type == SHT_LOUSER)
-            .count()
-            != 1
-    {
-        return false;
-    }
-    [
-        ".dynsym",
-        ".dynstr",
-        ".gnu.hash",
-        ".gnu.version",
-        ".gnu.version_r",
-    ]
-    .into_iter()
-    .all(|wanted| {
-        elf.section_headers.iter().any(|section| {
-            elf.shdr_strtab
-                .get_at(section.sh_name)
-                .is_some_and(|name| name == wanted)
-        })
-    })
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stage1Header {
@@ -70,13 +39,13 @@ pub(crate) fn inspect(
     outer_size: usize,
     cipher_constant: u32,
 ) -> Result<Stage1Result> {
-    let elf = Elf::parse(data).map_err(|source| Error::Elf {
+    let elf = parse(data).map_err(|source: ElfError| Error::Elf {
         path: path.to_path_buf(),
         source,
     })?;
-    if elf.header.e_machine != EM_AARCH64 {
+    if elf.header.e_machine != AARCH64_MACHINE {
         return invalid(format!(
-            "expected AArch64 ELF (machine 0x{EM_AARCH64:X}), got 0x{:X}",
+            "expected AArch64 ELF (machine 0x{AARCH64_MACHINE:X}), got 0x{:X}",
             elf.header.e_machine
         ));
     }
@@ -91,6 +60,15 @@ pub(crate) fn inspect(
             "expected exactly one SHT_LOUSER section, found {}",
             matches.len()
         ));
+    }
+    for wanted in senbei_elf::PROBE_SECTION_NAMES {
+        if !elf.section_headers.iter().any(|section| {
+            elf.shdr_strtab
+                .get_at(section.sh_name)
+                .is_some_and(|name| name == wanted)
+        }) {
+            return invalid(format!("protected ELF lacks required section {wanted}"));
+        }
     }
     let (section_index, section) = matches[0];
     let section_offset = usize::try_from(section.sh_offset)

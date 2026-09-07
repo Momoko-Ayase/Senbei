@@ -40,12 +40,12 @@ Folder scanning uses explicit target names to avoid opening bulk assets. Externa
 
 ```text
 senbei-cli/       command-line binary and integration tests
-senbei-crypto/    shared crypto and Android crypto primitives
-senbei-elf/       basic ELF parsing
+senbei-crypto/    Windows and Android crypto primitives
+senbei-elf/       ELF parsing, mapping, and dynamic-table helpers
 senbei-engine/    Windows and Android unpacking engines
-senbei-io/        filesystem, package, scanning, and CLI orchestration
-senbei-metadata/  Windows and Android metadata restoration
-senbei-pe/        basic PE parsing
+senbei-io/        filesystem, package, scanning, and platform adapters
+senbei-metadata/  shared, Windows, and Android metadata restoration
+senbei-pe/        PE parsing, data directories, and RVA mapping
 senbei-wasm/      browser bindings and its own lockfile
 web/              static browser frontend
 samples/          optional local corpus

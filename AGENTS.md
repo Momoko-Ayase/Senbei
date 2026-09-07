@@ -22,7 +22,7 @@ The optional `samples/` corpus is user-managed and ignored by Git. The Android c
 
 ## Crate Boundaries
 
-`senbei-pe` and `senbei-elf` contain basic format parsing and address mapping only. `senbei-engine/src/windows/` contains the PE unpacking pipeline; `senbei-engine/src/android/` contains Android extraction and ELF restoration. `senbei-crypto/src/android/` and `senbei-metadata/src/android/` contain Android-specific primitives; Windows metadata code is under `senbei-metadata/src/windows/`. Shared source stays directly under `src/`.
+`senbei-pe` and `senbei-elf` contain format parsing, address mapping, and ELF dynamic-table helpers only. `senbei-engine/src/windows/` contains the PE unpacking pipeline; `senbei-engine/src/android/` contains Android extraction and ELF restoration. `senbei-crypto/src/windows/` and `senbei-crypto/src/android/` contain platform-specific primitives; seeded Android metadata code is under `senbei-metadata/src/android/`, while the structural metadata transform is shared at the metadata crate root. Shared source stays directly under `src/`.
 
 The format crates and PE engine remain free of filesystem I/O. Native Android extraction and restoration may memory-map inputs and write temporary workspaces. The browser binding must continue to compile for `wasm32-unknown-unknown`.
 

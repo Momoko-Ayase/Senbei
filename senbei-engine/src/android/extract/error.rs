@@ -14,7 +14,7 @@ pub enum Error {
     Elf {
         path: PathBuf,
         #[source]
-        source: goblin::error::Error,
+        source: senbei_elf::Error,
     },
     #[error("serialize extraction index: {0}")]
     Json(#[from] serde_json::Error),

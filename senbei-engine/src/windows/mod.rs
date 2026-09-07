@@ -11,11 +11,11 @@ use senbei_crypto::primitives;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
+pub use crate::thread_cap;
 pub use dll::{unpack_dll, unpack_dll_v};
 pub use error::*;
 pub use exe::{unpack as unpack_exe, unpack_v as unpack_exe_v};
 pub use integrity::{IntegrityReport, check as check_integrity};
-pub use parallel::thread_cap;
 
 /// Maximum plausible PE `SizeOfImage` we are willing to allocate a zero buffer
 /// for. Guards against a corrupt/crafted header requesting a multi-gigabyte
