@@ -542,7 +542,6 @@ impl HuffmanLzDecoder {
 }
 
 /// Apply the native word transform and optional AES-256-CBC decryption.
-#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn transform_segment(
     data: &[u8],
     seed: u32,

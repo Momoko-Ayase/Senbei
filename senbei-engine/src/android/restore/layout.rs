@@ -4,6 +4,8 @@ pub(crate) const SHT_NOBITS: u32 = 8;
 pub(crate) const SHT_STRTAB: u32 = 3;
 pub(crate) const SHT_LOUSER: u32 = 0x8000_0000;
 pub(crate) const SHF_ALLOC: u64 = 2;
+const PT_LOAD: u32 = 1;
+pub(crate) const PF_R: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoadSegment {
@@ -12,6 +14,7 @@ pub(crate) struct LoadSegment {
     pub file_size: u64,
     pub memory_size: u64,
     pub flags: u32,
+    pub alignment: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +68,9 @@ impl SectionHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ElfLayout {
     pub entrypoint: u64,
+    pub program_header_offset: usize,
+    pub program_header_size: usize,
+    pub program_header_count: usize,
     pub program_headers: Vec<LoadSegment>,
     pub section_headers: Vec<SectionHeader>,
     pub section_name_index: usize,
@@ -95,7 +101,7 @@ impl ElfLayout {
         let mut program_headers = Vec::new();
         for index in 0..program_header_count {
             let offset = checked_index(program_header_offset, index, program_header_size)?;
-            if read_u32(data, offset)? != 1 {
+            if read_u32(data, offset)? != PT_LOAD {
                 continue;
             }
             let segment = LoadSegment {
@@ -104,6 +110,7 @@ impl ElfLayout {
                 virtual_address: read_u64(data, offset + 0x10)?,
                 file_size: read_u64(data, offset + 0x20)?,
                 memory_size: read_u64(data, offset + 0x28)?,
+                alignment: read_u64(data, offset + 0x30)?,
             };
             let file_end = segment
                 .offset
@@ -148,6 +155,9 @@ impl ElfLayout {
         };
         let layout = Self {
             entrypoint,
+            program_header_offset,
+            program_header_size,
+            program_header_count,
             program_headers,
             section_headers,
             section_name_index,
@@ -195,6 +205,116 @@ impl ElfLayout {
             .into_iter()
             .max()
             .ok_or_else(|| Error::Invalid("ELF has no PT_LOAD file range".to_owned()))
+    }
+
+    pub fn load_alignment(&self) -> Result<u64> {
+        let alignment = self
+            .program_headers
+            .iter()
+            .map(|segment| segment.alignment)
+            .max()
+            .ok_or_else(|| Error::Invalid("ELF has no PT_LOAD alignment".to_owned()))?;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return invalid(format!("invalid PT_LOAD alignment 0x{alignment:x}"));
+        }
+        Ok(alignment)
+    }
+
+    pub fn append_load_segment(&self, output: &mut [u8], segment: LoadSegment) -> Result<Self> {
+        if self.program_header_size != 0x38 {
+            return invalid("unexpected ELF program header size");
+        }
+        if segment.file_size == 0 {
+            return invalid("new PT_LOAD has no file contents");
+        }
+        if segment.memory_size < segment.file_size {
+            return invalid("new PT_LOAD memory size is smaller than file size");
+        }
+        if segment.alignment == 0 || !segment.alignment.is_power_of_two() {
+            return invalid(format!(
+                "invalid new PT_LOAD alignment 0x{:x}",
+                segment.alignment
+            ));
+        }
+        if segment.offset % segment.alignment != segment.virtual_address % segment.alignment {
+            return invalid("new PT_LOAD offset and address are misaligned");
+        }
+        let segment_file_end = segment
+            .offset
+            .checked_add(segment.file_size)
+            .ok_or_else(|| Error::Invalid("new PT_LOAD file range overflow".to_owned()))?;
+        let segment_memory_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or_else(|| Error::Invalid("new PT_LOAD memory range overflow".to_owned()))?;
+        if segment_file_end > output.len() as u64 {
+            return invalid("new PT_LOAD exceeds output mapping");
+        }
+        for existing in &self.program_headers {
+            let existing_file_end = existing
+                .offset
+                .checked_add(existing.file_size)
+                .ok_or_else(|| Error::Invalid("PT_LOAD file range overflow".to_owned()))?;
+            if segment.offset < existing_file_end && existing.offset < segment_file_end {
+                return invalid("new PT_LOAD overlaps an existing file range");
+            }
+            let existing_memory_end = existing
+                .virtual_address
+                .checked_add(existing.memory_size)
+                .ok_or_else(|| Error::Invalid("PT_LOAD memory range overflow".to_owned()))?;
+            if segment.virtual_address < existing_memory_end
+                && existing.virtual_address < segment_memory_end
+            {
+                return invalid("new PT_LOAD overlaps an existing memory range");
+            }
+        }
+        let new_count = self
+            .program_header_count
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("program header count overflow".to_owned()))?;
+        let new_count_u16 = u16::try_from(new_count)
+            .map_err(|_| Error::Invalid("program header count exceeds u16".to_owned()))?;
+        let header_offset = checked_index(
+            self.program_header_offset,
+            self.program_header_count,
+            self.program_header_size,
+        )?;
+        let header_end = header_offset
+            .checked_add(self.program_header_size)
+            .ok_or_else(|| Error::Invalid("new program header range overflow".to_owned()))?;
+        slice(output, header_offset, self.program_header_size)?;
+        let first_file_section = self
+            .section_headers
+            .iter()
+            .filter(|section| section.section_type != SHT_NOBITS && section.size != 0)
+            .map(|section| section.offset)
+            .min();
+        if first_file_section.is_some_and(|offset| header_end as u64 > offset) {
+            return invalid("no space for an additional program header");
+        }
+
+        let mut header = [0_u8; 0x38];
+        header[0..4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        header[4..8].copy_from_slice(&segment.flags.to_le_bytes());
+        header[8..0x10].copy_from_slice(&segment.offset.to_le_bytes());
+        header[0x10..0x18].copy_from_slice(&segment.virtual_address.to_le_bytes());
+        header[0x18..0x20].copy_from_slice(&segment.virtual_address.to_le_bytes());
+        header[0x20..0x28].copy_from_slice(&segment.file_size.to_le_bytes());
+        header[0x28..0x30].copy_from_slice(&segment.memory_size.to_le_bytes());
+        header[0x30..0x38].copy_from_slice(&segment.alignment.to_le_bytes());
+        output
+            .get_mut(header_offset..header_end)
+            .ok_or_else(|| Error::Invalid("new program header exceeds output".to_owned()))?
+            .copy_from_slice(&header);
+        output
+            .get_mut(0x38..0x3a)
+            .ok_or_else(|| Error::Invalid("ELF header is truncated".to_owned()))?
+            .copy_from_slice(&new_count_u16.to_le_bytes());
+
+        let mut updated = self.clone();
+        updated.program_header_count = new_count;
+        updated.program_headers.push(segment);
+        Ok(updated)
     }
 
     /// Resolve every section's name from the ELF `shstrtab` section.
@@ -349,6 +469,9 @@ mod tests {
     fn layout(name_index: u32) -> ElfLayout {
         ElfLayout {
             entrypoint: 0,
+            program_header_offset: 0,
+            program_header_size: 0x38,
+            program_header_count: 0,
             program_headers: Vec::new(),
             section_headers: vec![
                 SectionHeader {
@@ -436,5 +559,78 @@ mod tests {
             .section_names(b"\0text\0\x01\x01")
             .expect_err("unterminated table");
         assert!(error.to_string().contains("not NUL terminated"));
+    }
+
+    #[test]
+    fn append_load_segment_updates_program_headers() {
+        let elf_layout = ElfLayout {
+            entrypoint: 0,
+            program_header_offset: 0,
+            program_header_size: 0x38,
+            program_header_count: 0,
+            program_headers: Vec::new(),
+            section_headers: Vec::new(),
+            section_name_index: 0,
+            private_section_index: usize::MAX,
+        };
+        let mut output = vec![0_u8; 0x2000];
+        let updated = elf_layout
+            .append_load_segment(
+                &mut output,
+                LoadSegment {
+                    offset: 0x1000,
+                    virtual_address: 0x2000,
+                    file_size: 0x20,
+                    memory_size: 0x20,
+                    flags: PF_R,
+                    alignment: 0x1000,
+                },
+            )
+            .expect("append segment");
+        assert_eq!(updated.program_header_count, 1);
+        assert_eq!(updated.program_headers[0].virtual_address, 0x2000);
+        assert_eq!(&output[0..4], &PT_LOAD.to_le_bytes());
+        assert_eq!(&output[0x38..0x3a], &1_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn append_load_segment_rejects_program_header_overlap() {
+        let mut elf_layout = ElfLayout {
+            entrypoint: 0,
+            program_header_offset: 0,
+            program_header_size: 0x38,
+            program_header_count: 0,
+            program_headers: Vec::new(),
+            section_headers: Vec::new(),
+            section_name_index: 0,
+            private_section_index: usize::MAX,
+        };
+        elf_layout.section_headers.push(SectionHeader {
+            name: 0,
+            section_type: 1,
+            flags: 0,
+            address: 0,
+            offset: 0x20,
+            size: 1,
+            link: 0,
+            info: 0,
+            alignment: 1,
+            entry_size: 0,
+        });
+        let mut output = vec![0_u8; 0x100];
+        let error = elf_layout
+            .append_load_segment(
+                &mut output,
+                LoadSegment {
+                    offset: 0x80,
+                    virtual_address: 0x1080,
+                    file_size: 0x20,
+                    memory_size: 0x20,
+                    flags: PF_R,
+                    alignment: 0x1000,
+                },
+            )
+            .expect_err("overlapping program header");
+        assert!(error.to_string().contains("additional program header"));
     }
 }

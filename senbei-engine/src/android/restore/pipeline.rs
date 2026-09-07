@@ -16,8 +16,8 @@ use super::artifact::load_artifacts;
 use super::error::{Error, Result, invalid};
 use super::hash::{build_gnu_hash, build_sysv_hash};
 use super::layout::{
-    ElfLayout, SHF_ALLOC, SHT_LOUSER, SHT_NOBITS, SectionHeader, align_up, read_i64, read_u32,
-    read_u64, slice, slice_u64, usize_from_u64,
+    ElfLayout, LoadSegment, PF_R, SHF_ALLOC, SHT_LOUSER, SHT_NOBITS, SectionHeader, align_up,
+    read_i64, read_u32, read_u64, slice, slice_u64, usize_from_u64,
 };
 
 const CHUNK_SIZE: usize = 16 * 1024 * 1024;
@@ -98,6 +98,12 @@ pub struct HiddenSymbolReport {
 pub struct PlacementReport {
     pub offset: u64,
     pub size: usize,
+}
+
+struct TablePayload {
+    name: &'static str,
+    alignment: u64,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -432,6 +438,9 @@ impl AuxiliaryElfImage {
             relocation2_offset: words[10],
             relocation2_count: words[11],
         };
+        if result.dynsym_count == 0 {
+            return invalid("auxiliary dynamic symbol table has no null entry");
+        }
         if result.relocation1_offset != 0x40 {
             return invalid("auxiliary relocation table does not follow its header");
         }
@@ -469,9 +478,6 @@ impl AuxiliaryElfImage {
                     "auxiliary ELF alignment padding 0x{start:x}..0x{end:x} is nonzero"
                 ));
             }
-        }
-        if result.dynsym_count < 2 {
-            return invalid("auxiliary dynamic symbol table is empty");
         }
         if slice(data, result.dynsym_offset as usize, ELF64_SYMBOL_SIZE)?
             .iter()
@@ -743,8 +749,30 @@ fn patch_dynamic_tags(
     Ok(())
 }
 
+fn dynamic_contains_tag(output: &[u8], dynamic: SectionHeader, wanted: u64) -> Result<bool> {
+    if dynamic.size % 0x10 != 0 {
+        return invalid(".dynamic size is not entry-aligned");
+    }
+    let start = usize_from_u64(dynamic.offset, ".dynamic offset")?;
+    let size = usize_from_u64(dynamic.size, ".dynamic size")?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| Error::Invalid(".dynamic end overflow".to_owned()))?;
+    slice(output, start, size)?;
+    for offset in (start..end).step_by(0x10) {
+        let tag = read_u64(output, offset)?;
+        if tag == wanted {
+            return Ok(true);
+        }
+        if tag == 0 {
+            break;
+        }
+    }
+    Ok(false)
+}
+
 fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, usize>> {
-    const REQUIRED: [&str; 9] = [
+    const REQUIRED: [&str; 8] = [
         ".dynsym",
         ".gnu.version",
         ".gnu.version_r",
@@ -753,7 +781,6 @@ fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, us
         ".rela.dyn",
         ".rela.plt",
         ".dynamic",
-        ".rodata",
     ];
     let mut result = HashMap::with_capacity(REQUIRED.len());
     for required in REQUIRED {
@@ -785,13 +812,182 @@ fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, us
     Ok(result)
 }
 
+fn metadata_capacity_end(
+    layout: &ElfLayout,
+    indices: &HashMap<&'static str, usize>,
+    metadata_start: u64,
+) -> Result<u64> {
+    let table_indices = indices.values().copied().collect::<HashSet<_>>();
+    let file_end = layout.private_section()?.offset;
+    let next_section = layout
+        .section_headers
+        .iter()
+        .enumerate()
+        .filter(|(index, section)| {
+            !table_indices.contains(index)
+                && section.section_type != SHT_NOBITS
+                && section.size != 0
+                && section.offset >= metadata_start
+        })
+        .map(|(_, section)| section.offset)
+        .min()
+        .unwrap_or(file_end);
+    let capacity_end = next_section.min(file_end);
+    // A zero-length window is a valid result: the caller can move the whole
+    // table set to a new PT_LOAD instead of overwriting an adjacent section.
+    Ok(capacity_end.max(metadata_start))
+}
+
+fn metadata_mapping_length(
+    source: &[u8],
+    layout: &ElfLayout,
+    auxiliary_data: &[u8],
+) -> Result<usize> {
+    let names = layout.section_names(source)?;
+    let indices = required_section_indices(&names)?;
+    let section = |name: &'static str| -> SectionHeader { layout.section_headers[indices[name]] };
+    let dynsym = section(".dynsym");
+    let versym = section(".gnu.version");
+    let verneed = section(".gnu.version_r");
+    let dynstr = section(".dynstr");
+    let rela_dyn = section(".rela.dyn");
+    let rela_plt = section(".rela.plt");
+    if dynsym.entry_size != ELF64_SYMBOL_SIZE as u64
+        || dynsym.size % ELF64_SYMBOL_SIZE as u64 != 0
+        || versym.entry_size != 2
+        || rela_dyn.entry_size != ELF64_RELA_SIZE as u64
+        || rela_plt.entry_size != ELF64_RELA_SIZE as u64
+        || rela_dyn.size % ELF64_RELA_SIZE as u64 != 0
+        || rela_plt.size % ELF64_RELA_SIZE as u64 != 0
+    {
+        return invalid("unexpected dynamic-table entry layout");
+    }
+    let auxiliary = AuxiliaryElfImage::parse(auxiliary_data)?;
+    let old_symbol_count = usize_from_u64(
+        dynsym.size / ELF64_SYMBOL_SIZE as u64,
+        "dynamic symbol count",
+    )?;
+    let appended_count =
+        usize::try_from(auxiliary.dynsym_count.checked_sub(1).ok_or_else(|| {
+            Error::Invalid("auxiliary symbol table has no null entry".to_owned())
+        })?)
+        .map_err(|_| Error::Invalid("auxiliary symbol count exceeds usize".to_owned()))?;
+    let new_symbol_count = old_symbol_count
+        .checked_add(appended_count)
+        .ok_or_else(|| Error::Invalid("merged dynamic symbol count overflow".to_owned()))?;
+    let merged_dynstr_size = usize_from_u64(dynstr.size, ".dynstr size")?
+        .checked_add(auxiliary.dynstr_size as usize)
+        .ok_or_else(|| Error::Invalid("merged dynamic string size overflow".to_owned()))?;
+    let merged_rela_dyn_count =
+        usize_from_u64(rela_dyn.size / ELF64_RELA_SIZE as u64, ".rela.dyn count")?
+            .checked_add(auxiliary.relocation1_count as usize)
+            .and_then(|count| count.checked_add(auxiliary.relocation2_count as usize))
+            .ok_or_else(|| Error::Invalid("merged .rela.dyn count overflow".to_owned()))?;
+    let merged_rela_plt_count =
+        usize_from_u64(rela_plt.size / ELF64_RELA_SIZE as u64, ".rela.plt count")?
+            .checked_add(auxiliary.relocation2_count as usize)
+            .ok_or_else(|| Error::Invalid("merged .rela.plt count overflow".to_owned()))?;
+    let gnu_hash_size = 28_usize
+        .checked_add(
+            new_symbol_count
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    Error::Invalid("dynamic symbol table is unexpectedly empty".to_owned())
+                })?
+                .checked_mul(4)
+                .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?,
+        )
+        .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?;
+    let sysv_hash_size = indices.contains_key(".hash").then(|| {
+        new_symbol_count
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(2))
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| Error::Invalid("SysV hash size overflow".to_owned()))
+    });
+    let sysv_hash_size = match sysv_hash_size {
+        Some(size) => size?,
+        None => 0,
+    };
+    let mut cursor = 0_u64;
+    for (size, alignment) in [
+        (
+            new_symbol_count
+                .checked_mul(ELF64_SYMBOL_SIZE)
+                .ok_or_else(|| Error::Invalid("merged .dynsym size overflow".to_owned()))?,
+            8,
+        ),
+        (
+            usize_from_u64(versym.size, ".gnu.version size")?
+                .checked_add(appended_count.checked_mul(2).ok_or_else(|| {
+                    Error::Invalid("merged .gnu.version size overflow".to_owned())
+                })?)
+                .ok_or_else(|| Error::Invalid("merged .gnu.version size overflow".to_owned()))?,
+            2,
+        ),
+        (usize_from_u64(verneed.size, ".gnu.version_r size")?, 4),
+        (gnu_hash_size, 8),
+        (sysv_hash_size, 4),
+        (merged_dynstr_size, 1),
+        (
+            merged_rela_dyn_count
+                .checked_mul(ELF64_RELA_SIZE)
+                .ok_or_else(|| Error::Invalid("merged .rela.dyn size overflow".to_owned()))?,
+            8,
+        ),
+        (
+            merged_rela_plt_count
+                .checked_mul(ELF64_RELA_SIZE)
+                .ok_or_else(|| Error::Invalid("merged .rela.plt size overflow".to_owned()))?,
+            8,
+        ),
+    ] {
+        cursor = align_up(cursor, alignment)?;
+        cursor = cursor
+            .checked_add(size as u64)
+            .ok_or_else(|| Error::Invalid("dynamic-table reserve overflow".to_owned()))?;
+    }
+    let extension_alignment = layout.load_alignment()?;
+    let extension_start = align_up(layout.private_section()?.offset, extension_alignment)?;
+    let end = extension_start
+        .checked_add(cursor)
+        .ok_or_else(|| Error::Invalid("dynamic-table mapping end overflow".to_owned()))?;
+    usize_from_u64(end, "dynamic-table mapping length")
+}
+
+fn table_placements(
+    tables: &[TablePayload],
+    start: u64,
+) -> Result<(BTreeMap<String, PlacementReport>, u64)> {
+    let mut cursor = start;
+    let mut placements = BTreeMap::new();
+    for table in tables {
+        cursor = align_up(cursor, table.alignment)?;
+        placements.insert(
+            table.name.to_owned(),
+            PlacementReport {
+                offset: cursor,
+                size: table.data.len(),
+            },
+        );
+        cursor = cursor
+            .checked_add(table.data.len() as u64)
+            .ok_or_else(|| Error::Invalid("rebuilt ELF metadata end overflow".to_owned()))?;
+    }
+    Ok((placements, cursor))
+}
+
+fn table_end(tables: &[TablePayload], start: u64) -> Result<u64> {
+    table_placements(tables, start).map(|(_, end)| end)
+}
+
 fn materialize_static_elf_tables(
     output: &mut [u8],
     source: &[u8],
     layout: &ElfLayout,
     symbol_patch_data: &[u8],
     auxiliary_data: &[u8],
-) -> Result<(ElfLayout, ElfMaterializationReport)> {
+) -> Result<(ElfLayout, ElfMaterializationReport, u64)> {
     let names = layout.section_names(source)?;
     let indices = required_section_indices(&names)?;
     let section = |name: &'static str| -> SectionHeader { layout.section_headers[indices[name]] };
@@ -802,7 +998,6 @@ fn materialize_static_elf_tables(
     let rela_dyn = section(".rela.dyn");
     let rela_plt = section(".rela.plt");
     let dynamic = section(".dynamic");
-    let rodata = section(".rodata");
 
     let (old_symbols, old_strings, hidden_symbols) =
         restore_hidden_symbols(output, dynsym, dynstr, symbol_patch_data)?;
@@ -819,7 +1014,11 @@ fn materialize_static_elf_tables(
         auxiliary.dynstr_offset as usize,
         auxiliary.dynstr_size as usize,
     )?;
-    let appended_count = auxiliary.dynsym_count as usize - 1;
+    let appended_count =
+        usize::try_from(auxiliary.dynsym_count.checked_sub(1).ok_or_else(|| {
+            Error::Invalid("auxiliary symbol table has no null entry".to_owned())
+        })?)
+        .map_err(|_| Error::Invalid("auxiliary symbol count exceeds usize".to_owned()))?;
     let mut appended_symbols = Vec::with_capacity(appended_count * ELF64_SYMBOL_SIZE);
     for index in 1..auxiliary.dynsym_count as usize {
         let offset = auxiliary.dynsym_offset as usize + index * ELF64_SYMBOL_SIZE;
@@ -926,11 +1125,6 @@ fn materialize_static_elf_tables(
     let rela_dyn_count = merged_rela_dyn.len() / ELF64_RELA_SIZE;
     let rela_plt_count = merged_rela_plt.len() / ELF64_RELA_SIZE;
 
-    struct TablePayload {
-        name: &'static str,
-        alignment: u64,
-        data: Vec<u8>,
-    }
     let mut tables = vec![
         TablePayload {
             name: ".dynsym",
@@ -977,34 +1171,52 @@ fn materialize_static_elf_tables(
             data: merged_rela_plt,
         },
     ]);
-    let metadata_start = dynsym.offset;
-    let mut cursor = metadata_start;
-    let mut placements = BTreeMap::new();
-    for table in &tables {
-        cursor = align_up(cursor, table.alignment)?;
-        placements.insert(
-            table.name.to_owned(),
-            PlacementReport {
-                offset: cursor,
-                size: table.data.len(),
+    let mut placement_layout = layout.clone();
+    let mut metadata_start = dynsym.offset;
+    let (mut placements, mut cursor) = table_placements(&tables, metadata_start)?;
+    let mut capacity_end = metadata_capacity_end(layout, &indices, metadata_start)?;
+    if cursor > capacity_end {
+        let alignment = layout.load_alignment()?;
+        let extension_start = align_up(layout.private_section()?.offset, alignment)?;
+        let extension_end = table_end(&tables, extension_start)?;
+        let extension_size = extension_end
+            .checked_sub(extension_start)
+            .ok_or_else(|| Error::Invalid("dynamic-table extension underflow".to_owned()))?;
+        let extension_address = align_up(layout.load_end()?, alignment)?;
+        placement_layout = layout.append_load_segment(
+            output,
+            LoadSegment {
+                offset: extension_start,
+                virtual_address: extension_address,
+                file_size: extension_size,
+                memory_size: extension_size,
+                flags: PF_R,
+                alignment,
             },
-        );
-        cursor = cursor
-            .checked_add(table.data.len() as u64)
-            .ok_or_else(|| Error::Invalid("rebuilt ELF metadata end overflow".to_owned()))?;
+        )?;
+        metadata_start = extension_start;
+        (placements, cursor) = table_placements(&tables, metadata_start)?;
+        capacity_end = cursor;
     }
-    if cursor > rodata.offset {
-        return invalid(format!(
-            "rebuilt ELF tables end at 0x{cursor:x}, beyond .rodata 0x{:x}",
-            rodata.offset
-        ));
-    }
-    let zero_start = usize_from_u64(metadata_start, "metadata start")?;
-    let zero_end = usize_from_u64(rodata.offset, ".rodata offset")?;
+    let zero_start = usize_from_u64(dynsym.offset, "metadata start")?;
+    let zero_end = usize_from_u64(
+        metadata_capacity_end(layout, &indices, dynsym.offset)?,
+        "metadata capacity end",
+    )?;
     output
         .get_mut(zero_start..zero_end)
         .ok_or_else(|| Error::Invalid("metadata capacity exceeds output mapping".to_owned()))?
         .fill(0);
+    if metadata_start != dynsym.offset {
+        let extension_start = usize_from_u64(metadata_start, "dynamic-table extension start")?;
+        let extension_end = usize_from_u64(cursor, "dynamic-table extension end")?;
+        output
+            .get_mut(extension_start..extension_end)
+            .ok_or_else(|| {
+                Error::Invalid("dynamic-table extension exceeds output mapping".to_owned())
+            })?
+            .fill(0);
+    }
 
     let mut updated_sections = layout.section_headers.clone();
     for table in &tables {
@@ -1021,8 +1233,8 @@ fn materialize_static_elf_tables(
             .copy_from_slice(&table.data);
         let index = indices[table.name];
         let mut updated = updated_sections[index];
-        updated.address =
-            layout.file_offset_to_virtual_address(placement.offset, table.data.len() as u64)?;
+        updated.address = placement_layout
+            .file_offset_to_virtual_address(placement.offset, table.data.len() as u64)?;
         updated.offset = placement.offset;
         updated.size = table.data.len() as u64;
         updated_sections[index] = updated;
@@ -1039,16 +1251,23 @@ fn materialize_static_elf_tables(
         (DT_JMPREL, section_address(".rela.plt")),
         (DT_GNU_HASH, section_address(".gnu.hash")),
         (DT_VERSYM, section_address(".gnu.version")),
-        (DT_RELACOUNT, relative_count as u64),
         (DT_VERNEED, section_address(".gnu.version_r")),
     ]);
+    if dynamic_contains_tag(output, dynamic, DT_RELACOUNT)? {
+        dynamic_values.insert(DT_RELACOUNT, relative_count as u64);
+    }
     if indices.contains_key(".hash") {
         dynamic_values.insert(DT_HASH, section_address(".hash"));
     }
     patch_dynamic_tags(output, dynamic, &dynamic_values)?;
 
-    let mut restored_layout = layout.clone();
+    let mut restored_layout = placement_layout;
     restored_layout.section_headers = updated_sections;
+    let data_end = if metadata_start == dynsym.offset {
+        layout.private_section()?.offset
+    } else {
+        cursor
+    };
     Ok((
         restored_layout,
         ElfMaterializationReport {
@@ -1065,10 +1284,11 @@ fn materialize_static_elf_tables(
             relative_prefix_count: relative_count,
             metadata_start,
             metadata_end: cursor,
-            metadata_capacity_end: rodata.offset,
-            metadata_slack: rodata.offset - cursor,
+            metadata_capacity_end: capacity_end,
+            metadata_slack: capacity_end.saturating_sub(cursor),
             placements,
         },
+        data_end,
     ))
 }
 
@@ -1090,9 +1310,13 @@ fn finalize_clean_elf(
     temporary_path: &Path,
     source: &[u8],
     layout: &ElfLayout,
+    data_start: u64,
     preserve_entrypoint: bool,
 ) -> Result<CleaningReport> {
     let private = layout.private_section()?;
+    if data_start < private.offset {
+        return invalid("ELF data start precedes the private section");
+    }
     let names = layout.section_names(source)?;
     if layout.private_section_index + 1 != layout.section_headers.len() {
         return invalid("SHT_LOUSER section is not the final section");
@@ -1100,7 +1324,7 @@ fn finalize_clean_elf(
     let retained = &layout.section_headers[..layout.private_section_index];
     let mut updated = Vec::with_capacity(retained.len());
     stream
-        .seek(SeekFrom::Start(private.offset))
+        .seek(SeekFrom::Start(data_start))
         .map_err(|error| Error::io("seek temporary output", temporary_path, error))?;
     for &section in retained {
         if section.section_type == SHT_NOBITS || section.flags & SHF_ALLOC != 0 || section.size == 0
@@ -1363,9 +1587,9 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         .map_err(|error| Error::io("size temporary output", &temporary_path, error))?;
 
     let mut restored_layout = layout.clone();
-    let mut auxiliary_data = None;
     let mut auxiliary_stats = None;
     let mut materialization = None;
+    let mut temporary_end = private.offset;
     let primary_stats;
     {
         let mut output = map_mut(temporary.as_file(), private_size, &temporary_path)?;
@@ -1384,35 +1608,50 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
             options.verbose,
             |address, data| writer.write(address, data),
         )?;
-        if !options.outer_only {
-            if options.verbose {
-                eprintln!("Decoding auxiliary 0x9D ELF materialization container...");
-            }
-            let mut decoded = vec![0_u8; auxiliary_header.output_size as usize];
-            let stats = decode_container(
-                &payload,
-                &auxiliary_header,
-                &config,
-                options.verbose,
-                |offset, data| {
-                    let start = usize_from_u64(offset, "auxiliary write offset")?;
-                    let end = start.checked_add(data.len()).ok_or_else(|| {
-                        Error::Invalid("auxiliary decoded write overflow".to_owned())
-                    })?;
-                    let destination = decoded.get_mut(start..end).ok_or_else(|| {
-                        Error::Invalid("auxiliary decoded write is out of range".to_owned())
-                    })?;
-                    destination.copy_from_slice(data);
-                    Ok(data.len())
-                },
-            )?;
-            if let Some(path) = &options.dump_auxiliary {
-                write_atomic(&absolute(path)?, &decoded)?;
-            }
-            if options.verbose {
-                eprintln!("Rebuilding static ELF dynamic-linker tables...");
-            }
-            let (new_layout, report) = materialize_static_elf_tables(
+        output
+            .flush()
+            .map_err(|error| Error::io("flush restored image", &temporary_path, error))?;
+    }
+
+    if !options.outer_only {
+        if options.verbose {
+            eprintln!("Decoding auxiliary 0x9D ELF materialization container...");
+        }
+        let mut decoded = vec![0_u8; auxiliary_header.output_size as usize];
+        let stats = decode_container(
+            &payload,
+            &auxiliary_header,
+            &config,
+            options.verbose,
+            |offset, data| {
+                let start = usize_from_u64(offset, "auxiliary write offset")?;
+                let end = start
+                    .checked_add(data.len())
+                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
+                let destination = decoded.get_mut(start..end).ok_or_else(|| {
+                    Error::Invalid("auxiliary decoded write is out of range".to_owned())
+                })?;
+                destination.copy_from_slice(data);
+                Ok(data.len())
+            },
+        )?;
+        if let Some(path) = &options.dump_auxiliary {
+            write_atomic(&absolute(path)?, &decoded)?;
+        }
+        let mapping_length = metadata_mapping_length(&source, &layout, &decoded)?;
+        if mapping_length < private_size {
+            return invalid("dynamic-table mapping is shorter than the ELF image");
+        }
+        temporary
+            .as_file()
+            .set_len(mapping_length as u64)
+            .map_err(|error| Error::io("extend temporary output", &temporary_path, error))?;
+        if options.verbose {
+            eprintln!("Rebuilding static ELF dynamic-linker tables...");
+        }
+        {
+            let mut output = map_mut(temporary.as_file(), mapping_length, &temporary_path)?;
+            let (new_layout, report, data_end) = materialize_static_elf_tables(
                 &mut output,
                 &source,
                 &layout,
@@ -1422,19 +1661,23 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
             restored_layout = new_layout;
             materialization = Some(report);
             auxiliary_stats = Some(stats);
-            auxiliary_data = Some(decoded);
+            temporary_end = data_end;
+            output
+                .flush()
+                .map_err(|error| Error::io("flush restored image", &temporary_path, error))?;
         }
-        output
-            .flush()
-            .map_err(|error| Error::io("flush restored image", &temporary_path, error))?;
+        temporary
+            .as_file()
+            .set_len(temporary_end)
+            .map_err(|error| Error::io("trim temporary output", &temporary_path, error))?;
     }
-    drop(auxiliary_data);
 
     let cleaning = finalize_clean_elf(
         temporary.as_file_mut(),
         &temporary_path,
         &source,
         &restored_layout,
+        temporary_end,
         options.preserve_entrypoint,
     )?;
     let validation = {
@@ -1488,4 +1731,47 @@ fn hex_digest(data: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auxiliary_image(symbol_count: u32) -> Vec<u8> {
+        let mut data = vec![0_u8; 0x279];
+        let words = [
+            0x40_u32,
+            0,
+            0x40,
+            0,
+            0x278,
+            1,
+            0x260,
+            symbol_count,
+            0x40,
+            3,
+            0x90,
+            19,
+            0,
+            0,
+            0xb7,
+            0,
+        ];
+        for (index, word) in words.into_iter().enumerate() {
+            data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn auxiliary_accepts_null_only_dynamic_symbol_table() {
+        let parsed = AuxiliaryElfImage::parse(&auxiliary_image(1)).expect("null-only dynsym");
+        assert_eq!(parsed.dynsym_count, 1);
+    }
+
+    #[test]
+    fn auxiliary_rejects_missing_null_dynamic_symbol() {
+        let error = AuxiliaryElfImage::parse(&auxiliary_image(0)).expect_err("missing null symbol");
+        assert!(error.to_string().contains("no null entry"));
+    }
 }

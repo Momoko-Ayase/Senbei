@@ -37,6 +37,8 @@ External companion inputs are reconstructed as `stub[..4096]` followed by the ma
 
 Android protection primitives are in `senbei-crypto/src/android/`. Android metadata restoration is in `senbei-metadata/src/android/` and only rewrites MethodDef token fields. The Windows structural metadata transform is in `senbei-metadata/src/windows/`.
 
+Android ELF dynamic tables are located from the input section table and its actual file ranges. When the original gap is too small, restoration adds a validated read-only `PT_LOAD` after the existing load image and updates the dynamic tags; it never overwrites an adjacent section or emits a partial image.
+
 ## Scanning and Packages
 
 Folder scanning uses platform target names to avoid opening bulk assets: Windows candidates are `.exe`, `.dll`, and `global-metadata.dat`; Android candidates are `.so` and `global-metadata.dat`. A Windows `.exe._` or `.dll._` companion is auxiliary input for its sibling stub and is excluded from the skipped count.
