@@ -333,6 +333,26 @@ footer {
 }
 footer a { color: var(--dim); }
 
+/* --- narrow screens --- */
+
+/* On a narrow viewport the status column (flex: 1, right-aligned) is
+   squeezed by a long file name into a one-word-per-line vertical strip.
+   Stack the row instead: name + icons on the first line, the status on its
+   own full-width line below, left-aligned. */
+@media (max-width: 560px) {
+  main { padding: 1.5rem 0.9rem 2.5rem; }
+
+  #dropzone { padding: 1.75rem 1rem; }
+
+  .file .row { flex-wrap: wrap; }
+  .file .name { flex: 1; min-width: 0; }
+  .file .status {
+    order: 6; /* after the download/remove icons */
+    flex-basis: 100%;
+    text-align: left;
+  }
+}
+
 /* --- animations --- */
 
 @keyframes fadeIn {
