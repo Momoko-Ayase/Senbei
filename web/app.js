@@ -50,6 +50,22 @@ const KIND_LABEL = {
   'native-dll': 'protected native DLL',
   'managed-dll': 'protected managed DLL',
   metadata: 'il2cpp metadata',
+  'android-package':
+    'Android app package — the web build cannot unpack these yet; use the senbei CLI',
+  'android-so':
+    'Android AArch64 library — the web build cannot unpack these yet; use the senbei CLI',
+};
+
+// Android targets are recognized by extension so the row can explain the
+// situation instead of reporting a protected file as unrecognized: the
+// Android pipeline is filesystem orchestration (senbei-io) with no wasm
+// build, so these files need the CLI. The pseudo-kinds are labels only —
+// they never reach the worker.
+const ANDROID_KIND = {
+  apk: 'android-package',
+  apks: 'android-package',
+  xapk: 'android-package',
+  so: 'android-so',
 };
 
 const COMPANION_SVG =
@@ -91,8 +107,13 @@ async function stageFiles(list) {
     // the PE header fields); read a small slice, not the whole file.
     const head = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
     // Companions are ciphertext fragments; detect() only makes sense on the
-    // base module, so skip it for `._` files.
-    const kind = file.name.endsWith('._') ? undefined : detect(head);
+    // base module, so skip it for `._` files. Android targets short-circuit
+    // detect() as well: an ELF/zip never classifies as a protected PE, and
+    // the row must carry the android pseudo-kind for its status line.
+    const ext = file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase();
+    const kind = file.name.endsWith('._')
+      ? undefined
+      : (ANDROID_KIND[ext] ?? detect(head));
     const old = files.get(file.name);
     files.set(file.name, {
       file,
@@ -284,7 +305,10 @@ function render() {
 
   const unpackable = [...files].some(
     ([name, e]) =>
-      !name.endsWith('._') && e.kind !== undefined && e.state === 'staged',
+      !name.endsWith('._') &&
+      e.kind !== undefined &&
+      !e.kind.startsWith('android-') &&
+      e.state === 'staged',
   );
   unpackBtn.disabled = !unpackable;
   actions.hidden = files.size === 0;
@@ -363,6 +387,10 @@ unpackBtn.addEventListener('click', async () => {
         render();
         continue;
       }
+
+      // Android rows are informational only (no wasm pipeline); their staged
+      // status line already says to use the CLI.
+      if (entry.kind.startsWith('android-')) continue;
 
       entry.state = 'working';
       render();
