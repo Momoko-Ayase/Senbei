@@ -976,6 +976,58 @@ impl<'a> Unpacker<'a> {
             }
         }
 
+        // ---- Re-arm TLS field base relocations (PE32 DLL) ----
+        // The packer neutralizes the four relocations covering the TLS
+        // directory's VA fields (Start/EndAddressOfRawData, AddressOfIndex,
+        // AddressOfCallBacks) by demoting them to IMAGE_REL_BASED_ABSOLUTE
+        // padding, because its own loader fixes TLS up by hand. Restored
+        // verbatim, a DLL mapped off its preferred base keeps stale VAs in its
+        // TLS directory, and the OS loader faults in LdrpAllocateTlsEntry when
+        // it writes the TLS slot index through the unrelocated AddressOfIndex.
+        // Promote those entries back to IMAGE_REL_BASED_HIGHLOW. EXE output
+        // is untouched: its BaseReloc directory is zeroed above, and its
+        // goldens must stay byte-identical.
+        if is_dll && tls_dir_rva > 0 {
+            let reloc_rva = get_u32(&self.decompressed, exe_pe.wrapping_add(0xA0));
+            let reloc_size = get_u32(&self.decompressed, exe_pe.wrapping_add(0xA4));
+            let reloc_end = reloc_rva.wrapping_add(reloc_size);
+            let dlen = self.decompressed.len() as u32;
+            if reloc_rva > 0 && reloc_size >= 8 && reloc_end <= dlen {
+                let mut rearmed = 0u32;
+                let mut block = reloc_rva;
+                while block.wrapping_add(8) <= reloc_end {
+                    let page = get_u32(&self.decompressed, block);
+                    let block_size = get_u32(&self.decompressed, block.wrapping_add(4));
+                    if block_size < 8
+                        || !block_size.is_multiple_of(2)
+                        || block.wrapping_add(block_size) > reloc_end
+                    {
+                        break;
+                    }
+                    let entries = (block_size - 8) / 2;
+                    for i in 0..entries {
+                        let entry_off = block.wrapping_add(8).wrapping_add(i.wrapping_mul(2));
+                        let entry = get_u16(&self.decompressed, entry_off);
+                        let entry_rva = page.wrapping_add((entry & 0x0FFF) as u32);
+                        // IMAGE_REL_BASED_ABSOLUTE with a real offset is
+                        // neutralized, not padding (padding keeps offset 0).
+                        if entry >> 12 == 0
+                            && entry & 0x0FFF != 0
+                            && entry_rva >= tls_dir_rva
+                            && entry_rva < tls_dir_rva.wrapping_add(16)
+                        {
+                            write_u16(&mut self.decompressed, entry_off, (entry | 0x3000) as u32);
+                            rearmed = rearmed.wrapping_add(1);
+                        }
+                    }
+                    block = block.wrapping_add(block_size);
+                }
+                if verbose && rearmed > 0 {
+                    println!("  re-armed {} TLS field relocations", rearmed);
+                }
+            }
+        }
+
         // ---- Import table (PE32, 4-byte thunks) ----
         if verbose {
             println!("[8/9] Decrypting import strings (PE32)...");
