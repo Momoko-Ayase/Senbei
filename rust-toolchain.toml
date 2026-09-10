@@ -1,3 +1,7 @@
 [toolchain]
 channel = "1.98.1"
+# CI invokes rustfmt/clippy through the rustup shim with no setup action, so
+# the pinned toolchain must declare its components here — the runner images
+# only preinstall them for their default toolchain.
+components = ["rustfmt", "clippy"]
 targets = ["x86_64-pc-windows-msvc", "wasm32-unknown-unknown"]
