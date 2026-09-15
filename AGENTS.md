@@ -6,7 +6,7 @@ Guidance for contributors working in this repository.
 
 Senbei is a static unpacker for protected PE files and Android AArch64 shared libraries. The workspace contains `senbei-cli`, `senbei-crypto`, `senbei-elf`, `senbei-engine`, `senbei-io`, `senbei-metadata`, and `senbei-pe`; `senbei-wasm` is a separate crate for the browser frontend.
 
-Read `docs/design.md` before changing architecture or pipeline boundaries.
+Read the [Senbei design notes](https://xn--ri8h.gitbook.io/crackproof-research/senbei) before changing architecture or pipeline boundaries.
 
 ## Commands
 
@@ -37,4 +37,4 @@ The format crates and PE engine remain free of filesystem I/O. Native Android ex
 
 ## Documentation
 
-Use one line for each normal Markdown paragraph. Keep code blocks, table rows, and list items structurally separate. Update `docs/usage.md` when CLI behavior changes.
+Use one line for each normal Markdown paragraph. Keep code blocks, table rows, and list items structurally separate. Product documentation lives at <https://xn--ri8h.gitbook.io/crackproof-research/senbei>; update that site (not this repository) when CLI behavior changes.
