@@ -15,7 +15,7 @@ pub struct Summary {
     /// — likely to crash at runtime (e.g. 0xC0000005). Counted in addition to
     /// `unpacked` (a suspect file is still written).
     pub suspect: usize,
-    /// il2cpp `global-metadata.dat` files de-obfuscated (method tokens remapped),
+    /// il2cpp `global-metadata.dat` files de-obfuscated (protected method fields remapped),
     /// including blobs unwrapped from restored Android libraries.
     pub metadata: usize,
     /// Android app packages (`.apk`/`.apks`/`.xapk`) opened and searched.
@@ -369,7 +369,7 @@ pub fn run_folder_opts(
                 crate::ui::metadata(&bar, suppress_file_lines, &rel, report.remapped, &dest);
                 if let Some(log) = &log {
                     log.step(&format!(
-                        "META {rel:?} -> {dest:?}: v{} remapped {} method tokens",
+                        "META {rel:?} -> {dest:?}: v{} remapped {} method fields",
                         report.version, report.remapped
                     ));
                 }
@@ -506,13 +506,13 @@ pub fn run_file_v(
                 s.metadata = 1;
                 if let Some(log) = &log {
                     log.step(&format!(
-                        "META {:?} -> {:?}: v{} remapped {} method tokens",
+                        "META {:?} -> {:?}: v{} remapped {} method fields",
                         input, dest, report.version, report.remapped
                     ));
                 }
                 if quiet == 0 {
                     println!(
-                        "✓ metadata v{} -> {:?} ({} method tokens remapped)",
+                        "✓ metadata v{} -> {:?} ({} method fields remapped)",
                         report.version, dest, report.remapped
                     );
                 }

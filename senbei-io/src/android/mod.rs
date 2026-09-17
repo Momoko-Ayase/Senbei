@@ -1,6 +1,6 @@
 //! Android target orchestration: protected AArch64 shared libraries (`.so`),
 //! app packages (`.apk` / `.apks` / `.xapk`), and the Android variant of the
-//! il2cpp method-token obfuscation.
+//! il2cpp method-token/method-index obfuscation.
 //!
 //! The protection scheme hollows out an ELF64/AArch64 shared object and moves
 //! the original bytes into an encrypted payload appended as a `SHT_LOUSER`
@@ -100,14 +100,32 @@ pub fn file_content_identity(path: &Path) -> std::io::Result<String> {
 /// implementation detail of the two-phase restore, not user-facing output).
 /// Returns the unwrapped embedded metadata blob when the restored image
 /// carries one (see the module docs); the caller decides where to write it.
-pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Option<Vec<u8>>> {
+struct SoRestoreContext {
+    embedded_metadata: Option<Vec<u8>>,
+    method_index_module: Option<Vec<u8>>,
+}
+
+fn restore_so_file_with_context(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+) -> Result<SoRestoreContext> {
     let temporary = tempfile::tempdir().context("create stage-2 workspace")?;
     let stage2_dir = temporary.path().join("stage2");
-    extract_stage2(&ExtractOptions::with_defaults(
+    let extraction = extract_stage2(&ExtractOptions::with_defaults(
         input.to_path_buf(),
         stage2_dir.clone(),
     ))
     .context("extract stage-1/stage-2 payload")?;
+    let method_index_module = extraction
+        .module_registry
+        .iter()
+        .find(|module| module.command_id == 0x0c)
+        .map(|module| {
+            std::fs::read(stage2_dir.join(&module.image_path))
+                .with_context(|| format!("read decoded module 0x0C `{}`", module.image_path))
+        })
+        .transpose()?;
     restore_libil2cpp(&RestoreOptions {
         input: input.to_path_buf(),
         output: dest.to_path_buf(),
@@ -120,9 +138,14 @@ pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Optio
     .context("restore protected library")?;
     let restored =
         std::fs::read(dest).with_context(|| format!("read restored `{}`", dest.display()))?;
-    Ok(senbei_metadata::android::extract_embedded_metadata(
-        &restored,
-    ))
+    Ok(SoRestoreContext {
+        embedded_metadata: senbei_metadata::android::extract_embedded_metadata(&restored),
+        method_index_module,
+    })
+}
+
+pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Option<Vec<u8>>> {
+    Ok(restore_so_file_with_context(input, dest, verbose)?.embedded_metadata)
 }
 
 /// Content identity for cross-source deduplication: the same library may
@@ -134,8 +157,10 @@ pub fn content_identity(data: &[u8]) -> String {
     hex_digest(&digest.finalize())
 }
 
-/// Restore an il2cpp metadata blob (Android seeded permutation first, then the
-/// structural remap used by the Windows builds).
+/// Restore an il2cpp metadata blob. Paired v24.1 Android packages use the
+/// method-index profile recovered from module 0x0C; later Android layouts use
+/// the seeded MethodDef RID permutation before falling back to the structural
+/// remap used by the Windows builds.
 ///
 /// The Android variant obfuscates MethodDef RIDs with a keyed five-round
 /// permutation; the correct seed is recovered by intersecting per-image key
@@ -145,6 +170,32 @@ pub fn content_identity(data: &[u8]) -> String {
 /// canonical form. Both paths are no-ops (`remapped == 0`) on an
 /// already-clean blob.
 pub fn restore_metadata_bytes(data: &[u8]) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
+    restore_metadata_bytes_with_module(data, None)
+}
+
+fn restore_metadata_bytes_with_module(
+    data: &[u8],
+    method_index_module: Option<&[u8]>,
+) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
+    let version = data
+        .get(4..8)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes);
+    if version == Some(24)
+        && let Some(module) = method_index_module
+    {
+        let (out, report) = senbei_metadata::android::restore_method_indices_v24_1(data, module)
+            .map_err(anyhow::Error::new)?;
+        return Ok((
+            out,
+            senbei_metadata::Report {
+                version: report.version,
+                methods: report.methods,
+                remapped: report.changed_indices,
+                modules: 0,
+            },
+        ));
+    }
     if let Ok(discovery) = senbei_metadata::android::discover_method_token_seeds(data)
         && matches!(discovery.version, 29 | 31 | 39)
     {
@@ -190,7 +241,7 @@ pub struct EntryOutcome {
 pub enum EntryKind {
     /// A protected shared library, restored.
     So,
-    /// An il2cpp metadata blob, de-obfuscated (`remapped` tokens changed).
+    /// An il2cpp metadata blob, de-obfuscated (`remapped` method fields changed).
     Metadata { remapped: usize },
     /// A metadata blob unwrapped from a restored library's data section.
     EmbeddedMetadata,
@@ -204,10 +255,28 @@ pub enum EntryStatus {
     Duplicate,
     /// Content-probed but not a target (unprotected library).
     NotTarget,
-    /// A metadata blob whose tokens were already canonical; no copy written.
+    /// A metadata blob whose protected method fields were already canonical; no copy written.
     Unchanged,
     /// Recognised as a target but the restore failed.
     Failed(anyhow::Error),
+}
+
+struct PackageRestoreContext {
+    method_index_module: Option<Vec<u8>>,
+    verbose: bool,
+}
+
+impl PackageRestoreContext {
+    fn new(verbose: bool) -> Self {
+        Self {
+            method_index_module: None,
+            verbose,
+        }
+    }
+}
+
+fn package_entry_priority(path: &Path) -> u8 {
+    if is_so_name(path) { 0 } else { 1 }
 }
 
 /// Restore every protected library and metadata blob inside one app package.
@@ -233,6 +302,7 @@ pub fn restore_package(
     let mut archive = open_package(package)?;
     let temporary = tempfile::tempdir().context("create package workspace")?;
     let mut outcomes = Vec::new();
+    let mut context = PackageRestoreContext::new(verbose);
 
     let mut direct = Vec::new();
     let mut nested = Vec::new();
@@ -261,6 +331,7 @@ pub fn restore_package(
             }
         }
     }
+    direct.sort_by_key(|(_, name)| package_entry_priority(name));
     for (index, name) in direct {
         let label = format!("{}::{}", rel.display(), name.display());
         let dest = out_root.join(rel).join(crate::job::out_name(&name));
@@ -271,12 +342,13 @@ pub fn restore_package(
             &dest,
             &temporary,
             seen,
-            verbose,
+            &mut context,
         )
         .with_context(|| format!("extract `{label}`"))?;
         outcomes.append(&mut entry_outcomes);
     }
     for (index, name) in nested {
+        let mut nested_context = PackageRestoreContext::new(verbose);
         let nested_label = rel.join(&name);
         let nested_path = extract_entry(&mut archive, index, &temporary, &nested_label)
             .with_context(|| format!("extract `{}`", nested_label.display()))?;
@@ -296,6 +368,9 @@ pub fn restore_package(
                 }
             }
         }
+        // Restore the protected library before metadata so v24.1 metadata can
+        // consume the runtime profile recovered from module 0x0C.
+        entries.sort_by_key(|(_, entry_name)| package_entry_priority(entry_name));
         // Keep the nested package's stem in the output layout so two splits
         // carrying same-named entries cannot collide.
         let base = rel.join(name.with_extension(""));
@@ -309,7 +384,7 @@ pub fn restore_package(
                 &dest,
                 &temporary,
                 seen,
-                verbose,
+                &mut nested_context,
             )
             .with_context(|| format!("extract `{label}`"))?;
             outcomes.append(&mut entry_outcomes);
@@ -328,7 +403,7 @@ fn restore_package_entry<R: Read + Seek>(
     dest: &Path,
     temporary: &tempfile::TempDir,
     seen: &mut HashSet<String>,
-    verbose: bool,
+    context: &mut PackageRestoreContext,
 ) -> Result<Vec<EntryOutcome>> {
     let entry_path = extract_entry(archive, index, temporary, Path::new(label))?;
     let entry_file =
@@ -358,31 +433,39 @@ fn restore_package_entry<R: Read + Seek>(
     if is_so {
         drop(entry_data);
         drop(entry_file);
-        return Ok(match restore_so_file(&entry_path, dest, verbose) {
-            Ok(embedded) => {
-                let mut outcomes = vec![outcome(EntryKind::So, EntryStatus::Restored)];
-                if let Some(blob) = embedded {
-                    let meta_dest = embedded_metadata_dest(dest);
-                    let status = match write_metadata_blob(&meta_dest, &blob) {
-                        Ok(()) => EntryStatus::Restored,
-                        Err(error) => EntryStatus::Failed(error),
-                    };
-                    outcomes.push(EntryOutcome {
-                        label: format!("{label} (embedded metadata)"),
-                        dest: meta_dest,
-                        kind: EntryKind::EmbeddedMetadata,
-                        status,
-                    });
+        return Ok(
+            match restore_so_file_with_context(&entry_path, dest, context.verbose) {
+                Ok(restored) => {
+                    if let Some(module) = restored.method_index_module {
+                        context.method_index_module = Some(module);
+                    }
+                    let mut outcomes = vec![outcome(EntryKind::So, EntryStatus::Restored)];
+                    if let Some(blob) = restored.embedded_metadata {
+                        let meta_dest = embedded_metadata_dest(dest);
+                        let status = match write_metadata_blob(&meta_dest, &blob) {
+                            Ok(()) => EntryStatus::Restored,
+                            Err(error) => EntryStatus::Failed(error),
+                        };
+                        outcomes.push(EntryOutcome {
+                            label: format!("{label} (embedded metadata)"),
+                            dest: meta_dest,
+                            kind: EntryKind::EmbeddedMetadata,
+                            status,
+                        });
+                    }
+                    outcomes
                 }
-                outcomes
-            }
-            Err(error) => vec![outcome(EntryKind::So, EntryStatus::Failed(error))],
-        });
+                Err(error) => vec![outcome(EntryKind::So, EntryStatus::Failed(error))],
+            },
+        );
     }
 
-    // Metadata entry: write only when the restore actually changed tokens —
+    // Metadata entry: write only when the restore actually changed protected method fields —
     // a clean blob needs no copy (same contract as loose metadata files).
-    let kind_and_status = match restore_metadata_bytes(&entry_data) {
+    let kind_and_status = match restore_metadata_bytes_with_module(
+        &entry_data,
+        context.method_index_module.as_deref(),
+    ) {
         Ok((out, report)) if report.remapped > 0 => {
             let kind = EntryKind::Metadata {
                 remapped: report.remapped,
