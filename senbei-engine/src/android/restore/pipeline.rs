@@ -757,7 +757,18 @@ fn dynamic_contains_tag(output: &[u8], dynamic: SectionHeader, wanted: u64) -> R
 }
 
 fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, usize>> {
-    let mut result = HashMap::with_capacity(senbei_elf::DYNAMIC_SECTION_NAMES.len());
+    let present = senbei_elf::SYMBOL_HASH_SECTION_NAMES
+        .iter()
+        .filter(|name| names.iter().any(|section| section == *name))
+        .count();
+    if present == 0 {
+        return invalid(
+            "ELF must carry at least one of the .gnu.hash / .hash symbol-hash sections",
+        );
+    }
+    let mut result = HashMap::with_capacity(
+        senbei_elf::DYNAMIC_SECTION_NAMES.len() + senbei_elf::SYMBOL_HASH_SECTION_NAMES.len(),
+    );
     for required in senbei_elf::DYNAMIC_SECTION_NAMES {
         let indices = names
             .iter()
@@ -772,17 +783,19 @@ fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, us
             _ => return invalid(format!("ELF contains duplicate section {required}")),
         }
     }
-    let sysv_hash = names
-        .iter()
-        .enumerate()
-        .filter_map(|(index, name)| (name == ".hash").then_some(index))
-        .collect::<Vec<_>>();
-    match sysv_hash.as_slice() {
-        [index] => {
-            result.insert(".hash", *index);
+    for hash_table in senbei_elf::SYMBOL_HASH_SECTION_NAMES {
+        let indices = names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (name == hash_table).then_some(index))
+            .collect::<Vec<_>>();
+        match indices.as_slice() {
+            [index] => {
+                result.insert(hash_table, *index);
+            }
+            [] => {}
+            _ => return invalid(format!("ELF contains duplicate section {hash_table}")),
         }
-        [] => {}
-        _ => return invalid("ELF contains duplicate section .hash"),
     }
     Ok(result)
 }
@@ -862,17 +875,21 @@ fn metadata_mapping_length(
         usize_from_u64(rela_plt.size / ELF64_RELA_SIZE as u64, ".rela.plt count")?
             .checked_add(auxiliary.relocation2_count as usize)
             .ok_or_else(|| Error::Invalid("merged .rela.plt count overflow".to_owned()))?;
-    let gnu_hash_size = 28_usize
-        .checked_add(
-            new_symbol_count
-                .checked_sub(1)
-                .ok_or_else(|| {
-                    Error::Invalid("dynamic symbol table is unexpectedly empty".to_owned())
-                })?
-                .checked_mul(4)
-                .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?,
-        )
-        .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?;
+    let gnu_hash_size = if indices.contains_key(".gnu.hash") {
+        28_usize
+            .checked_add(
+                new_symbol_count
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        Error::Invalid("dynamic symbol table is unexpectedly empty".to_owned())
+                    })?
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?,
+            )
+            .ok_or_else(|| Error::Invalid("GNU hash size overflow".to_owned()))?
+    } else {
+        0
+    };
     let sysv_hash_size = indices.contains_key(".hash").then(|| {
         new_symbol_count
             .checked_mul(2)
@@ -1029,7 +1046,10 @@ fn materialize_static_elf_tables(
         .contains_key(".hash")
         .then(|| build_sysv_hash(&merged_names))
         .transpose()?;
-    let gnu_hash_table = build_gnu_hash(&merged_names)?;
+    let gnu_hash_table = indices
+        .contains_key(".gnu.hash")
+        .then(|| build_gnu_hash(&merged_names))
+        .transpose()?;
     let new_symbol_count = merged_names.len();
     let new_dynstr_size = merged_strings.len();
 
@@ -1100,6 +1120,11 @@ fn materialize_static_elf_tables(
     let rela_dyn_count = merged_rela_dyn.len() / ELF64_RELA_SIZE;
     let rela_plt_count = merged_rela_plt.len() / ELF64_RELA_SIZE;
 
+    let gnu_hash = gnu_hash_table.map(|data| TablePayload {
+        name: ".gnu.hash",
+        alignment: 8,
+        data,
+    });
     let mut tables = vec![
         TablePayload {
             name: ".dynsym",
@@ -1116,12 +1141,10 @@ fn materialize_static_elf_tables(
             alignment: 4,
             data: version_requirements,
         },
-        TablePayload {
-            name: ".gnu.hash",
-            alignment: 8,
-            data: gnu_hash_table,
-        },
     ];
+    if let Some(payload) = gnu_hash {
+        tables.push(payload);
+    }
     if let Some(data) = sysv_hash {
         tables.push(TablePayload {
             name: ".hash",
@@ -1224,10 +1247,12 @@ fn materialize_static_elf_tables(
         (DT_RELASZ, (rela_dyn_count * ELF64_RELA_SIZE) as u64),
         (DT_STRSZ, new_dynstr_size as u64),
         (DT_JMPREL, section_address(".rela.plt")),
-        (DT_GNU_HASH, section_address(".gnu.hash")),
         (DT_VERSYM, section_address(".gnu.version")),
         (DT_VERNEED, section_address(".gnu.version_r")),
     ]);
+    if indices.contains_key(".gnu.hash") {
+        dynamic_values.insert(DT_GNU_HASH, section_address(".gnu.hash"));
+    }
     if dynamic_contains_tag(output, dynamic, DT_RELACOUNT)? {
         dynamic_values.insert(DT_RELACOUNT, relative_count as u64);
     }
@@ -1719,5 +1744,35 @@ mod tests {
     fn auxiliary_rejects_missing_null_dynamic_symbol() {
         let error = AuxiliaryElfImage::parse(&auxiliary_image(0)).expect_err("missing null symbol");
         assert!(error.to_string().contains("no null entry"));
+    }
+
+    fn dynamic_section_names(hash_sections: &[&str]) -> Vec<String> {
+        senbei_elf::DYNAMIC_SECTION_NAMES
+            .into_iter()
+            .chain(hash_sections.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn required_sections_accept_each_hash_layout() {
+        for hashes in [
+            [".gnu.hash"].as_slice(),
+            [".hash"].as_slice(),
+            [".gnu.hash", ".hash"].as_slice(),
+        ] {
+            let indices = required_section_indices(&dynamic_section_names(hashes))
+                .expect("valid hash layout");
+            for hash in hashes {
+                assert!(indices.contains_key(hash));
+            }
+        }
+    }
+
+    #[test]
+    fn required_sections_reject_missing_symbol_hash() {
+        let error =
+            required_section_indices(&dynamic_section_names(&[])).expect_err("missing hash");
+        assert!(error.to_string().contains("at least one"));
     }
 }

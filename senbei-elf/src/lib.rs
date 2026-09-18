@@ -15,26 +15,23 @@ pub use layout::{
 /// ELF machine identifier for AArch64.
 pub const AARCH64_MACHINE: u16 = EM_AARCH64;
 
-/// Dynamic sections required by the restored AArch64 loader image.
-pub const DYNAMIC_SECTION_NAMES: [&str; 8] = [
+/// Dynamic sections required by every restored AArch64 loader image.
+pub const DYNAMIC_SECTION_NAMES: [&str; 7] = [
     ".dynsym",
     ".gnu.version",
     ".gnu.version_r",
-    ".gnu.hash",
     ".dynstr",
     ".rela.dyn",
     ".rela.plt",
     ".dynamic",
 ];
 
+/// Supported dynamic symbol-hash sections. At least one must be present.
+pub const SYMBOL_HASH_SECTION_NAMES: [&str; 2] = [".gnu.hash", ".hash"];
+
 /// Dynamic sections needed to identify a protected image before extraction.
-pub const PROBE_SECTION_NAMES: [&str; 5] = [
-    ".dynsym",
-    ".dynstr",
-    ".gnu.hash",
-    ".gnu.version",
-    ".gnu.version_r",
-];
+/// Hash tables are checked separately because either GNU or SysV hashing is valid.
+pub const PROBE_SECTION_NAMES: [&str; 4] = [".dynsym", ".dynstr", ".gnu.version", ".gnu.version_r"];
 
 /// ELF64 dynamic table record sizes.
 pub const ELF64_SYMBOL_SIZE: usize = 0x18;
