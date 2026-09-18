@@ -6,7 +6,7 @@ use serde_json::Value;
 use super::error::{Error, Result, invalid};
 
 const REQUIRED_IDS: [u32; 3] = [0x9b, 0x9d, 0x9e];
-const OPTIONAL_IDS: [u32; 1] = [0x98];
+const OPTIONAL_IDS: [u32; 2] = [0x96, 0x98];
 
 fn wanted_id(command_id: u32) -> bool {
     REQUIRED_IDS.contains(&command_id) || OPTIONAL_IDS.contains(&command_id)
