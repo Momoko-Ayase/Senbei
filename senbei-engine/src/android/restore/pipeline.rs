@@ -1140,12 +1140,41 @@ impl RelocationTable<'_> {
     }
 }
 
+fn relocation_references_symbol_range(relocation: Rela, range: Option<(u64, u64)>) -> bool {
+    let Some((start, end)) = range else {
+        return false;
+    };
+    let symbol = relocation.symbol();
+    symbol >= start && symbol < end
+}
+
+fn convert_defined_symbol_relocations(relocations: &mut [Rela], symbols: &[u8]) -> Result<usize> {
+    let mut converted = 0_usize;
+    for relocation in relocations {
+        if relocation.kind() == R_AARCH64_RELATIVE || relocation.symbol() == 0 {
+            continue;
+        }
+        let symbol = usize::try_from(relocation.symbol())
+            .map_err(|_| Error::Invalid("relocation symbol exceeds usize".to_owned()))?;
+        let (section_index, value) = symbol_definition(symbols, symbol)?;
+        if section_index == 0 {
+            continue;
+        }
+        let addend = i128::from(value) + i128::from(relocation.addend);
+        relocation.addend = i64::try_from(addend)
+            .map_err(|_| Error::Invalid("local relocation addend exceeds i64".to_owned()))?;
+        relocation.info = u64::from(R_AARCH64_RELATIVE);
+        converted += 1;
+    }
+    Ok(converted)
+}
+
 fn discover_special_plt_imports(
     image: &[u8],
     layout: &ElfLayout,
     names: &[String],
-    old_plt: RelocationTable<'_>,
-    auxiliary_plt: RelocationTable<'_>,
+    old_plt: &[Rela],
+    auxiliary_plt: &[Rela],
 ) -> Result<Vec<(usize, &'static str)>> {
     let plt_index = names
         .iter()
@@ -1170,9 +1199,10 @@ fn discover_special_plt_imports(
         .ok_or_else(|| Error::Invalid(".got.plt slot range overflow".to_owned()))?;
     let mut occupied = HashSet::new();
     for table in [old_plt, auxiliary_plt] {
-        for relocation in table.collect_where(|relocation| {
-            relocation.offset >= first_slot && relocation.offset < slot_end
-        })? {
+        for &relocation in table
+            .iter()
+            .filter(|relocation| relocation.offset >= first_slot && relocation.offset < slot_end)
+        {
             if !(relocation.offset - first_slot).is_multiple_of(8) {
                 return invalid("PLT relocation target is not slot-aligned");
             }
@@ -1553,7 +1583,7 @@ fn materialize_static_elf_tables(
     let protector_names = ["dlerror", "__stack_chk_guard", "__stack_chk_fail"];
     let protector_tail_start = usize::try_from(hidden_symbols.last_target_index.saturating_add(1))
         .map_err(|_| Error::Invalid("protector symbol index exceeds usize".to_owned()))?;
-    if protector_tail_start < source_symbol_count {
+    let protector_symbol_range = if protector_tail_start < source_symbol_count {
         let tail = &old_names[protector_tail_start..];
         if tail.iter().all(|name| {
             protector_names
@@ -1562,13 +1592,26 @@ fn materialize_static_elf_tables(
         }) {
             old_symbols.truncate(protector_tail_start * ELF64_SYMBOL_SIZE);
             old_versions.truncate(protector_tail_start * 2);
-        } else if legacy_import_profile {
-            return invalid("legacy import profile has unexpected protector symbols");
+            Some((
+                u64::try_from(protector_tail_start)
+                    .map_err(|_| Error::Invalid("protector symbol index exceeds u64".to_owned()))?,
+                u64::try_from(source_symbol_count)
+                    .map_err(|_| Error::Invalid("source symbol count exceeds u64".to_owned()))?,
+            ))
+        } else {
+            debug_assert!(
+                !legacy_import_profile,
+                "legacy protector symbol tail changed"
+            );
+            None
         }
-    }
-    if legacy_import_profile && old_symbols.len() / ELF64_SYMBOL_SIZE != 500 {
-        return invalid("legacy import profile has unexpected dynamic symbol count");
-    }
+    } else {
+        None
+    };
+    debug_assert!(
+        !legacy_import_profile || old_symbols.len() / ELF64_SYMBOL_SIZE == 500,
+        "legacy dynamic symbol count changed"
+    );
     let old_symbol_count = old_symbols.len() / ELF64_SYMBOL_SIZE;
     let auxiliary_strings = slice(
         auxiliary_data,
@@ -1664,14 +1707,30 @@ fn materialize_static_elf_tables(
         "auxiliary relocation table 2",
     )?;
 
+    let old_dyn_relocations = old_dyn.collect_where(|relocation| {
+        !relocation_references_symbol_range(relocation, protector_symbol_range)
+    })?;
+    let old_plt_relocations = old_plt.collect_where(|relocation| {
+        !relocation_references_symbol_range(relocation, protector_symbol_range)
+    })?;
+    let auxiliary1_relocations = auxiliary1.collect_where(|_| true)?;
+    let auxiliary2_relocations = auxiliary2.collect_where(|_| true)?;
+
     if legacy_import_profile {
         let custom_names = dynamic_symbol_names(&appended_symbols, &merged_strings)?;
-        if custom_names.get(170).map(Vec::as_slice) != Some(b"malloc") {
-            return invalid("legacy auxiliary symbol permutation anchor is missing");
-        }
+        debug_assert_eq!(
+            custom_names.get(170).map(Vec::as_slice),
+            Some(b"malloc".as_slice()),
+            "legacy auxiliary permutation anchor changed"
+        );
     }
-    let special_imports =
-        discover_special_plt_imports(output, layout, &names, old_plt, auxiliary2)?;
+    let special_imports = discover_special_plt_imports(
+        output,
+        layout,
+        &names,
+        &old_plt_relocations,
+        &auxiliary2_relocations,
+    )?;
     let existing_names = dynamic_symbol_names(&merged_symbols, &merged_strings)?;
     for &name in &SPECIAL_PLT_IMPORT_NAMES {
         if existing_names
@@ -1706,34 +1765,35 @@ fn materialize_static_elf_tables(
 
     let constructors = match constructor_module {
         Some(module) => {
-            let init_index = names.iter().position(|name| name == ".init_array");
-            let fini_index = names.iter().position(|name| name == ".fini_array");
-            match (init_index, fini_index) {
-                (Some(init_index), Some(fini_index)) => {
-                    let init_array = layout.section_headers[init_index];
-                    let fini_array = layout.section_headers[fini_index];
-                    match constructor_profile(
-                        module, output, layout, init_array, fini_array, old_dyn,
-                    )? {
-                        Some(profile) => {
-                            Some((profile, init_index, fini_index, init_array, fini_array))
-                        }
-                        None if legacy_import_profile => {
-                            return invalid(
-                                "legacy import profile has no validated constructor table",
-                            );
-                        }
-                        None => None,
-                    }
-                }
-                _ if legacy_import_profile => {
-                    return invalid("legacy image lacks init/fini array sections");
-                }
-                _ => None,
-            }
-        }
-        None if legacy_import_profile => {
-            return invalid("legacy import profile lacks constructor control module 0x98");
+            let init_index = names
+                .iter()
+                .position(|name| name == ".init_array")
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "constructor control module 0x98 is present but .init_array is missing"
+                            .to_owned(),
+                    )
+                })?;
+            let fini_index = names
+                .iter()
+                .position(|name| name == ".fini_array")
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "constructor control module 0x98 is present but .fini_array is missing"
+                            .to_owned(),
+                    )
+                })?;
+            let init_array = layout.section_headers[init_index];
+            let fini_array = layout.section_headers[fini_index];
+            let profile =
+                constructor_profile(module, output, layout, init_array, fini_array, old_dyn)?
+                    .ok_or_else(|| {
+                        Error::Invalid(
+                            "constructor control module 0x98 has no validated constructor table"
+                                .to_owned(),
+                        )
+                    })?;
+            Some((profile, init_index, fini_index, init_array, fini_array))
         }
         None => None,
     };
@@ -1755,21 +1815,28 @@ fn materialize_static_elf_tables(
         .checked_add((slot_count as u64) * 8)
         .ok_or_else(|| Error::Invalid(".got.plt slot end overflow".to_owned()))?;
 
-    let old_plt_outside = old_plt.collect_where(|relocation| {
-        relocation.offset < first_slot || relocation.offset >= slot_end
-    })?;
+    let old_plt_outside = old_plt_relocations
+        .iter()
+        .copied()
+        .filter(|relocation| relocation.offset < first_slot || relocation.offset >= slot_end)
+        .collect::<Vec<_>>();
     if old_plt_outside.iter().any(|relocation| {
         let symbol = relocation.symbol() as usize;
         symbol < old_symbol_count || symbol >= source_symbol_count
     }) {
         return invalid("protected .rela.plt has a non-protector target outside .got.plt");
     }
-    let mut plt_relocations = old_plt.collect_where(|relocation| {
-        relocation.offset >= first_slot && relocation.offset < slot_end
-    })?;
-    plt_relocations.extend(auxiliary2.collect_where(|relocation| {
-        relocation.offset >= first_slot && relocation.offset < slot_end
-    })?);
+    let mut plt_relocations = old_plt_relocations
+        .iter()
+        .copied()
+        .filter(|relocation| relocation.offset >= first_slot && relocation.offset < slot_end)
+        .collect::<Vec<_>>();
+    plt_relocations.extend(
+        auxiliary2_relocations
+            .iter()
+            .copied()
+            .filter(|relocation| relocation.offset >= first_slot && relocation.offset < slot_end),
+    );
     for &(slot, symbol) in &special_plt_symbols {
         let offset = first_slot
             .checked_add((slot as u64) * 8)
@@ -1799,11 +1866,13 @@ fn materialize_static_elf_tables(
         }
     }
 
-    let mut dyn_relocations = old_dyn.collect_where(|_| true)?;
-    dyn_relocations.extend(auxiliary1.collect_where(|_| true)?);
-    let auxiliary2_dynamic = auxiliary2.collect_where(|relocation| {
-        relocation.offset < first_slot || relocation.offset >= slot_end
-    })?;
+    let mut dyn_relocations = old_dyn_relocations;
+    dyn_relocations.extend(auxiliary1_relocations);
+    let auxiliary2_dynamic = auxiliary2_relocations
+        .iter()
+        .copied()
+        .filter(|relocation| relocation.offset < first_slot || relocation.offset >= slot_end)
+        .collect::<Vec<_>>();
     if auxiliary2_dynamic.iter().any(|relocation| {
         !matches!(
             relocation.kind(),
@@ -1814,25 +1883,8 @@ fn materialize_static_elf_tables(
     }
     dyn_relocations.extend(auxiliary2_dynamic);
 
-    let mut converted_local = 0_usize;
-    if legacy_import_profile {
-        for relocation in &mut dyn_relocations {
-            if relocation.kind() == R_AARCH64_RELATIVE || relocation.symbol() == 0 {
-                continue;
-            }
-            let symbol = usize::try_from(relocation.symbol())
-                .map_err(|_| Error::Invalid("relocation symbol exceeds usize".to_owned()))?;
-            let (section_index, value) = symbol_definition(&merged_symbols, symbol)?;
-            if section_index != 0 {
-                let addend = i128::from(value) + i128::from(relocation.addend);
-                relocation.addend = i64::try_from(addend).map_err(|_| {
-                    Error::Invalid("local relocation addend exceeds i64".to_owned())
-                })?;
-                relocation.info = u64::from(R_AARCH64_RELATIVE);
-                converted_local += 1;
-            }
-        }
-    }
+    let converted_local =
+        convert_defined_symbol_relocations(&mut dyn_relocations, &merged_symbols)?;
     dyn_relocations
         .sort_by_key(|relocation| (relocation.kind() != R_AARCH64_RELATIVE, relocation.offset));
     let relative_count = dyn_relocations
@@ -1841,18 +1893,14 @@ fn materialize_static_elf_tables(
         .count();
 
     if legacy_import_profile {
-        if dyn_relocations.len() != 450_990 || relative_count != 450_980 || converted_local != 37 {
-            return invalid(format!(
-                "legacy dynamic relocation profile mismatch: total={}, relative={}, local={converted_local}",
-                dyn_relocations.len(),
-                relative_count
-            ));
-        }
-        if slot_count != 366 {
-            return invalid(format!(
-                "legacy .got.plt has {slot_count} dynamic slots, expected 366"
-            ));
-        }
+        debug_assert_eq!(
+            dyn_relocations.len(),
+            450_990,
+            "legacy relocation count changed"
+        );
+        debug_assert_eq!(relative_count, 450_980, "legacy RELATIVE count changed");
+        debug_assert_eq!(converted_local, 37, "legacy local relocation count changed");
+        debug_assert_eq!(slot_count, 366, "legacy GOT/PLT slot count changed");
         let jump_slots = plt_relocations
             .iter()
             .filter(|relocation| relocation.kind() == R_AARCH64_JUMP_SLOT)
@@ -1861,11 +1909,11 @@ fn materialize_static_elf_tables(
             .iter()
             .filter(|relocation| relocation.kind() == R_AARCH64_RELATIVE)
             .count();
-        if (jump_slots, relatives) != (247, 119) {
-            return invalid(format!(
-                "legacy PLT type profile mismatch: {jump_slots} JUMP_SLOT / {relatives} RELATIVE"
-            ));
-        }
+        debug_assert_eq!(
+            (jump_slots, relatives),
+            (247, 119),
+            "legacy PLT type profile changed"
+        );
     }
 
     if let Some((profile, _, _, init_array, fini_array)) = &constructors {
@@ -2639,6 +2687,58 @@ mod tests {
             decode_auxiliary_symbol(120, 268, 0xd4, 0xbd93_5573).expect("decode"),
             171
         );
+    }
+
+    #[test]
+    fn protector_tail_relocations_are_identified_before_auxiliary_remap() {
+        let tail = Some((500, 503));
+        assert!(relocation_references_symbol_range(
+            Rela {
+                offset: 0x1000,
+                info: (501_u64 << 32) | u64::from(R_AARCH64_GLOB_DAT),
+                addend: 0,
+            },
+            tail,
+        ));
+        assert!(!relocation_references_symbol_range(
+            Rela {
+                offset: 0x1008,
+                info: (499_u64 << 32) | u64::from(R_AARCH64_GLOB_DAT),
+                addend: 0,
+            },
+            tail,
+        ));
+    }
+
+    #[test]
+    fn converts_defined_symbol_relocations_without_profile_fingerprint() {
+        let mut symbols = vec![0_u8; ELF64_SYMBOL_SIZE * 3];
+        // Symbol 1 is image-defined at value 0x1234, symbol 2 is undefined.
+        symbols[ELF64_SYMBOL_SIZE + 6..ELF64_SYMBOL_SIZE + 8].copy_from_slice(&1_u16.to_le_bytes());
+        symbols[ELF64_SYMBOL_SIZE + 8..ELF64_SYMBOL_SIZE + 16]
+            .copy_from_slice(&0x1234_u64.to_le_bytes());
+        let mut relocations = vec![
+            Rela {
+                offset: 0x2000,
+                info: (1_u64 << 32) | u64::from(R_AARCH64_GLOB_DAT),
+                addend: 4,
+            },
+            Rela {
+                offset: 0x2008,
+                info: (2_u64 << 32) | u64::from(R_AARCH64_ABS64),
+                addend: 0,
+            },
+        ];
+        assert_eq!(
+            convert_defined_symbol_relocations(&mut relocations, &symbols)
+                .expect("convert local relocation"),
+            1
+        );
+        assert_eq!(relocations[0].kind(), R_AARCH64_RELATIVE);
+        assert_eq!(relocations[0].symbol(), 0);
+        assert_eq!(relocations[0].addend, 0x1238);
+        assert_eq!(relocations[1].kind(), R_AARCH64_ABS64);
+        assert_eq!(relocations[1].symbol(), 2);
     }
 
     #[test]
