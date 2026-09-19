@@ -221,6 +221,7 @@ pub fn run_folder_opts(
     // files restore first so the cross-source dedup keeps them over a copy
     // inside a package (loose beats `.apk` beats `.apks`/`.xapk` bundle).
     let mut android_seen = std::collections::HashSet::new();
+    let mut android_method_index_module = None;
     // Hashing a protected library costs a full read, so only pay it when a
     // duplicate source can actually exist in this run.
     let android_dedup = scan.android_so.len() > 1 || !scan.android_packages.is_empty();
@@ -242,7 +243,12 @@ pub fn run_folder_opts(
         let input_owned = input.clone();
         let dest_owned = dest.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::android::restore_so_file(&input_owned, &dest_owned, verbose_steps)
+            crate::android::restore_so_file_with_method_index_module(
+                &input_owned,
+                &dest_owned,
+                verbose_steps,
+                &mut android_method_index_module,
+            )
         }));
         match result {
             Ok(Ok(embedded)) => {
@@ -310,12 +316,13 @@ pub fn run_folder_opts(
         let out_root_owned = out_root.clone();
         let mut seen_taken = std::mem::take(&mut android_seen);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let outcomes = crate::android::restore_package(
+            let outcomes = crate::android::restore_package_with_method_index_module(
                 &package_owned,
                 &rel_owned,
                 &out_root_owned,
                 &mut seen_taken,
                 verbose_steps,
+                &mut android_method_index_module,
             );
             (outcomes, seen_taken)
         }));
@@ -361,7 +368,12 @@ pub fn run_folder_opts(
         let meta_owned = meta.clone();
         let dest_owned = dest.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            deobfuscate_metadata_to(&meta_owned, &dest_owned, verbose_steps)
+            deobfuscate_metadata_to_with_module(
+                &meta_owned,
+                &dest_owned,
+                verbose_steps,
+                android_method_index_module.as_deref(),
+            )
         }));
         match result {
             Ok(Ok(report)) if report.remapped > 0 => {
@@ -736,14 +748,24 @@ pub fn deobfuscate_metadata_to(
     dest: &Path,
     verbose: bool,
 ) -> anyhow::Result<senbei_metadata::Report> {
+    deobfuscate_metadata_to_with_module(input, dest, verbose, None)
+}
+
+fn deobfuscate_metadata_to_with_module(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    method_index_module: Option<&[u8]>,
+) -> anyhow::Result<senbei_metadata::Report> {
     let data = std::fs::read(input)?;
     // The Android seeded-permutation variant is tried first (it validates
     // every restored RID); the structural remap is the fallback and the
     // Windows path. The [`senbei_metadata::Error`] is preserved in the chain
     // (rather than stringified) so the folder driver can apply its
     // unsupported-version policy.
-    let (out, report) = crate::android::restore_metadata_bytes(&data)
-        .map_err(|e| e.context(format!("{input:?}")))?;
+    let (out, report) =
+        crate::android::restore_metadata_bytes_with_module(&data, method_index_module)
+            .map_err(|e| e.context(format!("{input:?}")))?;
     if report.remapped > 0 {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;

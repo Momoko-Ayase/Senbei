@@ -145,7 +145,21 @@ fn restore_so_file_with_context(
 }
 
 pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Option<Vec<u8>>> {
-    Ok(restore_so_file_with_context(input, dest, verbose)?.embedded_metadata)
+    let mut method_index_module = None;
+    restore_so_file_with_method_index_module(input, dest, verbose, &mut method_index_module)
+}
+
+pub(crate) fn restore_so_file_with_method_index_module(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    method_index_module: &mut Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let restored = restore_so_file_with_context(input, dest, verbose)?;
+    if let Some(module) = restored.method_index_module {
+        *method_index_module = Some(module);
+    }
+    Ok(restored.embedded_metadata)
 }
 
 /// Content identity for cross-source deduplication: the same library may
@@ -173,7 +187,7 @@ pub fn restore_metadata_bytes(data: &[u8]) -> anyhow::Result<(Vec<u8>, senbei_me
     restore_metadata_bytes_with_module(data, None)
 }
 
-fn restore_metadata_bytes_with_module(
+pub(crate) fn restore_metadata_bytes_with_module(
     data: &[u8],
     method_index_module: Option<&[u8]>,
 ) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
@@ -261,15 +275,15 @@ pub enum EntryStatus {
     Failed(anyhow::Error),
 }
 
-struct PackageRestoreContext {
-    method_index_module: Option<Vec<u8>>,
+struct PackageRestoreContext<'a> {
+    method_index_module: &'a mut Option<Vec<u8>>,
     verbose: bool,
 }
 
-impl PackageRestoreContext {
-    fn new(verbose: bool) -> Self {
+impl<'a> PackageRestoreContext<'a> {
+    fn new(verbose: bool, method_index_module: &'a mut Option<Vec<u8>>) -> Self {
         Self {
-            method_index_module: None,
+            method_index_module,
             verbose,
         }
     }
@@ -293,6 +307,25 @@ pub fn restore_package(
     seen: &mut HashSet<String>,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
+    let mut method_index_module = None;
+    restore_package_with_method_index_module(
+        package,
+        rel,
+        out_root,
+        seen,
+        verbose,
+        &mut method_index_module,
+    )
+}
+
+pub(crate) fn restore_package_with_method_index_module(
+    package: &Path,
+    rel: &Path,
+    out_root: &Path,
+    seen: &mut HashSet<String>,
+    verbose: bool,
+    method_index_module: &mut Option<Vec<u8>>,
+) -> Result<Vec<EntryOutcome>> {
     let bundle = package
         .extension()
         .and_then(|value| value.to_str())
@@ -302,7 +335,7 @@ pub fn restore_package(
     let mut archive = open_package(package)?;
     let temporary = tempfile::tempdir().context("create package workspace")?;
     let mut outcomes = Vec::new();
-    let mut context = PackageRestoreContext::new(verbose);
+    let mut context = PackageRestoreContext::new(verbose, method_index_module);
 
     let mut direct = Vec::new();
     let mut nested = Vec::new();
@@ -347,8 +380,15 @@ pub fn restore_package(
         .with_context(|| format!("extract `{label}`"))?;
         outcomes.append(&mut entry_outcomes);
     }
+    struct NestedPackage {
+        label: PathBuf,
+        path: PathBuf,
+        base: PathBuf,
+        entries: Vec<(usize, PathBuf)>,
+    }
+
+    let mut nested_packages = Vec::with_capacity(nested.len());
     for (index, name) in nested {
-        let mut nested_context = PackageRestoreContext::new(verbose);
         let nested_label = rel.join(&name);
         let nested_path = extract_entry(&mut archive, index, &temporary, &nested_label)
             .with_context(|| format!("extract `{}`", nested_label.display()))?;
@@ -368,26 +408,45 @@ pub fn restore_package(
                 }
             }
         }
-        // Restore the protected library before metadata so v24.1 metadata can
-        // consume the runtime profile recovered from module 0x0C.
-        entries.sort_by_key(|(_, entry_name)| package_entry_priority(entry_name));
-        // Keep the nested package's stem in the output layout so two splits
-        // carrying same-named entries cannot collide.
-        let base = rel.join(name.with_extension(""));
-        for (nested_index, entry_name) in entries {
-            let label = format!("{}::{}", nested_label.display(), entry_name.display());
-            let dest = out_root.join(&base).join(crate::job::out_name(&entry_name));
-            let mut entry_outcomes = restore_package_entry(
-                &mut nested_archive,
-                nested_index,
-                &label,
-                &dest,
-                &temporary,
-                seen,
-                &mut nested_context,
-            )
-            .with_context(|| format!("extract `{label}`"))?;
-            outcomes.append(&mut entry_outcomes);
+        nested_packages.push(NestedPackage {
+            label: nested_label,
+            path: nested_path,
+            base: rel.join(name.with_extension("")),
+            entries,
+        });
+    }
+
+    // A bundle can put libil2cpp.so in an ABI split while metadata stays in
+    // base.apk. Share one context across the whole bundle and process all SOs
+    // before any metadata, regardless of which nested APK owns each entry.
+    for priority in [0_u8, 1_u8] {
+        for nested_package in &nested_packages {
+            let mut nested_archive = open_package(&nested_package.path)?;
+            for (nested_index, entry_name) in nested_package
+                .entries
+                .iter()
+                .filter(|(_, entry_name)| package_entry_priority(entry_name) == priority)
+            {
+                let label = format!(
+                    "{}::{}",
+                    nested_package.label.display(),
+                    entry_name.display()
+                );
+                let dest = out_root
+                    .join(&nested_package.base)
+                    .join(crate::job::out_name(entry_name));
+                let mut entry_outcomes = restore_package_entry(
+                    &mut nested_archive,
+                    *nested_index,
+                    &label,
+                    &dest,
+                    &temporary,
+                    seen,
+                    &mut context,
+                )
+                .with_context(|| format!("extract `{label}`"))?;
+                outcomes.append(&mut entry_outcomes);
+            }
         }
     }
     Ok(outcomes)
@@ -403,7 +462,7 @@ fn restore_package_entry<R: Read + Seek>(
     dest: &Path,
     temporary: &tempfile::TempDir,
     seen: &mut HashSet<String>,
-    context: &mut PackageRestoreContext,
+    context: &mut PackageRestoreContext<'_>,
 ) -> Result<Vec<EntryOutcome>> {
     let entry_path = extract_entry(archive, index, temporary, Path::new(label))?;
     let entry_file =
@@ -437,7 +496,7 @@ fn restore_package_entry<R: Read + Seek>(
             match restore_so_file_with_context(&entry_path, dest, context.verbose) {
                 Ok(restored) => {
                     if let Some(module) = restored.method_index_module {
-                        context.method_index_module = Some(module);
+                        *context.method_index_module = Some(module);
                     }
                     let mut outcomes = vec![outcome(EntryKind::So, EntryStatus::Restored)];
                     if let Some(blob) = restored.embedded_metadata {
