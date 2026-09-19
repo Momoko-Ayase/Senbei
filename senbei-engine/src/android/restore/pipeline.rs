@@ -803,20 +803,6 @@ fn classify_special_plt_slots(
     Ok(result)
 }
 
-fn is_legacy_import_profile(
-    source_symbol_count: usize,
-    hidden: &HiddenSymbolReport,
-    auxiliary: &AuxiliaryElfImage,
-) -> bool {
-    source_symbol_count == 503
-        && hidden.patched_symbols == 497
-        && hidden.first_target_index == 3
-        && hidden.last_target_index == 499
-        && auxiliary.dynsym_count == 0xd4
-        && auxiliary.relocation1_count == 0x6e159
-        && auxiliary.relocation2_count == 0x143
-}
-
 fn append_undefined_function_symbol(
     symbols: &mut Vec<u8>,
     strings: &mut Vec<u8>,
@@ -1577,8 +1563,6 @@ fn materialize_static_elf_tables(
     let version_requirements = slice_u64(output, verneed.offset, verneed.size)?.to_vec();
 
     let auxiliary = AuxiliaryElfImage::parse(auxiliary_data)?;
-    let legacy_import_profile =
-        is_legacy_import_profile(source_symbol_count, &hidden_symbols, &auxiliary);
     let old_names = dynamic_symbol_names(&old_symbols, &old_strings)?;
     let protector_names = ["dlerror", "__stack_chk_guard", "__stack_chk_fail"];
     let protector_tail_start = usize::try_from(hidden_symbols.last_target_index.saturating_add(1))
@@ -1599,19 +1583,11 @@ fn materialize_static_elf_tables(
                     .map_err(|_| Error::Invalid("source symbol count exceeds u64".to_owned()))?,
             ))
         } else {
-            debug_assert!(
-                !legacy_import_profile,
-                "legacy protector symbol tail changed"
-            );
             None
         }
     } else {
         None
     };
-    debug_assert!(
-        !legacy_import_profile || old_symbols.len() / ELF64_SYMBOL_SIZE == 500,
-        "legacy dynamic symbol count changed"
-    );
     let old_symbol_count = old_symbols.len() / ELF64_SYMBOL_SIZE;
     let auxiliary_strings = slice(
         auxiliary_data,
@@ -1716,14 +1692,6 @@ fn materialize_static_elf_tables(
     let auxiliary1_relocations = auxiliary1.collect_where(|_| true)?;
     let auxiliary2_relocations = auxiliary2.collect_where(|_| true)?;
 
-    if legacy_import_profile {
-        let custom_names = dynamic_symbol_names(&appended_symbols, &merged_strings)?;
-        debug_assert_eq!(
-            custom_names.get(170).map(Vec::as_slice),
-            Some(b"malloc".as_slice()),
-            "legacy auxiliary permutation anchor changed"
-        );
-    }
     let special_imports = discover_special_plt_imports(
         output,
         layout,
@@ -1883,38 +1851,13 @@ fn materialize_static_elf_tables(
     }
     dyn_relocations.extend(auxiliary2_dynamic);
 
-    let converted_local =
-        convert_defined_symbol_relocations(&mut dyn_relocations, &merged_symbols)?;
+    convert_defined_symbol_relocations(&mut dyn_relocations, &merged_symbols)?;
     dyn_relocations
         .sort_by_key(|relocation| (relocation.kind() != R_AARCH64_RELATIVE, relocation.offset));
     let relative_count = dyn_relocations
         .iter()
         .take_while(|relocation| relocation.kind() == R_AARCH64_RELATIVE)
         .count();
-
-    if legacy_import_profile {
-        debug_assert_eq!(
-            dyn_relocations.len(),
-            450_990,
-            "legacy relocation count changed"
-        );
-        debug_assert_eq!(relative_count, 450_980, "legacy RELATIVE count changed");
-        debug_assert_eq!(converted_local, 37, "legacy local relocation count changed");
-        debug_assert_eq!(slot_count, 366, "legacy GOT/PLT slot count changed");
-        let jump_slots = plt_relocations
-            .iter()
-            .filter(|relocation| relocation.kind() == R_AARCH64_JUMP_SLOT)
-            .count();
-        let relatives = plt_relocations
-            .iter()
-            .filter(|relocation| relocation.kind() == R_AARCH64_RELATIVE)
-            .count();
-        debug_assert_eq!(
-            (jump_slots, relatives),
-            (247, 119),
-            "legacy PLT type profile changed"
-        );
-    }
 
     if let Some((profile, _, _, init_array, fini_array)) = &constructors {
         for (slot, &addend) in profile.init_addends.iter().enumerate() {
@@ -2682,7 +2625,7 @@ mod tests {
         assert!(error.to_string().contains("at least one"));
     }
     #[test]
-    fn legacy_symbol_permutation_decodes_malloc_anchor() {
+    fn seeded_auxiliary_symbol_permutation_decodes_known_vector() {
         assert_eq!(
             decode_auxiliary_symbol(120, 268, 0xd4, 0xbd93_5573).expect("decode"),
             171
