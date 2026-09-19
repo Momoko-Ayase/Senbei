@@ -39,13 +39,13 @@ pub fn ok_label(bar: &ProgressBar, quiet: bool, rel: &str, label: &str, dest: &P
 }
 
 /// Print a green success line for a de-obfuscated il2cpp `global-metadata.dat`,
-/// reporting how many method tokens were remapped.
+/// reporting how many protected method fields were remapped.
 pub fn metadata(bar: &ProgressBar, quiet: bool, rel: &Path, remapped: usize, dest: &Path) {
     if quiet {
         return;
     }
     let msg = format!(
-        "{} metadata  {}  ->  {}  ({} method tokens remapped)",
+        "{} metadata  {}  ->  {}  ({} method fields remapped)",
         "✓".green(),
         rel.display(),
         dest.display(),
