@@ -70,6 +70,16 @@ pub(crate) fn inspect(
             return invalid(format!("protected ELF lacks required section {wanted}"));
         }
     }
+    let has_symbol_hash = senbei_elf::SYMBOL_HASH_SECTION_NAMES.iter().any(|wanted| {
+        elf.section_headers.iter().any(|section| {
+            elf.shdr_strtab
+                .get_at(section.sh_name)
+                .is_some_and(|name| name == *wanted)
+        })
+    });
+    if !has_symbol_hash {
+        return invalid("protected ELF lacks a .gnu.hash or .hash symbol-hash section");
+    }
     let (section_index, section) = matches[0];
     let section_offset = usize::try_from(section.sh_offset)
         .map_err(|_| Error::Invalid("SHT_LOUSER offset exceeds usize".to_owned()))?;
