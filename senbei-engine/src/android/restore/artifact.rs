@@ -6,6 +6,11 @@ use serde_json::Value;
 use super::error::{Error, Result, invalid};
 
 const REQUIRED_IDS: [u32; 3] = [0x9b, 0x9d, 0x9e];
+const OPTIONAL_IDS: [u32; 2] = [0x96, 0x98];
+
+fn wanted_id(command_id: u32) -> bool {
+    REQUIRED_IDS.contains(&command_id) || OPTIONAL_IDS.contains(&command_id)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Artifact {
@@ -27,7 +32,7 @@ pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact
             };
             let command_id = u32::try_from(command_id)
                 .map_err(|_| Error::Invalid("module command ID exceeds u32".to_owned()))?;
-            if !REQUIRED_IDS.contains(&command_id) {
+            if !wanted_id(command_id) {
                 continue;
             }
             let Some(path) = item.get("image_path").and_then(Value::as_str) else {
@@ -57,7 +62,7 @@ pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact
                 };
                 let command_id = u32::try_from(command_id)
                     .map_err(|_| Error::Invalid("record command ID exceeds u32".to_owned()))?;
-                if !REQUIRED_IDS.contains(&command_id) {
+                if !wanted_id(command_id) {
                     continue;
                 }
                 let Some(image) = record.get("image") else {
