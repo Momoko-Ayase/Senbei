@@ -2,9 +2,11 @@
 
 mod embedded;
 mod keystream;
+mod method_indices;
 mod method_tokens;
 
 pub use embedded::{embedded_metadata_size, extract_embedded_metadata};
+pub use method_indices::{MethodIndexError, MethodIndexReport, restore_method_indices_v24_1};
 pub use method_tokens::{
     DEFAULT_METHOD_TOKEN_SEED, Error, ImageKeyDiscovery, Report, SeedDiscoveryReport,
     discover_method_token_seeds, restore_method_tokens,
