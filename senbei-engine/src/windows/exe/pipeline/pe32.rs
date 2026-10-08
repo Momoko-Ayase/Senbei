@@ -823,7 +823,15 @@ impl<'a> Unpacker<'a> {
             let d = export_va as usize;
             let s = export_file_off as usize;
             let n = export_size as usize;
-            self.decompressed[d..d + n].copy_from_slice(&self.file_data[s..s + n]);
+            // Spliced companions may omit the stub's plaintext exports;
+            // the I/O adapter overlays those from the original stub later.
+            if s.checked_add(n)
+                .is_some_and(|end| end <= self.file_data.len())
+                && d.checked_add(n)
+                    .is_some_and(|end| end <= self.decompressed.len())
+            {
+                self.decompressed[d..d + n].copy_from_slice(&self.file_data[s..s + n]);
+            }
         }
 
         // ---- .text decrypt with decrypt_data8 (PE32 auto-detected formula) ----

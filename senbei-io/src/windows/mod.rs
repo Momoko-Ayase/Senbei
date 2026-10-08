@@ -128,18 +128,19 @@ pub(crate) fn overlay_exports_from_stub(out: &mut [u8], stub: &[u8]) {
         Some(v) if v.1 != 0 => v,
         _ => return,
     };
-    let dst = match rva_to_file_off(out, export_rva) {
-        Some(o) => o,
-        None => return,
+    let dst = match senbei_pe::parse(out)
+        .and_then(|headers| senbei_pe::rva_range(out, headers, export_rva, export_size))
+    {
+        Ok(range) => range,
+        Err(_) => return,
     };
-    let src = match rva_to_file_off(stub, export_rva) {
-        Some(o) => o,
-        None => return,
+    let src = match senbei_pe::parse(stub)
+        .and_then(|headers| senbei_pe::rva_range(stub, headers, export_rva, export_size))
+    {
+        Ok(range) => range,
+        Err(_) => return,
     };
-    let n = export_size as usize;
-    if dst + n <= out.len() && src + n <= stub.len() {
-        out[dst..dst + n].copy_from_slice(&stub[src..src + n]);
-    }
+    out[dst].copy_from_slice(&stub[src]);
 }
 
 /// Restore the CLR regions retained by an external-companion loader stub.
@@ -631,6 +632,34 @@ mod tests {
         data[raw + 0x100..raw + 0x104].copy_from_slice(b"BSJB");
         data[raw + 0x180..raw + 0x188].copy_from_slice(b"resource");
         data
+    }
+
+    #[test]
+    fn export_overlay_requires_the_entire_range_to_be_file_backed() {
+        for is_pe32_plus in [false, true] {
+            let dirs = 0x98 + if is_pe32_plus { 112 } else { 96 };
+            let section = 0x98 + if is_pe32_plus { 0xf0 } else { 0xe0 };
+            let mut stub = managed_fixture(is_pe32_plus, 0x600);
+            stub[0x780..0x880].fill(0x5a);
+            for (stub_raw_size, out_raw_size) in
+                [(0x600u32, 0x600u32), (0x200, 0x600), (0x600, 0x200)]
+            {
+                let mut out = managed_fixture(is_pe32_plus, 0x400);
+                out[dirs..dirs + 4].copy_from_slice(&0x2180u32.to_le_bytes());
+                out[dirs + 4..dirs + 8].copy_from_slice(&0x100u32.to_le_bytes());
+                out[section + 16..section + 20].copy_from_slice(&out_raw_size.to_le_bytes());
+                stub[section + 16..section + 20].copy_from_slice(&stub_raw_size.to_le_bytes());
+                let before = out.clone();
+                overlay_exports_from_stub(&mut out, &stub);
+                if stub_raw_size == 0x600 && out_raw_size == 0x600 {
+                    assert_eq!(&out[0x580..0x680], &[0x5a; 0x100]);
+                    assert_eq!(&out[..0x580], &before[..0x580]);
+                    assert_eq!(&out[0x680..], &before[0x680..]);
+                } else {
+                    assert_eq!(out, before);
+                }
+            }
+        }
     }
 
     #[test]

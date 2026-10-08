@@ -331,6 +331,13 @@ pub fn compact_memory_image_to_pe(data: &[u8], pe_header: u32) -> Option<Vec<u8>
     let opt_hdr = pe_header.wrapping_add(24);
     let sec_table = opt_hdr.wrapping_add(opt_hdr_size);
     let num_sections = get_u16(data, pe_header.wrapping_add(6)) as u32;
+    let export_dir = opt_hdr.wrapping_add(if get_u16(data, opt_hdr) == 0x20B {
+        112
+    } else {
+        96
+    });
+    let export_rva = get_u32(data, export_dir);
+    let export_size = get_u32(data, export_dir.wrapping_add(4));
 
     struct SecLayout {
         sec_off: u32,
@@ -365,11 +372,21 @@ pub fn compact_memory_image_to_pe(data: &[u8], pe_header: u32) -> Option<Vec<u8>
                 break;
             }
         }
-        let meaningful = if last_nonzero >= 0 {
+        let mut meaningful = if last_nonzero >= 0 {
             (last_nonzero + 1) as u32
         } else {
             0
         };
+        // Companion exports are overlaid after compaction. Keep their whole
+        // range file-backed even when the payload leaves it zero-filled.
+        if export_size != 0
+            && let Some(end) = export_rva
+                .checked_sub(va)
+                .and_then(|delta| delta.checked_add(export_size))
+            && end as usize <= section_data.len()
+        {
+            meaningful = meaningful.max(end);
+        }
         let mut raw_size = if meaningful != 0 {
             align_up_u32(meaningful, FILE_ALIGNMENT)
         } else {
@@ -432,6 +449,45 @@ pub fn compact_memory_image_to_pe(data: &[u8], pe_header: u32) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_keeps_export_space_without_changing_the_next_section() {
+        for (rva, size, expected_raw_size) in [
+            (0, 0, 0x200),
+            (0x1280, 0x181, 0x600),
+            (0x1f00, 0x200, 0x200),
+            (0xffff_fff0, 0x40, 0x200),
+        ] {
+            let mut data = vec![0; 0x3000];
+            data[..2].copy_from_slice(b"MZ");
+            data[0x80..0x84].copy_from_slice(b"PE\0\0");
+            write_u16(&mut data, 0x86, 2);
+            write_u16(&mut data, 0x94, 0xe0);
+            write_u16(&mut data, 0x98, 0x10b);
+            for (offset, value) in [
+                (0x3c, 0x80),
+                (0xf8, rva),
+                (0xfc, size),
+                (0x180, 0x1000),
+                (0x184, 0x1000),
+                (0x1a8, 0x1000),
+                (0x1ac, 0x2000),
+            ] {
+                write_u32(&mut data, offset, value);
+            }
+            data[0x1000] = 0xaa;
+            data[0x2000..0x200c].copy_from_slice(b"next section");
+            let out = compact_memory_image_to_pe(&data, 0x80).unwrap();
+            assert_eq!(get_u32(&out, 0x188), expected_raw_size);
+            let headers = senbei_pe::parse(&out).unwrap();
+            let next = senbei_pe::rva_range(&out, headers, 0x2000, 12).unwrap();
+            assert_eq!(&out[next], b"next section");
+            if rva == 0x1280 {
+                let exports = senbei_pe::rva_range(&out, headers, rva, size).unwrap();
+                assert!(out[exports].iter().all(|&byte| byte == 0));
+            }
+        }
+    }
 
     /// Review regression: a zero last-section VA (corrupt section table) must
     /// bail instead of building .kmiat at RVA 0 — the old code zeroed
