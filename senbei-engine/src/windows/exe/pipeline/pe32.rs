@@ -23,10 +23,153 @@ fn stage_key_rounds(data: &[u8], table: u32, slots: usize) -> Result<u32, Unpack
 }
 
 impl<'a> Unpacker<'a> {
+    pub(super) fn find_pe32_table(&mut self) -> Option<u32> {
+        let pe_off = get_u32(self.file_data, 60);
+        let header = self.decompressed[..4096].to_vec();
+        for tbl in layout::find_tbl_pe32_candidates(&self.decompressed, &self.info) {
+            let compact = get_u32(&self.decompressed, tbl + 0x78) == self.info[6];
+            let pair = tbl + if compact { 0x88 } else { 0x98 };
+            let start = get_u32(&self.decompressed, pair) as usize;
+            let size = get_u32(&self.decompressed, pair + 4) as usize;
+            let Some(end) = start
+                .checked_add(size)
+                .filter(|&end| end <= self.decompressed.len())
+            else {
+                continue;
+            };
+            let ciphertext = self.decompressed[start..end].to_vec();
+            let valid = self.decrypt_pe32_second_stage(tbl, pe_off).is_ok();
+            self.decompressed[start..end].copy_from_slice(&ciphertext);
+            self.decompressed[..4096].copy_from_slice(&header);
+            if valid {
+                return Some(tbl);
+            }
+        }
+        None
+    }
+
+    fn decrypt_pe32_second_stage(&mut self, tbl: u32, pe_off: u32) -> Result<u32, UnpackError> {
+        let compact = get_u32(&self.decompressed, tbl.wrapping_add(0x78)) == self.info[6];
+        let header_cs_field = if compact { 0x50 } else { 0x58 };
+        let stage_field = if compact { 0x88 } else { 0x98 };
+        let resource_field = if compact { 0xB0 } else { 0xC8 };
+        if (pe_off as usize)
+            .checked_add(0xB8)
+            .is_none_or(|end| end > 0x1000)
+        {
+            return Err(UnpackError::Pe32RelocationDataNotFound);
+        }
+        let import_rva = get_u32(&self.decompressed, tbl + stage_field + 0x24);
+        let resource_rva = get_u32(&self.decompressed, tbl + resource_field);
+        let resource_size = get_u32(&self.decompressed, tbl + resource_field + 4);
+        write_u32(&mut self.decompressed, pe_off + 0x80, import_rva);
+        write_u32(&mut self.decompressed, pe_off + 0x88, resource_rva);
+        write_u32(&mut self.decompressed, pe_off + 0x8C, resource_size);
+        write_u32(&mut self.decompressed, pe_off + 0xB0, 0);
+        write_u32(&mut self.decompressed, pe_off + 0xB4, 0);
+
+        let cs = tbl + stage_field + 0x10;
+        let cs_start = get_u32(&self.decompressed, cs) as usize;
+        let cs_size = get_u32(&self.decompressed, cs + 4) as usize;
+        if cs_size == 0
+            || cs_start
+                .checked_add(cs_size)
+                .is_none_or(|end| end > self.decompressed.len())
+        {
+            return Err(UnpackError::Pe32RelocationDataNotFound);
+        }
+        let first_stage_cs = self.calculate_checksum(cs);
+        let second_stage_key = get_u32(&self.decompressed, tbl + 0x40);
+        let ss_pair = tbl + stage_field;
+        let ss = get_u32(&self.decompressed, ss_pair);
+        let ss_size = get_u32(&self.decompressed, ss_pair + 4);
+        let ss_shift = ss_size.wrapping_sub(if compact { 0xAEC } else { 0xBC0 });
+        let third_pair_off = (if compact { 0xAB4u32 } else { 0xB8C }).wrapping_add(ss_shift);
+        let ss_lo = ss as usize;
+        let ss_hi = ss_lo.saturating_add(ss_size as usize);
+        if ss_hi > self.decompressed.len() || third_pair_off.saturating_add(8) > ss_size {
+            return Err(UnpackError::Pe32SecondStageRangeInvalid {
+                offset: ss,
+                size: ss_size,
+                image_len: self.decompressed.len(),
+            });
+        }
+        let ss_ct = self.decompressed[ss_lo..ss_hi].to_vec();
+        // Header checksums refer to the original PE header. Compact EXEs and
+        // native DLLs can carry a packer-added BaseReloc entry: trial both keys.
+        for zero_reloc in [false, true] {
+            if zero_reloc {
+                write_u32(&mut self.decompressed, pe_off + 0xA0, 0);
+                write_u32(&mut self.decompressed, pe_off + 0xA4, 0);
+            }
+            let mut hcs_addr = tbl + header_cs_field;
+            let mut header_checksum = 0;
+            loop {
+                if hcs_addr + 8 > tbl + stage_field - 0x10 {
+                    return Err(UnpackError::Pe32RelocationDataNotFound);
+                }
+                let size = get_u32(&self.decompressed, hcs_addr + 4) as usize;
+                if size == 0 {
+                    break;
+                }
+                let start = get_u32(&self.decompressed, hcs_addr) as usize;
+                if start.checked_add(size).is_none_or(|end| end > 0x1000) {
+                    return Err(UnpackError::Pe32RelocationDataNotFound);
+                }
+                header_checksum ^= self.calculate_checksum(hcs_addr);
+                hcs_addr += 8;
+            }
+            self.decompressed[ss_lo..ss_hi].copy_from_slice(&ss_ct);
+            self.decrypt_data3(
+                ss_pair,
+                header_checksum ^ first_stage_cs ^ second_stage_key,
+                21,
+            );
+            let pair = ss + third_pair_off;
+            let off = get_u32(&self.decompressed, pair) as usize;
+            let size = get_u32(&self.decompressed, pair + 4) as usize;
+            if off > 0x1000
+                && size >= 4
+                && off
+                    .checked_add(size)
+                    .is_some_and(|end| end <= self.decompressed.len())
+            {
+                return Ok(header_checksum);
+            }
+        }
+        Err(UnpackError::Pe32RelocationDataNotFound)
+    }
+
+    fn read_pe32_metadata(&mut self, compact: bool) -> (u32, [u8; 128]) {
+        let base = self.info[3];
+        let layout_b = get_u32(&self.decompressed, base.wrapping_add(0x10)) > 0x10000;
+        let (offset, size, ep_offset, dirs_offset) = if layout_b {
+            // Compact metadata has an extra 16-byte prefix before the EP/dirs.
+            let shift = if compact { 0x10 } else { 0 };
+            (0x10, 0x290, 0x20 + shift, 0x30 + shift)
+        } else {
+            (0x40, 144, 0x40, 0x50)
+        };
+        let start = base.wrapping_add(offset) as usize;
+        let backup = self.decompressed[start..start + size].to_vec();
+        self.decrypt_data5(base.wrapping_add(offset), size as u32);
+        let ep = get_u32(&self.decompressed, base.wrapping_add(ep_offset));
+        let mut dirs = [0u8; 128];
+        let dirs_start = base.wrapping_add(dirs_offset) as usize;
+        dirs.copy_from_slice(&self.decompressed[dirs_start..dirs_start + 128]);
+        self.decompressed[start..start + size].copy_from_slice(&backup);
+        (ep, dirs)
+    }
+
     /// PE32 (32-bit) unpack pipeline. The shared Stage 1/2 setup (info decrypt,
     /// payload decrypt, raw copy, header restore) has already run in `run()`
     /// before dispatch; this takes over from "Locating shell offsets".
-    pub(super) fn run_pe32(&mut self, pe_off: u32, verbose: bool) -> Result<Vec<u8>, UnpackError> {
+    pub(super) fn run_pe32(
+        &mut self,
+        pe_off: u32,
+        tbl: u32,
+        verbose: bool,
+    ) -> Result<Vec<u8>, UnpackError> {
         let info = self.info;
         let info3 = info[3];
 
@@ -43,94 +186,21 @@ impl<'a> Unpacker<'a> {
             key
         };
 
-        // ---- Locate tbl in shell ----
-        let tbl =
-            layout::find_tbl_pe32(&self.decompressed, &info).ok_or(UnpackError::Pe32TblNotFound)?;
+        // ---- Validated shell table ----
+        let compact = get_u32(&self.decompressed, tbl.wrapping_add(0x78)) == info[6];
+        let stage_field = if compact { 0x88 } else { 0x98 };
         if verbose {
             println!("[3/9] Locating config layout (PE32)...");
-            println!("  tbl = 0x{:X}", tbl);
+            println!("  tbl = 0x{:X}, compact = {}", tbl, compact);
         }
-
-        // ---- PE header restore ----
-        let val_bc = get_u32(&self.decompressed, tbl.wrapping_add(0xBC));
-        let val_c8 = get_u32(&self.decompressed, tbl.wrapping_add(0xC8));
-        let val_cc = get_u32(&self.decompressed, tbl.wrapping_add(0xCC));
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x80), val_bc);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x88), val_c8);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x8C), val_cc);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB0), 0);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB4), 0);
-
-        // ---- Header-independent checksum inputs ----
-        let first_stage_cs = self.calculate_checksum(tbl.wrapping_add(0xA8));
-        let second_stage_key = get_u32(&self.decompressed, tbl.wrapping_add(0x40));
 
         // ---- Stage 3: SecondStage ----
-        //
-        // ss_key = headerChecksum ^ firstStageCS ^ secondStageKey, where the
-        // header checksum (a XOR of crc32(region)^size over the sub-regions at
-        // tbl+0x58) is taken over the *original* pre-pack PE header. For EXEs the
-        // import/resource restore above reconstructs that header exactly. Native
-        // DLLs additionally carry a packer-added BaseReloc data-directory entry
-        // (dir 5) that was absent from the checksummed original, so the header
-        // checksum only matches once that entry is treated as zero. EXEs have no
-        // dir-5 entry, so zeroing it is a no-op for them.
-        //
-        // Rather than branch on EXE-vs-DLL, try the header as-is and, on failure,
-        // with the BaseReloc entry zeroed; keep whichever ss_key decrypts a
-        // SecondStage whose ThirdStage (off,size) pair lands inside the image.
-        // This uses the same shift/key trial-and-validate the later stages
-        // already use, and keeps EXE output byte-identical (the as-is variant
-        // wins first).
-        let ss_pair = tbl.wrapping_add(0x98);
+        let ss_pair = tbl.wrapping_add(stage_field);
         let ss = get_u32(&self.decompressed, ss_pair);
         let ss_size = get_u32(&self.decompressed, ss_pair.wrapping_add(4));
-        let ss_shift = ss_size.wrapping_sub(0xBC0);
-        // Back up the SecondStage ciphertext so a failed trial can be retried.
-        let ss_lo = ss as usize;
-        let ss_hi = ss_lo.wrapping_add(ss_size as usize);
-        if ss_hi < ss_lo || ss_hi > self.decompressed.len() {
-            return Err(UnpackError::Pe32SecondStageRangeInvalid {
-                offset: ss,
-                size: ss_size,
-                image_len: self.decompressed.len(),
-            });
-        }
-        let ss_ct: Vec<u8> = self.decompressed[ss_lo..ss_hi].to_vec();
-        // PE32 data dir 5 (BaseReloc) = optional_header(pe+24) + 0x60 + 5*8 = pe+0xA0.
-        let reloc_dir = pe_off.wrapping_add(0xA0);
-        let len = self.decompressed.len() as u64;
-        let pair_off = 0xB8Cu32.wrapping_add(ss_shift);
-        let mut found = false;
-        // Holds the winning variant's header checksum; the later stages
-        // (Forth/Fifth/Seven/Eighth) reuse it as a key component.
-        let mut header_checksum: u32 = 0;
-        for zero_reloc in [false, true] {
-            if zero_reloc {
-                write_u32(&mut self.decompressed, reloc_dir, 0);
-                write_u32(&mut self.decompressed, reloc_dir.wrapping_add(4), 0);
-            }
-            let mut hcs_addr = tbl.wrapping_add(0x58);
-            header_checksum = 0;
-            while get_u32(&self.decompressed, hcs_addr.wrapping_add(4)) != 0 {
-                header_checksum ^= self.calculate_checksum(hcs_addr);
-                hcs_addr = hcs_addr.wrapping_add(8);
-            }
-            let ss_key = header_checksum ^ first_stage_cs ^ second_stage_key;
-            self.decompressed[ss_lo..ss_hi].copy_from_slice(&ss_ct);
-            self.decrypt_data3(ss_pair, ss_key, 21);
-            // Validate: the ThirdStage (off,size) pair must reference the image.
-            let pair = ss.wrapping_add(pair_off);
-            let off = get_u32(&self.decompressed, pair) as u64;
-            let sz = get_u32(&self.decompressed, pair.wrapping_add(4)) as u64;
-            if off > 0x1000 && off < len && sz >= 4 && off.saturating_add(sz) <= len {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return Err(UnpackError::Pe32RelocationDataNotFound);
-        }
+        let ss_shift = ss_size.wrapping_sub(if compact { 0xAEC } else { 0xBC0 });
+        let third_pair_off = (if compact { 0xAB4u32 } else { 0xB8C }).wrapping_add(ss_shift);
+        let header_checksum = self.decrypt_pe32_second_stage(tbl, pe_off)?;
         if verbose {
             println!(
                 "  ss = 0x{:08X}, size = 0x{:X}, shift = 0x{:X}",
@@ -139,13 +209,12 @@ impl<'a> Unpacker<'a> {
         }
 
         // ---- PE32 fixed offsets ----
-        let third_key_off = 0x968u32.wrapping_add(ss_shift);
-        let forth_key_off = 0x964u32.wrapping_add(ss_shift);
-        let cs_base_off = 0x96Cu32.wrapping_add(ss_shift);
-        let dp_base_off = 0xA9Cu32.wrapping_add(ss_shift);
+        let third_key_off = (if compact { 0x950u32 } else { 0x968 }).wrapping_add(ss_shift);
+        let forth_key_off = (if compact { 0x94Cu32 } else { 0x964 }).wrapping_add(ss_shift);
+        let cs_base_off = (if compact { 0x954u32 } else { 0x96C }).wrapping_add(ss_shift);
+        let dp_base_off = (if compact { 0x9C4u32 } else { 0xA9C }).wrapping_add(ss_shift);
 
         // ---- Stage 4: ThirdStage (brute-force the rotate shift) ----
-        let third_pair_off = 0xB8Cu32.wrapping_add(ss_shift);
         let key = get_u32(&self.decompressed, ss.wrapping_add(third_key_off));
         let pair_addr = ss.wrapping_add(third_pair_off);
         let ts_addr = get_u32(&self.decompressed, pair_addr);
@@ -238,7 +307,7 @@ impl<'a> Unpacker<'a> {
         }
 
         // ---- Checksum addresses ----
-        let second_stage_cs_addr = tbl.wrapping_add(0xB0);
+        let second_stage_cs_addr = tbl.wrapping_add(stage_field + 0x18);
         let forth_stage_cs_addr = ss.wrapping_add(cs_base_off);
         let fifth_stage_cs_addr = ss.wrapping_add(cs_base_off).wrapping_add(0x08);
         let seven_stage_cs_addr = ss.wrapping_add(cs_base_off).wrapping_add(0x10);
@@ -298,7 +367,9 @@ impl<'a> Unpacker<'a> {
         );
         let seven_key = !get_u32(
             &self.decompressed,
-            cs1_addr.wrapping_add(cs1_size).wrapping_sub(0x10),
+            cs1_addr
+                .wrapping_add(cs1_size)
+                .wrapping_sub(if compact { 0xC } else { 0x10 }),
         );
         let fk7 = header_checksum ^ fifth_cs ^ seven_key;
         if let Err(reason) = self.decrypt_and_decompress_data(seven_addr, fk7, None) {
@@ -640,28 +711,7 @@ impl<'a> Unpacker<'a> {
         )?;
 
         // ---- PE32 metadata: EP and data dirs from info[3] ----
-        let test_val = get_u32(&self.decompressed, info3.wrapping_add(0x10));
-        let metadata_ep: u32;
-        let mut metadata_dirs = [0u8; 128];
-        if test_val > 0x10000 {
-            // Layout B
-            let s = info3.wrapping_add(0x10) as usize;
-            let backup_meta = self.decompressed[s..s + 0x290].to_vec();
-            self.decrypt_data5(info3.wrapping_add(0x10), 0x290);
-            metadata_ep = get_u32(&self.decompressed, info3.wrapping_add(0x20));
-            let d = info3.wrapping_add(0x30) as usize;
-            metadata_dirs.copy_from_slice(&self.decompressed[d..d + 128]);
-            self.decompressed[s..s + 0x290].copy_from_slice(&backup_meta);
-        } else {
-            // Layout A
-            let s = info3.wrapping_add(0x40) as usize;
-            let backup_meta = self.decompressed[s..s + 144].to_vec();
-            self.decrypt_data5(info3.wrapping_add(0x40), 144);
-            metadata_ep = get_u32(&self.decompressed, info3.wrapping_add(0x40));
-            let d = info3.wrapping_add(0x50) as usize;
-            metadata_dirs.copy_from_slice(&self.decompressed[d..d + 128]);
-            self.decompressed[s..s + 144].copy_from_slice(&backup_meta);
-        }
+        let (metadata_ep, metadata_dirs) = self.read_pe32_metadata(compact);
 
         // ---- Zero-out list (runs BEFORE decompression) ----
         let zero_list_addr = eighth_start.wrapping_add(off_zero_list);
@@ -1156,6 +1206,56 @@ impl<'a> Unpacker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_metadata(compact: bool, layout_b: bool) {
+        let base = 0x1000u32;
+        let (offset, size, ep_offset, dirs_offset) = if layout_b {
+            if compact {
+                (0x10, 0x290, 0x30, 0x40)
+            } else {
+                (0x10, 0x290, 0x20, 0x30)
+            }
+        } else {
+            (0x40, 144, 0x40, 0x50)
+        };
+        let mut data = vec![0u8; 0x2000];
+        let ep = 0x123456;
+        let dirs = std::array::from_fn::<_, 128, _>(|i| i as u8 ^ 0x5A);
+        write_u32(&mut data, base + ep_offset, ep);
+        data[(base + dirs_offset) as usize..(base + dirs_offset + 128) as usize]
+            .copy_from_slice(&dirs);
+        for i in 0..size {
+            let key = (base + offset + i) as u8;
+            let byte = &mut data[(base + offset + i) as usize];
+            let mixed = (byte.rotate_right(2) ^ key).rotate_right(2) ^ key.wrapping_add(1);
+            *byte = mixed.rotate_right(2);
+        }
+        assert_eq!(get_u32(&data, base + 0x10) > 0x10000, layout_b);
+        let backup = data.clone();
+        let mut unpacker = Unpacker {
+            file_data: &[],
+            decompressed: data,
+            info: [0, 0, 0, base, 0, 0, 0, 0],
+            key_offsets: [0; 4],
+            decrypt_size: 0,
+        };
+        assert_eq!(unpacker.read_pe32_metadata(compact), (ep, dirs));
+        assert_eq!(
+            unpacker.decompressed, backup,
+            "metadata reads must be nondestructive"
+        );
+    }
+
+    #[test]
+    fn pe32_compact_metadata_restores_entry_point_and_directories() {
+        check_metadata(true, true);
+    }
+
+    #[test]
+    fn pe32_standard_metadata_preserves_both_layouts() {
+        check_metadata(false, false);
+        check_metadata(false, true);
+    }
 
     #[test]
     fn stage_key_rounds_follow_active_descriptor_prefix() {

@@ -104,6 +104,45 @@ impl<'a> Unpacker<'a> {
         }
     }
 
+    fn load_payload(&mut self) -> Option<u32> {
+        self.decrypt_size = self.info[6].wrapping_sub(self.info[3]).wrapping_add(8192);
+        self.decrypt_data2();
+        let src_start = self.info[4]
+            .wrapping_add(4096)
+            .wrapping_add(self.decrypt_size) as usize;
+        let dst_start = self.info[3].wrapping_add(self.decrypt_size) as usize;
+        let len = self.info[5].wrapping_sub(self.decrypt_size) as usize;
+        self.decompressed[dst_start..dst_start + len]
+            .copy_from_slice(&self.file_data[src_start..src_start + len]);
+
+        write_u32(&mut self.decompressed, self.info[3], 4096);
+        self.decompressed[..4096].copy_from_slice(&self.file_data[..4096]);
+        let pe = get_u32(self.file_data, 60);
+        let is_pe32 = get_u16(self.file_data, pe.wrapping_add(24)) == 0x10B;
+        let mut table = if is_pe32 {
+            self.find_pe32_table()
+        } else {
+            None
+        };
+        // Older PE32 loaders encrypt the entire payload; the length also seeds
+        // the cipher, so the prefix-size key cannot decode even their shell.
+        if is_pe32 && self.info[5] > self.decrypt_size && table.is_none() {
+            let prefix_size = self.decrypt_size;
+            let start = self.info[3] as usize;
+            let end = start + self.info[5] as usize;
+            let backup = self.decompressed[start..end].to_vec();
+            self.decrypt_size = self.info[5];
+            self.decrypt_data2();
+            write_u32(&mut self.decompressed, self.info[3], 4096);
+            table = self.find_pe32_table();
+            if table.is_none() {
+                self.decompressed[start..end].copy_from_slice(&backup);
+                self.decrypt_size = prefix_size;
+            }
+        }
+        table
+    }
+
     // Strategy (a): delegate to primitives::decrypt_data3
     fn decrypt_data3(&mut self, pos: u32, key: u32, shift: u32) {
         primitives::decrypt_data3(&mut self.decompressed, pos, key, shift);
@@ -351,28 +390,18 @@ impl<'a> Unpacker<'a> {
             });
         }
         u.decompressed = vec![0u8; size_of_image as usize];
-        u.decrypt_size = u.info[6].wrapping_sub(u.info[3]).wrapping_add(8192);
         if verbose {
             println!("[2/9] Decrypting payload...");
         }
-        u.decrypt_data2();
-
-        {
-            let src_start = u.info[4].wrapping_add(4096).wrapping_add(u.decrypt_size) as usize;
-            let dst_start = u.info[3].wrapping_add(u.decrypt_size) as usize;
-            let len = u.info[5].wrapping_sub(u.decrypt_size) as usize;
-            u.decompressed[dst_start..dst_start + len]
-                .copy_from_slice(&u.file_data[src_start..src_start + len]);
-        }
-        write_u32(&mut u.decompressed, u.info[3], 4096);
-        u.decompressed[..4096].copy_from_slice(&u.file_data[..4096]);
+        let pe32_table = u.load_payload();
 
         // PE32 (32-bit) images use an entirely different config layout and
         // final-output transform than PE32+ (64-bit). Dispatch here, after the
         // shared header/payload setup (the PE32 branch follows the common
         // Stage 1/2 work). pe_magic at pe_off+24: 0x10B = PE32, 0x20B = PE32+.
         if get_u16(u.file_data, pe_off.wrapping_add(24)) == 0x10B {
-            return u.run_pe32(pe_off, verbose);
+            let table = pe32_table.ok_or(UnpackError::Pe32TblNotFound)?;
+            return u.run_pe32(pe_off, table, verbose);
         }
 
         // The config block layout in the decrypted region varies between Crackproof
@@ -1989,6 +2018,146 @@ impl<'a> Unpacker<'a> {
         let d = tls_dir_rva as usize;
         self.decompressed[d..d + 24].copy_from_slice(&self.file_data[src..src + 24]);
         true
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    fn check_payload(full: bool, valid_table: bool) {
+        let info = [
+            0x1234_5678,
+            0x4E4E_4F4B,
+            0,
+            0x2000,
+            0x200,
+            0x7000,
+            0x2400,
+            0,
+        ];
+        let mut plain = vec![0u8; 0x10000];
+        let table = 0x2800;
+        let (shell_field, header_field) = if full { (0x78, 0x50) } else { (0x88, 0x58) };
+        write_u32(&mut plain, table + shell_field, info[6]);
+        write_u32(&mut plain, table + shell_field + 4, 0x1800);
+        write_u32(&mut plain, table + header_field, 0x80);
+        write_u32(
+            &mut plain,
+            table + header_field + 4,
+            if valid_table { 0x58 } else { 0 },
+        );
+        let ss_size = if full { 0xAEC } else { 0xBC0 };
+        write_u32(&mut plain, table + shell_field + 0x10, 0x6000);
+        write_u32(&mut plain, table + shell_field + 0x14, ss_size);
+        write_u32(&mut plain, table + shell_field + 0x20, info[6]);
+        write_u32(&mut plain, table + shell_field + 0x24, 0x1800);
+        write_u32(&mut plain, table + 0x40, 0x9ABC_DEF0);
+        let third_pair = 0x6000 + if full { 0xAB4 } else { 0xB8C };
+        write_u32(&mut plain, third_pair, 0x8000);
+        write_u32(&mut plain, third_pair + 4, 0x20);
+        if full {
+            // This earlier table has plausible descriptors but a wrong stage key.
+            for (field, value) in [
+                (0x40, 0x1122_3344),
+                (0x50, 0x80),
+                (0x54, 0x58),
+                (0x78, info[6]),
+                (0x7C, 0x1800),
+                (0x88, 0x7000),
+                (0x8C, 0xAEC),
+                (0x98, info[6]),
+                (0x9C, 0x1800),
+            ] {
+                write_u32(&mut plain, 0x2500 + field, value);
+            }
+        }
+        write_u32(&mut plain, 0x8100, 0xAABB_CCDD);
+        let encrypted_size = if full {
+            info[5]
+        } else {
+            info[6] - info[3] + 8192
+        };
+        let src = 4096 + info[4];
+        let mut input = vec![0u8; (src + info[5]) as usize];
+        write_u32(&mut input, 0x3C, 0x80);
+        write_u16(&mut input, 0x98, 0x10B);
+        plain[..4096].copy_from_slice(&input[..4096]);
+        let mut key = primitives::calculate_checksum(&plain, table + header_field)
+            ^ primitives::calculate_checksum(&plain, table + shell_field + 0x20)
+            ^ get_u32(&plain, table + 0x40);
+        for i in 0..ss_size / 4 {
+            let word = get_u32(&plain, 0x6000 + i * 4);
+            write_u32(
+                &mut plain,
+                0x6000 + i * 4,
+                word.wrapping_add(i).rotate_left(21) ^ key,
+            );
+            key = key.wrapping_add(i);
+        }
+        let mut key = info[0].wrapping_add(!encrypted_size);
+        for i in 0..info[5] / 4 {
+            let word = get_u32(&plain, info[3] + i * 4);
+            let cell = if i * 4 < encrypted_size {
+                word ^ key
+            } else {
+                word
+            };
+            write_u32(&mut input, src + i * 4, cell);
+            key = i.wrapping_mul(i) ^ key.wrapping_add(cell).wrapping_add(i);
+        }
+        let mut unpacker = Unpacker {
+            file_data: &input,
+            decompressed: vec![0u8; plain.len()],
+            info,
+            key_offsets: [0; 4],
+            decrypt_size: 0,
+        };
+        let selected = unpacker.load_payload();
+        assert_eq!(selected, valid_table.then_some(table));
+        if !valid_table {
+            let prefix_size = info[6] - info[3] + 8192;
+            assert_eq!(unpacker.decrypt_size, prefix_size);
+            assert_eq!(
+                get_u32(&unpacker.decompressed, info[3] + prefix_size - 4),
+                {
+                    let mut key = info[0].wrapping_add(!prefix_size);
+                    let mut word = 0;
+                    for i in 0..prefix_size / 4 {
+                        let cell = get_u32(&input, src + i * 4);
+                        word = key ^ cell;
+                        key = i.wrapping_mul(i) ^ key.wrapping_add(cell).wrapping_add(i);
+                    }
+                    word
+                }
+            );
+            assert_eq!(
+                &unpacker.decompressed
+                    [(info[3] + prefix_size) as usize..(info[3] + info[5]) as usize],
+                &input[(src + prefix_size) as usize..(src + info[5]) as usize]
+            );
+            return;
+        }
+        assert_eq!(unpacker.decrypt_size, encrypted_size);
+        assert_eq!(
+            &unpacker.decompressed[info[3] as usize + 4..(info[3] + info[5]) as usize],
+            &plain[info[3] as usize + 4..(info[3] + info[5]) as usize]
+        );
+    }
+
+    #[test]
+    fn pe32_full_payload_encryption_is_trial_validated() {
+        check_payload(true, true);
+    }
+
+    #[test]
+    fn pe32_prefix_payload_encryption_preserves_plaintext_tail() {
+        check_payload(false, true);
+    }
+
+    #[test]
+    fn pe32_invalid_full_payload_trial_restores_prefix() {
+        check_payload(true, false);
     }
 }
 

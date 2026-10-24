@@ -212,37 +212,54 @@ pub fn section_name(data: &[u8], offset: u32) -> String {
 // PE32 (32-bit) helpers
 // ---------------------------------------------------------------------------
 
-/// PE32 shell-table locator. Walks the shell region (`info[6]`) for a dword
-/// equal to `info[6]` followed by a plausible shell size, returning the table
-/// base (`candidate = off - 0x88`) when `candidate+0x58` holds a valid pointer.
-pub fn find_tbl_pe32(data: &[u8], info: &[u32; 8]) -> Option<u32> {
-    let shell = info[6];
-    if (data.len() as u64) < 0x100 {
-        return None;
-    }
-    let hi = (shell as u64)
-        .saturating_add(0x3000)
-        .min(data.len() as u64 - 0x100) as u32;
-    let mut off = shell;
-    while off < hi {
-        if off as usize + 8 <= data.len() {
-            let candidate = off.wrapping_sub(0x88);
-            if candidate >= shell && get_u32(data, off) == info[6] {
-                let shell_size_val = get_u32(data, off.wrapping_add(4));
-                if shell_size_val > 0x1000 && shell_size_val < 0x100000 {
-                    let v58_off = candidate.wrapping_add(0x58);
-                    if (v58_off as usize + 4) <= data.len() {
-                        let v58 = get_u32(data, v58_off);
-                        if v58 > 0 && (v58 as usize) < data.len() {
-                            return Some(candidate);
-                        }
-                    }
-                }
+/// PE32 shell-table locator. The compact layout moves the shell descriptor
+/// from +0x88 to +0x78 and the header-checksum list from +0x58 to +0x50.
+/// Return structurally plausible candidates; the pipeline must trial-decrypt
+/// their second stages before selecting a table.
+pub fn find_tbl_pe32_candidates(data: &[u8], info: &[u32; 8]) -> Vec<u32> {
+    let mut tables = Vec::new();
+    let shell = info[6] as usize;
+    let hi = shell.saturating_add(0x3000).min(data.len());
+    for off in (shell..hi.saturating_sub(8)).step_by(4) {
+        if get_u32(data, off as u32) != info[6] {
+            continue;
+        }
+        let shell_size = get_u32(data, off as u32 + 4) as usize;
+        if !(0x1001..0x100000).contains(&shell_size)
+            || shell
+                .checked_add(shell_size)
+                .is_none_or(|end| end > data.len())
+        {
+            continue;
+        }
+        for (shell_field, header_field) in [(0x88, 0x58), (0x78, 0x50)] {
+            let Some(candidate) = off.checked_sub(shell_field).filter(|&base| base >= shell) else {
+                continue;
+            };
+            let Some(table) = data.get(candidate..candidate + 0xD0) else {
+                continue;
+            };
+            let header = get_u32(table, header_field) as usize;
+            let header_size = get_u32(table, header_field + 4) as usize;
+            let stage = get_u32(table, shell_field as u32 + 0x10) as usize;
+            let stage_size = get_u32(table, shell_field as u32 + 0x14) as usize;
+            if header > 0
+                && header_size > 0
+                && header
+                    .checked_add(header_size)
+                    .is_some_and(|end| end <= 0x1000)
+                && stage >= info[3] as usize
+                && stage_size >= 4
+                && stage
+                    .checked_add(stage_size)
+                    .is_some_and(|end| end <= data.len())
+                && !tables.contains(&(candidate as u32))
+            {
+                tables.push(candidate as u32);
             }
         }
-        off = off.wrapping_add(4);
     }
-    None
+    tables
 }
 
 /// Locate an LFSR-encrypted bytecode block (decrypt_data6 form) in a region.
@@ -448,6 +465,57 @@ pub fn discover_eighth_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pe32_table_fixture(compact: bool) -> (Vec<u8>, [u32; 8], u32) {
+        let mut data = vec![0u8; 0x10000];
+        let info = [0, 0, 0, 0x2000, 0, 0x7000, 0x2400, 0];
+        let table = 0x2800;
+        let (shell, header) = if compact { (0x78, 0x50) } else { (0x88, 0x58) };
+        for (field, value) in [
+            (header, 0x80),
+            (header + 4, 0x58),
+            (shell, info[6]),
+            (shell + 4, 0x1800),
+            (shell + 0x10, 0x6000),
+            (shell + 0x14, 0xAEC),
+        ] {
+            senbei_crypto::primitives::write_u32(&mut data, table + field, value);
+        }
+        (data, info, table)
+    }
+
+    #[test]
+    fn pe32_table_supports_compact_header_descriptors() {
+        for compact in [false, true] {
+            let (data, info, table) = pe32_table_fixture(compact);
+            assert_eq!(find_tbl_pe32_candidates(&data, &info), vec![table]);
+        }
+    }
+
+    #[test]
+    fn pe32_table_rejects_a_shell_reference_without_valid_descriptors() {
+        let (mut data, info, table) = pe32_table_fixture(true);
+        for (field, value) in [(0x58, 0x80), (0x5C, 0x58), (0x88, info[6]), (0x8C, 0x1800)] {
+            senbei_crypto::primitives::write_u32(&mut data, 0x2500 + field, value);
+        }
+        assert_eq!(find_tbl_pe32_candidates(&data, &info), vec![table]);
+        senbei_crypto::primitives::write_u32(&mut data, table + 0x54, 0);
+        assert_eq!(find_tbl_pe32_candidates(&data, &info), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn pe32_table_rejects_truncated_and_out_of_range_regions() {
+        let (mut data, mut info, table) = pe32_table_fixture(true);
+        assert_eq!(
+            find_tbl_pe32_candidates(&data[..0x28C0], &info),
+            Vec::<u32>::new()
+        );
+        senbei_crypto::primitives::write_u32(&mut data, table + 0x50, u32::MAX - 15);
+        assert_eq!(find_tbl_pe32_candidates(&data, &info), Vec::<u32>::new());
+        info[6] = u32::MAX;
+        assert_eq!(find_tbl_pe32_candidates(&data, &info), Vec::<u32>::new());
+        assert_eq!(find_tbl_pe32_candidates(&[], &info), Vec::<u32>::new());
+    }
 
     /// Task 4.1 regression: build a synthetic buffer whose valid bytecode block
     /// sits PAST `len` but within `len*2`. Assert that the smaller window misses
