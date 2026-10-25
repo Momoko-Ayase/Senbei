@@ -602,19 +602,59 @@ fn dynamic_symbol_names(symbols: &[u8], strings: &[u8]) -> Result<Vec<Vec<u8>>> 
         .collect()
 }
 
+fn auxiliary_seed_references(module: &[u8]) -> HashSet<u64> {
+    let mut references = HashSet::new();
+    // The relocation decoder loads the seed through the module GOT, then
+    // squares it in a W register. Follow ADRP/LDR X/LDR W/MUL W instead of
+    // treating a neighbouring module's function offset as a format constant.
+    for (index, code) in module.windows(16).step_by(4).enumerate() {
+        let word = |offset| u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap());
+        let adrp = word(0);
+        let pointer = word(4);
+        let seed = word(8);
+        let square = word(12);
+        let page_register = adrp & 31;
+        let pointer_register = pointer & 31;
+        let seed_register = seed & 31;
+        if adrp & 0x9f00_0000 != 0x9000_0000
+            || page_register == 31
+            || pointer & 0xffc0_0000 != 0xf940_0000
+            || (pointer >> 5) & 31 != page_register
+            || pointer_register == 31
+            || seed != 0xb940_0000 | (pointer_register << 5) | seed_register
+            || seed_register == 31
+            || square != 0x1b00_7c00 | (seed_register << 16) | (seed_register << 5) | seed_register
+        {
+            continue;
+        }
+        let Some(address) = aarch64_adrp_target(adrp, (index * 4) as u64)
+            .and_then(|page| page.checked_add(u64::from((pointer >> 10) & 0xfff) * 8))
+        else {
+            continue;
+        };
+        if let Ok(offset) = usize::try_from(address)
+            && let Ok(target) = read_u64(module, offset)
+        {
+            references.insert(target);
+        }
+    }
+    references
+}
+
 fn discover_auxiliary_symbol_seed(module: &[u8]) -> Result<u32> {
     const PREFIX0: u32 = 0x8f;
-    const PREFIX1: u32 = 0x15ec;
     const TYPE_ID: u32 = 0x81;
     const MODE0: u32 = 1;
     const MODE1: u32 = 5;
     const SUFFIX0: u32 = 0x0a54;
     const SUFFIX1: u32 = 0x12008;
 
+    let references = auxiliary_seed_references(module);
     let mut matches = Vec::new();
-    for seed_offset in (0x20..module.len().saturating_sub(0x10)).step_by(4) {
+    for seed_offset in (0x20..=module.len().saturating_sub(0x10)).step_by(4) {
         if read_u32(module, seed_offset - 0x20)? == PREFIX0
-            && read_u32(module, seed_offset - 0x1c)? == PREFIX1
+            && read_u32(module, seed_offset - 0x1c)? != 0
+            && read_u32(module, seed_offset - 0x1c)?.is_multiple_of(4)
             && read_u32(module, seed_offset - 0x18)? == TYPE_ID
             && read_u32(module, seed_offset - 0x10)? == TYPE_ID
             && read_u32(module, seed_offset - 8)? == MODE0
@@ -622,6 +662,7 @@ fn discover_auxiliary_symbol_seed(module: &[u8]) -> Result<u32> {
             && read_u32(module, seed_offset + 4)? == SUFFIX0
             && read_u32(module, seed_offset + 8)? == SUFFIX1
             && read_u32(module, seed_offset + 0x0c)? == 0
+            && references.contains(&(seed_offset as u64))
         {
             matches.push(read_u32(module, seed_offset)?);
         }
@@ -687,7 +728,53 @@ fn aarch64_writes_w1_immediate(instruction: u32) -> bool {
     )
 }
 
+fn aarch64_adrp_target(instruction: u32, pc: u64) -> Option<u64> {
+    if instruction & 0x9f00_0000 != 0x9000_0000 {
+        return None;
+    }
+    let immediate = ((instruction >> 29) & 3) | ((instruction >> 5) & 0x7ffff) << 2;
+    let pages = i64::from(immediate);
+    let pages = if pages & (1 << 20) != 0 {
+        pages - (1 << 21)
+    } else {
+        pages
+    };
+    (pc & !0xfff).checked_add_signed(pages * 0x1000)
+}
+
+fn aarch64_plt_veneer_target(code: &[u8], pc: u64) -> Option<u64> {
+    let adrp = read_u32(code, 0).ok()?;
+    let add = read_u32(code, 4).ok()?;
+    let branch = read_u32(code, 8).ok()?;
+    let register = adrp & 31;
+    // Linker range-extension veneers preserve the call's arguments and LR:
+    // ADRP X16/X17, page; ADD X16/X17, X16/X17, lo12; BR X16/X17.
+    if !matches!(register, 16 | 17)
+        || add & 0xffc0_03ff != 0x9100_0000 | (register << 5) | register
+        || branch != 0xd61f_0000 | (register << 5)
+    {
+        return None;
+    }
+    aarch64_adrp_target(adrp, pc)?.checked_add(u64::from((add >> 10) & 0xfff))
+}
+
 fn plt_call_features(image: &[u8], layout: &ElfLayout, target: u64) -> Result<PltCallFeatures> {
+    let mut targets = HashSet::from([target]);
+    for segment in &layout.program_headers {
+        if segment.flags & 1 == 0 {
+            continue;
+        }
+        let code = slice_u64(image, segment.offset, segment.file_size)?;
+        for (index, instructions) in code.windows(12).step_by(4).enumerate() {
+            let pc = segment
+                .virtual_address
+                .checked_add((index * 4) as u64)
+                .ok_or_else(|| Error::Invalid("veneer PC overflow".to_owned()))?;
+            if aarch64_plt_veneer_target(instructions, pc) == Some(target) {
+                targets.insert(pc);
+            }
+        }
+    }
     let mut features = PltCallFeatures::default();
     for segment in &layout.program_headers {
         if segment.flags & 1 == 0 || segment.file_size < 4 {
@@ -708,7 +795,8 @@ fn plt_call_features(image: &[u8], layout: &ElfLayout, target: u64) -> Result<Pl
                 .checked_add(relative as u64)
                 .ok_or_else(|| Error::Invalid("executable PC overflow".to_owned()))?;
             let instruction = read_u32(image, offset)?;
-            if aarch64_bl_target(instruction, pc) != Some(target) {
+            if !aarch64_bl_target(instruction, pc).is_some_and(|address| targets.contains(&address))
+            {
                 continue;
             }
             features.calls += 1;
@@ -2684,13 +2772,17 @@ mod tests {
         assert_eq!(relocations[1].symbol(), 2);
     }
 
-    #[test]
-    fn discovers_auxiliary_symbol_permutation_seed() {
-        let mut module = vec![0_u8; 0x80];
-        let seed_offset = 0x40;
+    fn auxiliary_seed_module(helper_offset: u32) -> Vec<u8> {
+        let mut module = vec![0_u8; 0x100];
+        let seed_offset = 0xf0;
         for (offset, value) in [
+            (0x10, 0x9000_0000), // ADRP X0, page 0
+            (0x14, 0xf940_4000), // LDR X0, [X0, #0x80]
+            (0x18, 0xb940_0001), // LDR W1, [X0]
+            (0x1c, 0x1b01_7c21), // MUL W1, W1, W1
+            (0x80, seed_offset as u32),
             (seed_offset - 0x20, 0x8f_u32),
-            (seed_offset - 0x1c, 0x15ec),
+            (seed_offset - 0x1c, helper_offset),
             (seed_offset - 0x18, 0x81),
             (seed_offset - 0x10, 0x81),
             (seed_offset - 8, 1),
@@ -2702,10 +2794,142 @@ mod tests {
         ] {
             module[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        module
+    }
+
+    #[test]
+    fn discovers_auxiliary_symbol_seed_with_relocated_helper() {
+        // The configuration ends exactly at the module boundary.
+        for helper_offset in [0x15ec, 0x164c, 0x2400] {
+            assert_eq!(
+                discover_auxiliary_symbol_seed(&auxiliary_seed_module(helper_offset))
+                    .expect("symbol seed"),
+                0x4db4_d9ec
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_symbol_seed_requires_a_valid_decoder_reference() {
+        for (offset, value) in [
+            (0x10, 0xd503_201f_u32), // no ADRP
+            (0x14, 0xf940_4020),     // wrong page register
+            (0x18, 0xb940_0002),     // wrong seed register for MUL
+            (0x1c, 0x1b02_7c21),     // multiplication by another value
+            (0x80, 0xec),            // GOT points at a different field
+            (0x80, 0x1000),          // GOT points outside the module
+            (0xd4, 0),               // null helper offset
+            (0xd4, 0x164d),          // unaligned helper offset
+            (0xe8, 2),               // unsupported mode
+        ] {
+            let mut module = auxiliary_seed_module(0x164c);
+            module[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(discover_auxiliary_symbol_seed(&module).is_err());
+        }
+        for length in [0, 0x10, 0x20, 0xff] {
+            assert!(
+                discover_auxiliary_symbol_seed(&auxiliary_seed_module(0x164c)[..length]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_symbol_seed_trials_all_candidates_and_rejects_ambiguity() {
+        let mut module = auxiliary_seed_module(0x164c);
+        module.copy_within(0xd0..0x100, 0x40);
+        // An unreferenced configuration-shaped decoy must not hide the real one.
         assert_eq!(
-            discover_auxiliary_symbol_seed(&module).expect("symbol seed"),
+            discover_auxiliary_symbol_seed(&module).unwrap(),
             0x4db4_d9ec
         );
+        module.copy_within(0x10..0x20, 0x20);
+        module[0x24..0x28].copy_from_slice(&0xf940_4400_u32.to_le_bytes());
+        module[0x88..0x90].copy_from_slice(&0x60_u64.to_le_bytes());
+        assert!(
+            discover_auxiliary_symbol_seed(&module)
+                .unwrap_err()
+                .to_string()
+                .contains("2 validated")
+        );
+    }
+
+    #[test]
+    fn auxiliary_seed_reference_supports_negative_page_displacements() {
+        let mut module = auxiliary_seed_module(0x164c);
+        module.resize(0x2010, 0);
+        module.copy_within(0x10..0x20, 0x2000);
+        module[0x10..0x20].fill(0);
+        // ADRP X0, PC page - 2 pages; GOT and seed remain in page zero.
+        module[0x2000..0x2004].copy_from_slice(&0xd0ff_ffe0_u32.to_le_bytes());
+        assert_eq!(
+            discover_auxiliary_symbol_seed(&module).unwrap(),
+            0x4db4_d9ec
+        );
+    }
+
+    #[test]
+    fn plt_call_features_follow_validated_range_extension_veneers() {
+        let mut image = vec![0_u8; 0x130];
+        for (offset, word) in [
+            (0x100, 0x2a1f_03e1_u32), // MOV W1, WZR
+            (0x104, 0x9400_03ff),     // BL 0x2000
+            (0x108, 0x3400_0040),     // CBZ W0
+            (0x110, 0x2a1f_03e1),     // MOV W1, WZR
+            (0x114, 0x9400_0003),     // BL 0x1020 (veneer)
+            (0x118, 0x3400_0040),     // CBZ W0
+            (0x120, 0xb000_0010),     // ADRP X16, 0x2000
+            (0x124, 0x9100_0210),     // ADD X16, X16, #0
+            (0x128, 0xd61f_0200),     // BR X16
+        ] {
+            image[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let layout = ElfLayout {
+            entrypoint: 0,
+            program_header_offset: 0,
+            program_header_size: 0x38,
+            program_header_count: 1,
+            program_headers: vec![LoadSegment {
+                offset: 0x100,
+                virtual_address: 0x1000,
+                file_size: 0x30,
+                memory_size: 0x30,
+                flags: PF_R | 1,
+                alignment: 0x1000,
+            }],
+            section_headers: Vec::new(),
+            section_name_index: 0,
+            private_section_index: 0,
+        };
+        assert_eq!(
+            plt_call_features(&image, &layout, 0x2000).unwrap(),
+            PltCallFeatures {
+                calls: 2,
+                zero_arg1: 2,
+                w0_zero_branch: 2,
+                ..PltCallFeatures::default()
+            }
+        );
+        let original = image.clone();
+        for (offset, word) in [
+            (0x120, 0xb000_000f_u32), // ADRP uses a different register
+            (0x124, 0x9100_0610),     // veneer targets a different address
+            (0x128, 0xd63f_0200),     // BLR would overwrite LR
+            (0x128, 0xd61f_0220),     // BR uses a different register
+        ] {
+            image.copy_from_slice(&original);
+            image[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(plt_call_features(&image, &layout, 0x2000).unwrap().calls, 1);
+        }
+        assert!(aarch64_plt_veneer_target(&original[0x120..0x128], 0x1020).is_none());
+        image.copy_from_slice(&original);
+        for (offset, word) in [
+            (0x120, 0xb000_0011_u32),
+            (0x124, 0x9100_0231),
+            (0x128, 0xd61f_0220),
+        ] {
+            image[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(plt_call_features(&image, &layout, 0x2000).unwrap().calls, 2);
     }
 
     #[test]
