@@ -728,7 +728,7 @@ fn aarch64_writes_w1_immediate(instruction: u32) -> bool {
     )
 }
 
-fn aarch64_adrp_target(instruction: u32, pc: u64) -> Option<u64> {
+pub(super) fn aarch64_adrp_target(instruction: u32, pc: u64) -> Option<u64> {
     if instruction & 0x9f00_0000 != 0x9000_0000 {
         return None;
     }
@@ -926,7 +926,11 @@ struct ConstructorProfile {
     fini_addend: u64,
 }
 
-fn virtual_address_to_file_offset(layout: &ElfLayout, address: u64, size: u64) -> Option<usize> {
+pub(super) fn virtual_address_to_file_offset(
+    layout: &ElfLayout,
+    address: u64,
+    size: u64,
+) -> Option<usize> {
     let end = address.checked_add(size)?;
     for segment in &layout.program_headers {
         let segment_end = segment.virtual_address.checked_add(segment.file_size)?;
@@ -940,131 +944,91 @@ fn virtual_address_to_file_offset(layout: &ElfLayout, address: u64, size: u64) -
     None
 }
 
-fn discover_suppressed_constructors(
-    module: &[u8],
-    source: &[u8],
-    layout: &ElfLayout,
-    max_count: usize,
-) -> Result<Option<Vec<u64>>> {
-    const RECORD_SIZE: usize = 16;
-    const MIN_COUNT: usize = 2;
-    const MAX_COUNT: usize = 256;
-    let mut matches = Vec::new();
-    if module.len() < 8 {
-        return Ok(None);
-    }
-    for base in (0..=module.len() - 8).step_by(4) {
-        let count = read_u32(module, base)? as usize;
-        if !(MIN_COUNT..=MAX_COUNT.min(max_count)).contains(&count)
-            || read_u32(module, base + 4)? != 0
+// The bootstrap saves the incoming linker register frame, calls Stage 1,
+// restores that frame and returns. Validate this at the ELF init relocation;
+// e_entry may be zero for a shared library, so it cannot identify the slot.
+fn is_stage1_constructor(source: &[u8], layout: &ElfLayout, address: u64) -> bool {
+    let Some(offset) = virtual_address_to_file_offset(layout, address, 0x84) else {
+        return false;
+    };
+    for pair in 0..15_u32 {
+        let first = pair * 2 + 1;
+        let save = 0xa9bf_03e0 | ((first + 1) << 10) | first;
+        let restore = 0xa8c1_03e0 | ((first + 1) << 10) | first;
+        if read_u32(source, offset + pair as usize * 4).ok() != Some(save)
+            || read_u32(source, offset + 0x44 + (14 - pair) as usize * 4).ok() != Some(restore)
         {
-            continue;
-        }
-        let table_size = 8_usize
-            .checked_add(
-                count
-                    .checked_mul(RECORD_SIZE)
-                    .ok_or_else(|| Error::Invalid("constructor table size overflow".to_owned()))?,
-            )
-            .ok_or_else(|| Error::Invalid("constructor table size overflow".to_owned()))?;
-        if base
-            .checked_add(table_size)
-            .is_none_or(|end| end > module.len())
-        {
-            continue;
-        }
-        let mut constructors = Vec::with_capacity(count);
-        let mut valid = true;
-        for index in 0..count {
-            let record = base + 8 + index * RECORD_SIZE;
-            let constructor = u64::from(read_u32(module, record)?);
-            let fallback = u64::from(read_u32(module, record + 4)?);
-            let original = read_u32(module, record + 8)?;
-            let reserved = read_u32(module, record + 12)?;
-            let constructor_offset = virtual_address_to_file_offset(layout, constructor, 4);
-            let fallback_offset = virtual_address_to_file_offset(layout, fallback, 4);
-            if constructor == 0
-                || fallback == 0
-                || reserved != 0
-                || constructor_offset.and_then(|offset| read_u32(source, offset).ok())
-                    != Some(original)
-                || fallback_offset.and_then(|offset| read_u32(source, offset).ok())
-                    != Some(AARCH64_RET)
-            {
-                valid = false;
-                break;
-            }
-            constructors.push(constructor);
-        }
-        if valid
-            && constructors.windows(2).all(|pair| pair[0] < pair[1])
-            && constructors.iter().copied().collect::<HashSet<_>>().len() == count
-        {
-            matches.push(constructors);
+            return false;
         }
     }
-    match matches.len() {
-        1 => Ok(matches.pop()),
-        0 => Ok(None),
-        count => invalid(format!(
-            "constructor control module has {count} validated suppression tables"
-        )),
-    }
+    read_u32(source, offset + 0x3c).ok() == Some(0x9100_03e0)
+        && read_u32(source, offset + 0x40)
+            .ok()
+            .and_then(|instruction| aarch64_bl_target(instruction, address + 0x40))
+            .is_some_and(|target| super::constructors::executable_address(layout, target))
+        && read_u32(source, offset + 0x80).ok() == Some(AARCH64_RET)
 }
 
 fn constructor_profile(
-    module: &[u8],
+    module: (&[u8], u32),
     source: &[u8],
+    protected: &[u8],
     layout: &ElfLayout,
     init_array: SectionHeader,
     fini_array: SectionHeader,
     old_dyn: RelocationTable<'_>,
-) -> Result<Option<ConstructorProfile>> {
+) -> Result<ConstructorProfile> {
     if !init_array.size.is_multiple_of(8) {
         return invalid("init-array size is not entry-aligned");
     }
     let init_count = usize_from_u64(init_array.size / 8, "init-array count")?;
-    let Some(mut init_addends) =
-        discover_suppressed_constructors(module, source, layout, init_count)?
-    else {
-        return Ok(None);
-    };
-    let max_suppressed = *init_addends
-        .last()
-        .ok_or_else(|| Error::Invalid("constructor table is empty".to_owned()))?;
+    let callbacks = super::constructors::callbacks(module.0, module.1, source, layout, init_count)?;
     let init_end = init_array
         .address
         .checked_add(init_array.size)
         .ok_or_else(|| Error::Invalid("init-array range overflow".to_owned()))?;
-    let existing = old_dyn.collect_where(|relocation| {
+    let mut existing = old_dyn.collect_where(|relocation| {
         relocation.offset >= init_array.address && relocation.offset < init_end
     })?;
-    let extra = existing
-        .iter()
-        .filter(|relocation| {
-            relocation.kind() == R_AARCH64_RELATIVE
-                && relocation.symbol() == 0
-                && relocation.addend >= 0
-        })
-        .map(|relocation| relocation.addend as u64)
-        .filter(|&addend| {
-            addend != layout.entrypoint
-                && addend > max_suppressed
-                && addend <= max_suppressed.saturating_add(0x1000)
-        })
-        .collect::<Vec<_>>();
-    if extra.len() != 1 {
+    existing.sort_by_key(|relocation| relocation.offset);
+    if existing.len() != init_count {
+        return invalid("init-array does not have one relocation per slot");
+    }
+    let mut init_addends = Vec::new();
+    let mut bootstraps = 0;
+    for (slot, relocation) in existing.iter().enumerate() {
+        if relocation.offset != init_array.address + slot as u64 * 8
+            || relocation.kind() != R_AARCH64_RELATIVE
+            || relocation.symbol() != 0
+            || relocation.addend < 0
+        {
+            return invalid("init-array contains an invalid relocation");
+        }
+        let address = relocation.addend as u64;
+        if is_stage1_constructor(protected, layout, address) {
+            bootstraps += 1;
+            init_addends.extend_from_slice(&callbacks);
+        } else {
+            if !super::constructors::executable_address(layout, address) {
+                return invalid("init-array callback is outside executable segments");
+            }
+            let offset = virtual_address_to_file_offset(layout, address, 4).ok_or_else(|| {
+                Error::Invalid("init-array callback is not file-backed".to_owned())
+            })?;
+            // The linker still calls the unsuppressed entries after Stage 1
+            // returns. RET-only placeholders have no initialization effect.
+            if read_u32(source, offset)? != AARCH64_RET {
+                init_addends.push(address);
+            }
+        }
+    }
+    if bootstraps != 1 {
         return invalid(format!(
-            "expected one unsuppressed constructor near the suppression table, found {}",
-            extra.len()
+            "init-array has {bootstraps} validated Stage 1 callbacks"
         ));
     }
-    init_addends.push(extra[0]);
     if init_addends.len() > init_count {
-        return invalid(format!(
-            "constructor profile produced {} entries for {init_count} init slots",
-            init_addends.len()
-        ));
+        return invalid("restored constructors exceed the init-array capacity");
     }
     let fini = old_dyn.collect_where(|relocation| relocation.offset == fini_array.address)?;
     if fini.len() != 1
@@ -1074,10 +1038,10 @@ fn constructor_profile(
     {
         return invalid("fini-array relocation is not a single RELATIVE record");
     }
-    Ok(Some(ConstructorProfile {
+    Ok(ConstructorProfile {
         init_addends,
         fini_addend: fini[0].addend as u64,
-    }))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1628,7 +1592,7 @@ fn materialize_static_elf_tables(
     symbol_patch_data: &[u8],
     auxiliary_data: &[u8],
     auxiliary_symbol_seed: Option<u32>,
-    constructor_module: Option<&[u8]>,
+    constructor_module: Option<(&[u8], u32)>,
 ) -> Result<(ElfLayout, ElfMaterializationReport, u64)> {
     let names = layout.section_names(source)?;
     let indices = required_section_indices(&names)?;
@@ -1841,14 +1805,9 @@ fn materialize_static_elf_tables(
                 })?;
             let init_array = layout.section_headers[init_index];
             let fini_array = layout.section_headers[fini_index];
-            let profile =
-                constructor_profile(module, output, layout, init_array, fini_array, old_dyn)?
-                    .ok_or_else(|| {
-                        Error::Invalid(
-                            "constructor control module 0x98 has no validated constructor table"
-                                .to_owned(),
-                        )
-                    })?;
+            let profile = constructor_profile(
+                module, output, source, layout, init_array, fini_array, old_dyn,
+            )?;
             Some((profile, init_index, fini_index, init_array, fini_array))
         }
         None => None,
@@ -2421,7 +2380,17 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         .transpose()?;
     let constructor_module = artifacts
         .get(&0x98)
-        .map(|artifact| read_file(&artifact.path))
+        .map(|artifact| -> Result<_> {
+            let entry = artifact
+                .entry_offset
+                .filter(|entry| *entry != 0)
+                .ok_or_else(|| {
+                    Error::Invalid(
+                        "constructor module 0x98 lacks its descriptor entry offset".to_owned(),
+                    )
+                })?;
+            Ok((read_file(&artifact.path)?, entry))
+        })
         .transpose()?;
     let config = Module9bConfig::parse(&module)?;
 
@@ -2574,7 +2543,9 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
                 &symbol_patch_data,
                 &decoded,
                 auxiliary_symbol_seed,
-                constructor_module.as_deref(),
+                constructor_module
+                    .as_ref()
+                    .map(|(image, entry)| (image.as_slice(), *entry)),
             )?;
             restored_layout = new_layout;
             materialization = Some(report);
@@ -2933,6 +2904,134 @@ mod tests {
     }
 
     #[test]
+    fn constructor_profile_replaces_the_bootstrap_and_preserves_linker_order() {
+        let mut module = vec![0_u8; 0x100];
+        // Entry calls a selector that dispatches image + 0x400.
+        for (index, instruction) in [0x9400_0010_u32, 0xd65f_03c0].into_iter().enumerate() {
+            module[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        for (index, instruction) in [
+            0xd100_43ff_u32, // SUB SP, SP, #16
+            0xf900_03fe,     // STR LR, [SP]
+            0xf940_0413,     // LDR X19, [X0, #8]
+            0x5280_8000,     // MOV W0, #0x400
+            0x8b00_0260,     // ADD X0, X19, X0
+            0xd63f_0000,     // BLR X0
+            0x5280_0020,     // MOV W0, #1
+            0xf940_03fe,     // LDR LR, [SP]
+            0x9100_43ff,     // ADD SP, SP, #16
+            0xd65f_03c0,     // RET
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            module[0x40 + index * 4..0x44 + index * 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut protected = vec![0_u8; 0x8000];
+        for pair in 0..15_u32 {
+            let first = pair * 2 + 1;
+            for (offset, instruction) in [
+                (
+                    0x1000 + pair as usize * 4,
+                    0xa9bf_03e0 | ((first + 1) << 10) | first,
+                ),
+                (
+                    0x1044 + (14 - pair) as usize * 4,
+                    0xa8c1_03e0 | ((first + 1) << 10) | first,
+                ),
+            ] {
+                protected[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+            }
+        }
+        for (offset, instruction) in [
+            (0x103c, 0x9100_03e0_u32),
+            (0x1040, 0x9400_0070),
+            (0x1080, AARCH64_RET),
+        ] {
+            protected[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut restored = protected.clone();
+        restored[0x1000..0x1084].fill(0);
+        restored[0x2000..0x2004].copy_from_slice(&AARCH64_RET.to_le_bytes());
+        restored[0x6000..0x6004].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        let layout = ElfLayout {
+            entrypoint: 0,
+            program_header_offset: 0,
+            program_header_size: 0x38,
+            program_header_count: 1,
+            program_headers: vec![LoadSegment {
+                offset: 0,
+                virtual_address: 0,
+                file_size: 0x8000,
+                memory_size: 0x8000,
+                flags: PF_R | 1,
+                alignment: 0x1000,
+            }],
+            section_headers: Vec::new(),
+            section_name_index: 0,
+            private_section_index: 0,
+        };
+        let init = SectionHeader {
+            name: 0,
+            section_type: 14,
+            flags: 3,
+            address: 0x7000,
+            offset: 0x7000,
+            size: 24,
+            link: 0,
+            info: 0,
+            alignment: 8,
+            entry_size: 8,
+        };
+        let fini = SectionHeader {
+            address: 0x7100,
+            offset: 0x7100,
+            size: 8,
+            ..init
+        };
+        for (original, expected) in [
+            ([0x1000, 0x6000, 0x2000], vec![0x400, 0x6000]),
+            ([0x6000, 0x1000, 0x2000], vec![0x6000, 0x400]),
+        ] {
+            let mut data = Vec::new();
+            for (slot, addend) in original.into_iter().enumerate() {
+                Rela {
+                    offset: 0x7000 + slot as u64 * 8,
+                    info: u64::from(R_AARCH64_RELATIVE),
+                    addend,
+                }
+                .encode(&mut data);
+            }
+            Rela {
+                offset: 0x7100,
+                info: u64::from(R_AARCH64_RELATIVE),
+                addend: 0x500,
+            }
+            .encode(&mut data);
+            let table = RelocationTable {
+                data: &data,
+                offset: 0,
+                count: 4,
+                remap: None,
+            };
+            let profile = constructor_profile(
+                (&module, 0),
+                &restored,
+                &protected,
+                &layout,
+                init,
+                fini,
+                table,
+            )
+            .unwrap();
+            assert_eq!(profile.init_addends, expected);
+            assert_eq!(profile.fini_addend, 0x500);
+        }
+        protected[0x1000] ^= 1;
+        assert!(!is_stage1_constructor(&protected, &layout, 0x1000));
+    }
+
+    #[test]
     fn classifies_special_plt_slots_from_call_shapes() {
         let candidates = [
             (
@@ -2985,48 +3084,5 @@ mod tests {
                 (283, "strchr"),
             ]
         );
-    }
-
-    #[test]
-    fn discovers_validated_constructor_table() {
-        const COUNT: usize = 43;
-        let mut source = vec![0_u8; 0x1000];
-        let mut module = vec![0_u8; 0x1000];
-        let table = 0x40;
-        module[table..table + 4].copy_from_slice(&(COUNT as u32).to_le_bytes());
-        for index in 0..COUNT {
-            let constructor = 0x100 + index * 4;
-            let fallback = 0x500 + index * 4;
-            let instruction = 0xa000_0000_u32 + index as u32;
-            source[constructor..constructor + 4].copy_from_slice(&instruction.to_le_bytes());
-            source[fallback..fallback + 4].copy_from_slice(&AARCH64_RET.to_le_bytes());
-            let record = table + 8 + index * 16;
-            module[record..record + 4].copy_from_slice(&(constructor as u32).to_le_bytes());
-            module[record + 4..record + 8].copy_from_slice(&(fallback as u32).to_le_bytes());
-            module[record + 8..record + 12].copy_from_slice(&instruction.to_le_bytes());
-        }
-        let layout = ElfLayout {
-            entrypoint: 0,
-            program_header_offset: 0,
-            program_header_size: 0x38,
-            program_header_count: 1,
-            program_headers: vec![LoadSegment {
-                offset: 0,
-                virtual_address: 0,
-                file_size: source.len() as u64,
-                memory_size: source.len() as u64,
-                flags: PF_R,
-                alignment: 0x1000,
-            }],
-            section_headers: Vec::new(),
-            section_name_index: 0,
-            private_section_index: 0,
-        };
-        let constructors = discover_suppressed_constructors(&module, &source, &layout, COUNT)
-            .expect("constructor table")
-            .expect("validated constructor table");
-        assert_eq!(constructors.len(), COUNT);
-        assert_eq!(constructors[0], 0x100);
-        assert_eq!(constructors[COUNT - 1], 0x100 + ((COUNT - 1) * 4) as u64);
     }
 }

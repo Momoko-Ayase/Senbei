@@ -16,6 +16,7 @@ fn wanted_id(command_id: u32) -> bool {
 pub(crate) struct Artifact {
     pub path: PathBuf,
     pub size: u64,
+    pub entry_offset: Option<u32>,
 }
 
 pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact>> {
@@ -47,6 +48,10 @@ pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact
                 Artifact {
                     path: root.join(path),
                     size,
+                    entry_offset: item
+                        .get("entry_offset")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok()),
                 },
             );
         }
@@ -79,6 +84,10 @@ pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact
                     Artifact {
                         path: root.join(path),
                         size,
+                        entry_offset: record
+                            .get("entry_offset")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok()),
                     },
                 );
             }
