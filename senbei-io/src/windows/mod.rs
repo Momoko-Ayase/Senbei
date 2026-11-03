@@ -4,6 +4,9 @@ use senbei_engine as unpacker;
 use std::path::Path;
 
 use crate::atomic::write_atomic;
+use anyhow::Context;
+
+mod companion;
 
 pub(crate) fn is_pe_extension(path: &Path) -> bool {
     path.extension()
@@ -57,9 +60,10 @@ const HEADER_OFF: usize = 4096;
 ///
 /// The splice fires only when a sibling `<input>._` exists *and* its first 32
 /// bytes equal the stub's header at offset 4096 — a precise signal that the
-/// companion is this stub's payload. Otherwise the file is returned untouched,
-/// so normal (embedded-payload) inputs are unaffected.
-pub(crate) fn read_unpacker_input(input: &Path) -> std::io::Result<UnpackerInput> {
+/// companion is this stub's payload. A recognized external-file declaration
+/// without a matching payload reports a companion error. Other inputs are
+/// returned untouched, so normal (embedded-payload) inputs are unaffected.
+pub(crate) fn read_unpacker_input(input: &Path) -> anyhow::Result<UnpackerInput> {
     let stub = std::fs::read(input)?;
 
     // Companion path: append "._" to the full file name (Foo.dll -> Foo.dll._).
@@ -76,14 +80,17 @@ pub(crate) fn read_unpacker_input(input: &Path) -> std::io::Result<UnpackerInput
             });
         }
     };
-    if !companion.is_file() {
-        return Ok(UnpackerInput {
-            bytes: stub,
-            stub: None,
-        });
-    }
-    let comp = std::fs::read(&companion)?;
-    match splice_companion(&stub, &comp) {
+    let comp = match std::fs::read(&companion) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("couldn't read companion {}", companion.display()));
+        }
+    };
+    match companion::prepare_companion(&stub, comp.as_deref())
+        .with_context(|| format!("companion {}", companion.display()))?
+    {
         // A splice fired: keep the stub so its plaintext export table can be
         // overlaid onto the unpacked image (the companion does not carry it).
         Some(spliced) => Ok(UnpackerInput {
@@ -499,7 +506,7 @@ fn unpack_bytes_impl(
     companion: Option<&[u8]>,
     force_exe: bool,
 ) -> Result<UnpackedImage, unpacker::UnpackError> {
-    let spliced = companion.and_then(|c| splice_companion(input, c));
+    let spliced = companion::prepare_companion(input, companion)?;
     let bytes: &[u8] = spliced.as_deref().unwrap_or(input);
     let (kind, mut out) = unpack_spliced_or_auto(bytes, spliced.is_some(), force_exe, false)?;
     if spliced.is_some() {

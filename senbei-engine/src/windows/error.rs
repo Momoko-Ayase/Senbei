@@ -91,6 +91,16 @@ impl std::fmt::Display for DescriptorTable {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum UnpackError {
+    #[error(
+        "Companion missing? This loader expects a matching <input>._ payload. Keep it beside the input file (or add both files in the browser) and try again."
+    )]
+    CompanionMissing,
+
+    #[error(
+        "Companion doesn't match: the supplied ._ payload is too short or its header differs from the loader's. Use the companion from the same build; either file may be damaged."
+    )]
+    CompanionMismatch,
+
     #[error("input too short (need at least {required} bytes, got {actual})")]
     InputTooShort { actual: usize, required: usize },
 
