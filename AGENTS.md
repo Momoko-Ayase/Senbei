@@ -28,7 +28,7 @@ The format crates and PE engine remain free of filesystem I/O. Native Android ex
 
 ## Hard Rules
 
-- Outputs must be byte-identical to the available golden corpus.
+- Outputs must be byte-identical to the available golden corpus. (Unless a change that's designed to break the golden corpus, in which case it must have a runtime test to check if it still runnable.)
 - Layout heuristics must trial and validate every candidate before accepting it.
 - Deterministic parallel and sequential paths must produce identical bytes.
 - Folder scanning must not open bulk assets. Windows candidates are `.exe`, `.dll`, and `global-metadata.dat`; Android candidates are `.so` and `global-metadata.dat`. Matching `.exe._` and `.dll._` files are auxiliary payloads and are not counted as skipped targets.
