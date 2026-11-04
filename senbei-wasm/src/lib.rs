@@ -130,10 +130,7 @@ pub fn detect(input: &[u8]) -> Option<String> {
 /// is none). Throws a string error when the input is not a supported
 /// Crackproof file or is corrupt.
 #[wasm_bindgen]
-pub fn unpack_file(
-    input: &[u8],
-    companion: Option<Vec<u8>>,
-) -> Result<UnpackResult, JsError> {
+pub fn unpack_file(input: &[u8], companion: Option<Vec<u8>>) -> Result<UnpackResult, JsError> {
     let r = senbei_io::job::unpack_bytes(input, companion.as_deref())
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(UnpackResult {

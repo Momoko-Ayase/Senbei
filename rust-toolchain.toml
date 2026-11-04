@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 # CI invokes rustfmt/clippy through the rustup shim with no setup action, so
 # the pinned toolchain must declare its components here — the runner images
 # only preinstall them for their default toolchain.
