@@ -10,6 +10,7 @@ fn main() -> std::process::ExitCode {
     let mut no_log = false;
     let mut verbose = false;
     let mut scan_all = false;
+    let mut strict_integrity = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -26,6 +27,7 @@ fn main() -> std::process::ExitCode {
             "--no-pause" => no_pause = true,
             "--no-log" => no_log = true,
             "--scan-all" => scan_all = true,
+            "--strict-integrity" => strict_integrity = true,
             "--out" => match args.next() {
                 Some(v) if !v.starts_with('-') => out = Some(v),
                 _ => {
@@ -77,7 +79,7 @@ fn main() -> std::process::ExitCode {
                         println!("{}", summary.line());
                         println!("done in {} ms", summary.duration_ms);
                     }
-                    if summary.errors > 0 { 1 } else { 0 }
+                    exit_code(&summary, strict_integrity)
                 }
                 Err(error) => {
                     if quiet < 2 {
@@ -93,9 +95,22 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code as u8)
 }
 
+/// Process status for a finished run.
+///
+/// Suspect outputs are still written. By default a suspect file is a warning
+/// and the process stays successful; strict mode treats it like an error so a
+/// caller can fail the run. An error fails the run either way.
+fn exit_code(summary: &job::Summary, strict_integrity: bool) -> u8 {
+    if summary.errors > 0 || (strict_integrity && summary.suspect > 0) {
+        1
+    } else {
+        0
+    }
+}
+
 fn print_help() {
     println!(
-        "senbei <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--scan-all] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
+        "senbei <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--scan-all] [--strict-integrity] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
     );
     println!(
         "  input        a Crackproof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
@@ -107,4 +122,53 @@ fn print_help() {
         "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\
          \x20              size floor; other filenames remain excluded."
     );
+    println!(
+        "  --strict-integrity\n\
+         \x20              exit non-zero when any output fails the static integrity\n\
+         \x20              check (a suspect) or a file errors. Off by default: a\n\
+         \x20              suspect is still written and the process exits 0 unless\n\
+         \x20              a file errors. Quiet levels are unchanged."
+    );
+}
+
+#[cfg(test)]
+mod strict_integrity {
+    use super::exit_code;
+    use senbei_io::job::Summary;
+
+    fn summary(errors: usize, suspect: usize) -> Summary {
+        Summary {
+            errors,
+            suspect,
+            ..Summary::default()
+        }
+    }
+
+    #[test]
+    fn clean_run_exits_0_in_both_modes() {
+        let summary = summary(0, 0);
+        assert_eq!(exit_code(&summary, false), 0);
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn errors_exit_1_whether_or_not_strict() {
+        let summary = summary(2, 0);
+        assert_eq!(exit_code(&summary, false), 1);
+        assert_eq!(exit_code(&summary, true), 1);
+    }
+
+    #[test]
+    fn suspect_exits_0_by_default_and_1_when_strict() {
+        let summary = summary(0, 1);
+        assert_eq!(exit_code(&summary, false), 0);
+        assert_eq!(exit_code(&summary, true), 1);
+    }
+
+    #[test]
+    fn errors_with_suspects_exit_1_in_both_modes() {
+        let summary = summary(1, 3);
+        assert_eq!(exit_code(&summary, false), 1);
+        assert_eq!(exit_code(&summary, true), 1);
+    }
 }
