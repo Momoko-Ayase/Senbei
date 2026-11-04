@@ -38,6 +38,7 @@ pub(crate) fn inspect(
     path: &Path,
     outer_size: usize,
     cipher_constant: u32,
+    max_payload_bytes: Option<u64>,
 ) -> Result<Stage1Result> {
     let elf = parse(data).map_err(|source: ElfError| Error::Elf {
         path: path.to_path_buf(),
@@ -133,6 +134,15 @@ pub(crate) fn inspect(
             "Stage 1 payload size must be nonzero and word aligned: 0x{payload_size:x}"
         ));
     }
+    if let Some(limit) = max_payload_bytes {
+        let declared = u64::try_from(payload_size)
+            .map_err(|_| Error::Invalid("Stage 1 payload size exceeds u64".to_owned()))?;
+        crate::android::ResourceLimits {
+            max_entry_bytes: limit,
+            ..crate::android::ResourceLimits::default()
+        }
+        .check_entry_bytes(declared)?;
+    }
     let entry_offset = usize::try_from(header.entry_offset)
         .map_err(|_| Error::Invalid("Stage 1 entry offset exceeds usize".to_owned()))?;
     if entry_offset >= payload_size {
@@ -190,7 +200,11 @@ fn decrypt_words(ciphertext: &[u8], key: u32, constant: u32) -> Result<Vec<u8>> 
     if !ciphertext.len().is_multiple_of(4) {
         return invalid("Stage 1 word cipher input is not 4-byte aligned");
     }
-    let mut plaintext = ciphertext.to_vec();
+    let mut plaintext = Vec::new();
+    plaintext
+        .try_reserve_exact(ciphertext.len())
+        .map_err(|_| Error::Invalid("Stage 1 plaintext reservation failed".to_owned()))?;
+    plaintext.extend_from_slice(ciphertext);
     for (index, chunk) in plaintext.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let index = u32::try_from(index)
             .map_err(|_| Error::Invalid("Stage 1 word index exceeds u32".to_owned()))?;

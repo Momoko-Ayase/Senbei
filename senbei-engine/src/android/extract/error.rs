@@ -44,6 +44,8 @@ pub enum Error {
     },
     #[error("{0}")]
     Invalid(String),
+    #[error(transparent)]
+    Limit(#[from] crate::android::LimitExceeded),
 }
 
 impl Error {

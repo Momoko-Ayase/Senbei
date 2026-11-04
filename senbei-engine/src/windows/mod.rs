@@ -52,7 +52,7 @@ where
                 line: details.line,
                 column: details.column,
             })
-        },
+        }
     }
 }
 
@@ -215,12 +215,12 @@ where
 {
     match validate_dll_layout(dll_layout()) {
         Ok(output) => Ok(output),
-        Err(dll) => validate_dll_layout(exe_layout()).map_err(|exe| {
-            UnpackError::PipelineFallbackFailed {
+        Err(dll) => {
+            validate_dll_layout(exe_layout()).map_err(|exe| UnpackError::PipelineFallbackFailed {
                 dll: Box::new(dll),
                 exe: Box::new(exe),
-            }
-        }),
+            })
+        }
     }
 }
 
@@ -228,7 +228,9 @@ fn validate_dll_layout(output: Result<Vec<u8>, UnpackError>) -> Result<Vec<u8>, 
     let output = output?;
     if let Some(report) = dll_layout_invalid(&output) {
         return Err(UnpackError::InvalidLayoutCandidate {
-            issues: report.findings.into_iter()
+            issues: report
+                .findings
+                .into_iter()
                 .filter(|finding| finding.severity == integrity::IntegritySeverity::Fatal)
                 .map(|finding| finding.message)
                 .collect(),

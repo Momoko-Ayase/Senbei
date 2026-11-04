@@ -18,6 +18,8 @@ pub enum Error {
     Elf(#[from] senbei_elf::Error),
     #[error("{0}")]
     Invalid(String),
+    #[error(transparent)]
+    Limit(#[from] crate::android::LimitExceeded),
 }
 
 impl Error {

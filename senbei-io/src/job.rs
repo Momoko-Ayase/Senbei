@@ -96,6 +96,27 @@ pub fn run_folder_opts(
     no_log: bool,
     scan_all: bool,
 ) -> anyhow::Result<Summary> {
+    run_folder_with_limits(
+        root,
+        out_dir,
+        quiet,
+        verbose,
+        no_log,
+        scan_all,
+        &senbei_engine::android::ResourceLimits::default(),
+    )
+}
+
+/// Folder mode with explicit Android archive and decoder ceilings.
+pub fn run_folder_with_limits(
+    root: &Path,
+    out_dir: Option<&Path>,
+    quiet: u8,
+    verbose: bool,
+    no_log: bool,
+    scan_all: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+) -> anyhow::Result<Summary> {
     let t0 = std::time::Instant::now();
     let out_root = out_dir
         .map(Path::to_path_buf)
@@ -119,7 +140,7 @@ pub fn run_folder_opts(
     // [`crate::scan::find_targets_opts`]). Files the free directory metadata
     // already rules out are never opened — on asset-heavy trees the per-file
     // open+read latency, not the traversal, is the whole cost.
-    let scan = crate::scan::find_targets_opts(root, scan_all);
+    let scan = crate::scan::find_targets_with_limits(root, scan_all, limits);
     let candidates = scan.crackproof.as_slice();
     let metas = scan.metadata.as_slice();
     let scan_stats = &scan.stats;
@@ -218,7 +239,7 @@ pub fn run_folder_opts(
     // Module 0x0C stays inside the application that produced it: an extracted
     // `lib/<abi>/` tree shares with that tree's `assets/` metadata only, and a
     // package shares only with splits of the same package name and version.
-    let mut android_cache = crate::android::run_cache();
+    let mut android_cache = crate::android::run_cache_with_limits(limits);
     let loose = crate::android::loose_scopes(&scan.android_so, metas);
     for scoped in loose.iter().filter(|scoped| {
         scan.android_so
@@ -311,7 +332,8 @@ pub fn run_folder_opts(
     // set. Their libraries run before their metadata because each package
     // restores its own libraries first and the shared cache collects modules
     // across the group. Bundles stay one package each.
-    let package_groups = crate::android::loose_apk_groups(&scan.android_packages);
+    let package_groups =
+        crate::android::loose_apk_groups_cached(&scan.android_packages, &mut android_cache);
     for group in &package_groups {
         if group.len() > 1 {
             s.packages += group.len();
@@ -515,6 +537,25 @@ pub fn run_file_v(
     verbose: bool,
     no_log: bool,
 ) -> anyhow::Result<Summary> {
+    run_file_with_limits(
+        input,
+        out_dir,
+        quiet,
+        verbose,
+        no_log,
+        &senbei_engine::android::ResourceLimits::default(),
+    )
+}
+
+/// Single-file mode with explicit Android archive and decoder ceilings.
+pub fn run_file_with_limits(
+    input: &Path,
+    out_dir: Option<&Path>,
+    quiet: u8,
+    verbose: bool,
+    no_log: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+) -> anyhow::Result<Summary> {
     let t0 = std::time::Instant::now();
     let out_root = out_dir
         .map(Path::to_path_buf)
@@ -556,8 +597,8 @@ pub fn run_file_v(
     // library probe needs the whole file (its payload section is found through
     // the section-header table at the end), while a package is a container
     // handled entry-by-entry. Anything else falls through to the PE pipeline.
-    let is_android_so =
-        crate::android::is_elf64_aarch64(&prefix) && crate::android::is_protected_so_file(input);
+    let is_android_so = crate::android::is_elf64_aarch64(&prefix)
+        && crate::android::probe_so_file_with_limits(input, limits).unwrap_or(true);
     let is_android_package = !is_android_so && crate::android::is_app_package(input, &prefix);
 
     if is_meta {
@@ -603,7 +644,12 @@ pub fn run_file_v(
             }
         }
     } else if is_android_so {
-        match crate::android::restore_so_file(input, &dest, verbose && quiet == 0) {
+        match crate::android::restore_so_file_with_limits(
+            input,
+            &dest,
+            verbose && quiet == 0,
+            limits,
+        ) {
             Ok(embedded) => {
                 s.unpacked = 1;
                 if let Some(log) = &log {
@@ -652,12 +698,13 @@ pub fn run_file_v(
         s.packages = 1;
         let rel = PathBuf::from(input.file_name().unwrap_or_default());
         let mut seen = std::collections::HashSet::new();
-        match crate::android::restore_package(
+        match crate::android::restore_package_with_limits(
             input,
             &rel,
             &out_root,
             &mut seen,
             verbose && quiet == 0,
+            limits,
         ) {
             Ok(outcomes) => {
                 let bar = crate::ui::progress(0, true);

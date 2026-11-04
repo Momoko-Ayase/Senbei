@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 use super::super::common;
 use super::artifact::load_artifacts;
 use super::error::{Error, Result, invalid};
+use crate::android::{ByteBudget, ResourceLimits};
 use senbei_elf::{
     DT_GNU_HASH, DT_HASH, DT_JMPREL, DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELASZ, DT_STRSZ,
     DT_STRTAB, DT_SYMTAB, DT_VERNEED, DT_VERSYM, ELF64_RELA_SIZE, ELF64_SYMBOL_SIZE, ElfLayout,
@@ -169,8 +170,68 @@ fn map_mut(file: &File, length: usize, path: &Path) -> Result<MmapMut> {
         .map_err(|error| Error::io("map temporary output", path, error))
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|error| Error::io("read", path, error))
+/// Reserve the flat auxiliary image.
+///
+/// `output_size` is the size declared by the auxiliary container header. It
+/// is charged and rejected before `try_reserve_exact`, so an over-limit size
+/// never becomes an allocation.
+fn allocate_auxiliary(
+    output_size: u32,
+    limits: &ResourceLimits,
+    bytes: &mut ByteBudget,
+) -> Result<Vec<u8>> {
+    let declared = u64::from(output_size);
+    limits.check_entry_bytes(declared)?;
+    // The auxiliary image is retained for the rest of the task, so it counts
+    // against the task total as well as the single-entry ceiling. The task
+    // total is also the cap for the restored output file below.
+    bytes.charge(declared)?;
+    let auxiliary_size = output_size as usize;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(auxiliary_size)
+        .map_err(|_| Error::Invalid("auxiliary output reservation failed".to_owned()))?;
+    decoded.resize(auxiliary_size, 0);
+    Ok(decoded)
+}
+
+/// Reject one scratch reservation against the single-entry ceiling.
+fn reserve_within(limits: &ResourceLimits, bytes: usize) -> Result<()> {
+    let declared = u64::try_from(bytes)
+        .map_err(|_| Error::Invalid("scratch reservation exceeds u64".to_owned()))?;
+    limits.check_entry_bytes(declared)?;
+    Ok(())
+}
+
+fn read_artifact(path: &Path, limits: &ResourceLimits, bytes: &mut ByteBudget) -> Result<Vec<u8>> {
+    let data = read_file_limited(path, limits, bytes)?;
+    Ok(data)
+}
+
+fn read_file_limited(
+    path: &Path,
+    limits: &ResourceLimits,
+    bytes: &mut ByteBudget,
+) -> Result<Vec<u8>> {
+    let mut file = File::open(path).map_err(|error| Error::io("read", path, error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| Error::io("inspect", path, error))?
+        .len();
+    // Charge the length the open file reports before reserving it. This is
+    // the file's own metadata, not a directory lookup that can be swapped
+    // before the open.
+    limits.check_entry_bytes(length)?;
+    bytes.charge(length)?;
+    let capacity = usize::try_from(length)
+        .map_err(|_| Error::Invalid("artifact length exceeds usize".to_owned()))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(capacity)
+        .map_err(|_| Error::Invalid("artifact reservation failed".to_owned()))?;
+    data.resize(capacity, 0);
+    file.read_exact(&mut data)
+        .map_err(|error| Error::io("read", path, error))?;
+    Ok(data)
 }
 
 fn sha256_bytes(data: &[u8]) -> String {
@@ -214,8 +275,9 @@ struct FileLayoutWriter<'a> {
 }
 
 impl FileLayoutWriter<'_> {
-    fn write(&mut self, virtual_address: u64, data: &[u8]) -> Result<usize> {
-        let data_len = u64::try_from(data.len())
+    /// Reject a declared write before its bytes have been decompressed.
+    fn validate(&self, virtual_address: u64, length: usize) -> Result<()> {
+        let data_len = u64::try_from(length)
             .map_err(|_| Error::Invalid("decoded write length exceeds u64".to_owned()))?;
         let end = virtual_address
             .checked_add(data_len)
@@ -225,6 +287,16 @@ impl FileLayoutWriter<'_> {
                 "decoded write 0x{virtual_address:x}..0x{end:x} exceeds target load image"
             ));
         }
+        Ok(())
+    }
+
+    fn write(&mut self, virtual_address: u64, data: &[u8]) -> Result<usize> {
+        self.validate(virtual_address, data.len())?;
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| Error::Invalid("decoded write length exceeds u64".to_owned()))?;
+        let end = virtual_address
+            .checked_add(data_len)
+            .ok_or_else(|| Error::Invalid("decoded write range overflow".to_owned()))?;
         let mut written = 0_u64;
         let mut covered_memory = 0_u64;
         for segment in &self.layout.program_headers {
@@ -275,21 +347,31 @@ impl FileLayoutWriter<'_> {
     }
 }
 
-fn decode_container<F>(
+struct DecodeContext<'a, V> {
+    limits: &'a ResourceLimits,
+    bytes: &'a mut ByteBudget,
+    records: &'a mut crate::android::EntryBudget,
+    validate: V,
+}
+
+fn decode_container<F, V>(
     payload: &[u8],
     header: &ContainerHeader,
     config: &Module9bConfig,
     verbose: bool,
+    context: &mut DecodeContext<'_, V>,
     mut writer: F,
 ) -> Result<DecodeStatistics>
 where
     F: FnMut(u64, &[u8]) -> Result<usize>,
+    V: FnMut(u64, usize) -> Result<()>,
 {
     let decoder = HuffmanLzDecoder::new(&header.tree)?;
     let mut statistics = DecodeStatistics {
         segments: header.segments.len(),
         ..DecodeStatistics::default()
     };
+    context.records.charge(header.segments.len())?;
     let decrypt_aes = !(config.skip_aes || header.skip_aes);
     for (segment_index, encoded) in header.segments.iter().enumerate() {
         let start = checked_add(
@@ -298,6 +380,7 @@ where
             "encoded segment start",
         )?;
         let encoded_data = slice(payload, start, encoded.size as usize)?;
+        context.limits.check_entry_bytes(u64::from(encoded.size))?;
         let transformed = transform_segment(
             encoded_data,
             config.container_seed,
@@ -325,6 +408,7 @@ where
                 "decoded segment {segment_index} has invalid writer offsets"
             ));
         }
+        context.records.charge(writer_count)?;
         let mut data_cursor = data_offset;
         for writer_index in 0..writer_count {
             let record = table_offset + writer_index * 16;
@@ -341,16 +425,32 @@ where
                 ));
             }
             let source = &transformed[data_cursor..encoded_end];
+            let encoded_bytes = u64::try_from(encoded_size)
+                .map_err(|_| Error::Invalid("writer source length exceeds u64".to_owned()))?;
+            let decoded_bytes = u64::try_from(output_size)
+                .map_err(|_| Error::Invalid("writer output length exceeds u64".to_owned()))?;
+            // The compressed source and the declared destination are both
+            // rejected before Huffman decoding reserves the output buffer.
+            // Only a writer that actually decompresses retains a new buffer,
+            // so only that length is charged to the task total.
+            context.limits.check_entry_bytes(encoded_bytes)?;
+            context.limits.check_entry_bytes(decoded_bytes)?;
+            let target = base_offset
+                .checked_add(output_offset)
+                .ok_or_else(|| Error::Invalid("writer target address overflow".to_owned()))?;
+            // The destination is checked against the real output before a
+            // compressed writer reserves its buffer. An in-range declared
+            // length that still falls past the image is a bounds error, not
+            // a decoder error.
+            (context.validate)(target, output_size)?;
             let decoded = if encoded_size == output_size {
                 None
             } else {
                 statistics.compressed_writers += 1;
+                context.bytes.charge(decoded_bytes)?;
                 Some(decoder.decode(source, output_size)?)
             };
             let decoded_slice = decoded.as_deref().unwrap_or(source);
-            let target = base_offset
-                .checked_add(output_offset)
-                .ok_or_else(|| Error::Invalid("writer target address overflow".to_owned()))?;
             statistics.file_bytes_written += writer(target, decoded_slice)? as u64;
             statistics.writers += 1;
             statistics.encoded_bytes += encoded_size as u64;
@@ -1585,14 +1685,19 @@ fn table_end(tables: &[TablePayload], start: u64) -> Result<u64> {
     table_placements(tables, start).map(|(_, end)| end)
 }
 
+struct MaterializeInput<'a> {
+    auxiliary_symbol_seed: Option<u32>,
+    constructor_module: Option<(&'a [u8], u32)>,
+    limits: &'a ResourceLimits,
+}
+
 fn materialize_static_elf_tables(
     output: &mut [u8],
     source: &[u8],
     layout: &ElfLayout,
     symbol_patch_data: &[u8],
     auxiliary_data: &[u8],
-    auxiliary_symbol_seed: Option<u32>,
-    constructor_module: Option<(&[u8], u32)>,
+    input: MaterializeInput<'_>,
 ) -> Result<(ElfLayout, ElfMaterializationReport, u64)> {
     let names = layout.section_names(source)?;
     let indices = required_section_indices(&names)?;
@@ -1651,7 +1756,14 @@ fn materialize_static_elf_tables(
             Error::Invalid("auxiliary symbol table has no null entry".to_owned())
         })?)
         .map_err(|_| Error::Invalid("auxiliary symbol count exceeds usize".to_owned()))?;
-    let mut appended_symbols = Vec::with_capacity(auxiliary_appended_count * ELF64_SYMBOL_SIZE);
+    let appended_symbol_bytes = auxiliary_appended_count
+        .checked_mul(ELF64_SYMBOL_SIZE)
+        .ok_or_else(|| Error::Invalid("appended symbol reservation overflow".to_owned()))?;
+    reserve_within(input.limits, appended_symbol_bytes)?;
+    let mut appended_symbols = Vec::new();
+    appended_symbols
+        .try_reserve_exact(appended_symbol_bytes)
+        .map_err(|_| Error::Invalid("appended symbol reservation failed".to_owned()))?;
     for index in 1..auxiliary.dynsym_count as usize {
         let offset = auxiliary.dynsym_offset as usize + index * ELF64_SYMBOL_SIZE;
         let symbol = slice(auxiliary_data, offset, ELF64_SYMBOL_SIZE)?;
@@ -1670,10 +1782,27 @@ fn materialize_static_elf_tables(
         appended_symbols.extend_from_slice(&merged_name_offset.to_le_bytes());
         appended_symbols.extend_from_slice(&symbol[4..]);
     }
-    let mut merged_symbols = Vec::with_capacity(old_symbols.len() + appended_symbols.len());
+    let merged_symbol_bytes = old_symbols
+        .len()
+        .checked_add(appended_symbols.len())
+        .ok_or_else(|| Error::Invalid("merged symbol reservation overflow".to_owned()))?;
+    reserve_within(input.limits, merged_symbol_bytes)?;
+    let mut merged_symbols = Vec::new();
+    merged_symbols
+        .try_reserve_exact(merged_symbol_bytes)
+        .map_err(|_| Error::Invalid("merged symbol reservation failed".to_owned()))?;
     merged_symbols.extend_from_slice(&old_symbols);
     merged_symbols.extend_from_slice(&appended_symbols);
-    let mut merged_strings = Vec::with_capacity(old_strings.len() + auxiliary_strings.len() + 64);
+    let merged_string_bytes = old_strings
+        .len()
+        .checked_add(auxiliary_strings.len())
+        .and_then(|len| len.checked_add(64))
+        .ok_or_else(|| Error::Invalid("merged string reservation overflow".to_owned()))?;
+    reserve_within(input.limits, merged_string_bytes)?;
+    let mut merged_strings = Vec::new();
+    merged_strings
+        .try_reserve_exact(merged_string_bytes)
+        .map_err(|_| Error::Invalid("merged string reservation failed".to_owned()))?;
     merged_strings.extend_from_slice(&old_strings);
     merged_strings.extend_from_slice(auxiliary_strings);
     let mut merged_versions =
@@ -1708,7 +1837,7 @@ fn materialize_static_elf_tables(
         remap: Some(RelocationRemap {
             base_symbol_count: old_symbol_count,
             auxiliary_symbol_count: auxiliary.dynsym_count,
-            permutation_seed: auxiliary_symbol_seed,
+            permutation_seed: input.auxiliary_symbol_seed,
         }),
     };
     let auxiliary2 = RelocationTable {
@@ -1718,7 +1847,7 @@ fn materialize_static_elf_tables(
         remap: Some(RelocationRemap {
             base_symbol_count: old_symbol_count,
             auxiliary_symbol_count: auxiliary.dynsym_count,
-            permutation_seed: auxiliary_symbol_seed,
+            permutation_seed: input.auxiliary_symbol_seed,
         }),
     };
     old_dyn.validate(
@@ -1783,7 +1912,7 @@ fn materialize_static_elf_tables(
     let new_symbol_count = merged_names.len();
     let new_dynstr_size = merged_strings.len();
 
-    let constructors = match constructor_module {
+    let constructors = match input.constructor_module {
         Some(module) => {
             let init_index = names
                 .iter()
@@ -1951,11 +2080,27 @@ fn materialize_static_elf_tables(
             .map_err(|_| Error::Invalid("fini RVA exceeds i64".to_owned()))?;
     }
 
-    let mut merged_rela_dyn = Vec::with_capacity(dyn_relocations.len() * ELF64_RELA_SIZE);
+    let rela_dyn_bytes = dyn_relocations
+        .len()
+        .checked_mul(ELF64_RELA_SIZE)
+        .ok_or_else(|| Error::Invalid("merged relocation reservation overflow".to_owned()))?;
+    reserve_within(input.limits, rela_dyn_bytes)?;
+    let mut merged_rela_dyn = Vec::new();
+    merged_rela_dyn
+        .try_reserve_exact(rela_dyn_bytes)
+        .map_err(|_| Error::Invalid("merged relocation reservation failed".to_owned()))?;
     for relocation in dyn_relocations {
         relocation.encode(&mut merged_rela_dyn);
     }
-    let mut merged_rela_plt = Vec::with_capacity(plt_relocations.len() * ELF64_RELA_SIZE);
+    let rela_plt_bytes = plt_relocations
+        .len()
+        .checked_mul(ELF64_RELA_SIZE)
+        .ok_or_else(|| Error::Invalid("merged PLT reservation overflow".to_owned()))?;
+    reserve_within(input.limits, rela_plt_bytes)?;
+    let mut merged_rela_plt = Vec::new();
+    merged_rela_plt
+        .try_reserve_exact(rela_plt_bytes)
+        .map_err(|_| Error::Invalid("merged PLT reservation failed".to_owned()))?;
     for relocation in plt_relocations {
         relocation.encode(&mut merged_rela_plt);
     }
@@ -2358,6 +2503,20 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Restore the current protected `libil2cpp.so` without executing protector code.
 pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
+    restore_libil2cpp_with_limits(options, &ResourceLimits::default())
+}
+
+/// [`restore_libil2cpp`] with explicit ceilings.
+///
+/// `max_entry_bytes` bounds each artifact read, the auxiliary decoded image,
+/// every writer source and destination, and growth of the temporary output.
+/// `max_total_bytes` sums the stage-2 artifact reads and decompressed writer
+/// outputs for this call. It is not a peak resident-memory budget: the mapped
+/// input and the output image are checked individually and are not added in.
+pub fn restore_libil2cpp_with_limits(
+    options: &RestoreOptions,
+    limits: &ResourceLimits,
+) -> Result<RestoreReport> {
     let started = Instant::now();
     let input_path = absolute(&options.input)?;
     let output_path = absolute(&options.output)?;
@@ -2369,11 +2528,13 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         return invalid("refusing to overwrite the protected input in place");
     }
     let artifacts = load_artifacts(&index_path)?;
-    let module = read_file(&artifacts[&0x9b].path)?;
-    let symbol_patch_data = read_file(&artifacts[&0x9e].path)?;
+    let mut bytes = ByteBudget::new(limits);
+    let mut records = crate::android::EntryBudget::new(limits);
+    let module = read_artifact(&artifacts[&0x9b].path, limits, &mut bytes)?;
+    let symbol_patch_data = read_artifact(&artifacts[&0x9e].path, limits, &mut bytes)?;
     let auxiliary_symbol_seed = artifacts
         .get(&0x96)
-        .map(|artifact| read_file(&artifact.path))
+        .map(|artifact| read_artifact(&artifact.path, limits, &mut bytes))
         .transpose()?
         .as_deref()
         .map(discover_auxiliary_symbol_seed)
@@ -2389,7 +2550,7 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
                         "constructor module 0x98 lacks its descriptor entry offset".to_owned(),
                     )
                 })?;
-            Ok((read_file(&artifact.path)?, entry))
+            Ok((read_artifact(&artifact.path, limits, &mut bytes)?, entry))
         })
         .transpose()?;
     let config = Module9bConfig::parse(&module)?;
@@ -2445,6 +2606,12 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
     if auxiliary_header.output_size != descriptor.auxiliary_expected_size {
         return invalid("auxiliary container output size does not match the 0x9D descriptor");
     }
+    // The auxiliary image is one flat allocation. Reject its declared size
+    // before that buffer is reserved, even when outer-only mode will not
+    // decode it: a hostile size must not depend on a later branch to be safe.
+    // The same check repeats inside `allocate_auxiliary`, which is also what
+    // charges the buffer; this one only guards the outer-only path.
+    limits.check_entry_bytes(u64::from(auxiliary_header.output_size))?;
     if outer.encoded_end()? != descriptor.auxiliary_offset as usize {
         return invalid("primary and auxiliary 0x9D containers are not contiguous");
     }
@@ -2456,6 +2623,19 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         .map_err(|error| Error::io("create temporary output", parent, error))?;
     let temporary_path = temporary.path().to_path_buf();
     let private_size = usize_from_u64(private.offset, "private section offset")?;
+    // The temporary output is one file. It is capped by the smaller of the
+    // single-entry ceiling and the task total, but it is not added to the
+    // decoder byte budget: that budget counts retained decoded bytes, and the
+    // output file is the image those bytes are written into.
+    limits.check_entry_bytes(private.offset.min(limits.max_total_bytes))?;
+    if private.offset > limits.max_total_bytes {
+        return Err(crate::android::LimitExceeded::Total {
+            requested: private.offset,
+            adding: private.offset,
+            limit: limits.max_total_bytes,
+        }
+        .into());
+    }
     copy_range(
         &source,
         temporary.as_file_mut(),
@@ -2486,11 +2666,30 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
             layout: &layout,
             load_end,
         };
+        let mut context = DecodeContext {
+            limits,
+            bytes: &mut bytes,
+            records: &mut records,
+            validate: |address: u64, length: usize| {
+                let data_len = u64::try_from(length)
+                    .map_err(|_| Error::Invalid("decoded write length exceeds u64".to_owned()))?;
+                let end = address
+                    .checked_add(data_len)
+                    .ok_or_else(|| Error::Invalid("decoded write range overflow".to_owned()))?;
+                if end > load_end {
+                    return invalid(format!(
+                        "decoded write 0x{address:x}..0x{end:x} exceeds target load image"
+                    ));
+                }
+                Ok(())
+            },
+        };
         primary_stats = decode_container(
             &payload,
             &outer,
             &config,
             options.verbose,
+            &mut context,
             |address, data| writer.write(address, data),
         )?;
         output
@@ -2502,12 +2701,29 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         if options.verbose {
             eprintln!("Decoding auxiliary 0x9D ELF materialization container...");
         }
-        let mut decoded = vec![0_u8; auxiliary_header.output_size as usize];
+        let mut decoded = allocate_auxiliary(auxiliary_header.output_size, limits, &mut bytes)?;
+        let auxiliary_len = decoded.len();
+        let mut context = DecodeContext {
+            limits,
+            bytes: &mut bytes,
+            records: &mut records,
+            validate: |offset: u64, length: usize| {
+                let start = usize_from_u64(offset, "auxiliary write offset")?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
+                if end > auxiliary_len {
+                    return invalid("auxiliary decoded write is out of range".to_owned());
+                }
+                Ok(())
+            },
+        };
         let stats = decode_container(
             &payload,
             &auxiliary_header,
             &config,
             options.verbose,
+            &mut context,
             |offset, data| {
                 let start = usize_from_u64(offset, "auxiliary write offset")?;
                 let end = start
@@ -2527,9 +2743,20 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
         if mapping_length < private_size {
             return invalid("dynamic-table mapping is shorter than the ELF image");
         }
+        let mapping_bytes = u64::try_from(mapping_length)
+            .map_err(|_| Error::Invalid("dynamic-table mapping length exceeds u64".to_owned()))?;
+        limits.check_entry_bytes(mapping_bytes.min(limits.max_total_bytes))?;
+        if mapping_bytes > limits.max_total_bytes {
+            return Err(crate::android::LimitExceeded::Total {
+                requested: mapping_bytes,
+                adding: mapping_bytes,
+                limit: limits.max_total_bytes,
+            }
+            .into());
+        }
         temporary
             .as_file()
-            .set_len(mapping_length as u64)
+            .set_len(mapping_bytes)
             .map_err(|error| Error::io("extend temporary output", &temporary_path, error))?;
         if options.verbose {
             eprintln!("Rebuilding static ELF dynamic-linker tables...");
@@ -2542,10 +2769,13 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
                 &layout,
                 &symbol_patch_data,
                 &decoded,
-                auxiliary_symbol_seed,
-                constructor_module
-                    .as_ref()
-                    .map(|(image, entry)| (image.as_slice(), *entry)),
+                MaterializeInput {
+                    auxiliary_symbol_seed,
+                    constructor_module: constructor_module
+                        .as_ref()
+                        .map(|(image, entry)| (image.as_slice(), *entry)),
+                    limits,
+                },
             )?;
             restored_layout = new_layout;
             materialization = Some(report);
@@ -2615,6 +2845,198 @@ pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `decode_container` rejects a writer whose declared length fits the entry
+    /// ceiling but whose target ends past the destination. The writer closure
+    /// counts calls and must stay at zero.
+    #[test]
+    fn decode_rejects_an_in_cap_writer_past_the_destination_before_writing() {
+        let limits = ResourceLimits {
+            max_entry_bytes: 64,
+            max_total_bytes: 64,
+            max_entries: 8,
+            ..ResourceLimits::default()
+        };
+        let destination_len = 8_usize;
+        let mut writes = 0_usize;
+        let mut records = crate::android::EntryBudget::new(&limits);
+        let mut bytes = ByteBudget::new(&limits);
+        let container = past_end_container();
+        let header = senbei_crypto::android::ContainerHeader::parse(&container, 0, 0)
+            .expect("synthetic container header");
+        let config = senbei_crypto::android::Module9bConfig {
+            header_seed: 0,
+            container_seed: 0,
+            aes_key: [0; 32],
+            skip_aes: true,
+            schedule_offset: 0,
+        };
+        let mut context = DecodeContext {
+            limits: &limits,
+            bytes: &mut bytes,
+            records: &mut records,
+            validate: |offset: u64, length: usize| {
+                limits.check_entry_bytes(length as u64)?;
+                let start = usize_from_u64(offset, "auxiliary write offset")?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
+                if end > destination_len {
+                    return invalid("auxiliary decoded write is out of range".to_owned());
+                }
+                Ok(())
+            },
+        };
+        let error = decode_container(
+            &container,
+            &header,
+            &config,
+            false,
+            &mut context,
+            |_offset, _data| {
+                writes += 1;
+                Ok(0)
+            },
+        )
+        .expect_err("the writer target ends past the destination");
+        assert!(error.to_string().contains("out of range"), "{error}");
+        assert_eq!(writes, 0, "the writer ran before the range check");
+    }
+
+    /// Container whose one writer declares 4 bytes at offset 8. The destination
+    /// used by the test is 8 bytes, so the range check fails before the writer.
+    fn past_end_container() -> Vec<u8> {
+        fn unmultiply(encoded: u32) -> u32 {
+            let mut multiplier = 0xdc49_cd06_u32;
+            let mut value = encoded;
+            let mut result = 0_u32;
+            while multiplier != 0 {
+                if multiplier & 1 != 0 {
+                    result ^= value;
+                }
+                let carry = value >> 31;
+                value = value.wrapping_shl(1);
+                if carry != 0 {
+                    value ^= 0x5793_57eb;
+                }
+                multiplier >>= 1;
+            }
+            result
+        }
+        let state = 0_u32;
+        let output_size = 8_u32;
+        let raw0 = unmultiply(
+            output_size
+                .wrapping_sub(0xa21d_fb3a_u32.wrapping_shl(state & 7))
+                .wrapping_sub(state.wrapping_mul(0xf87b_337c)),
+        );
+        let flag_word = 1_u32 | (1_u32 << 8);
+        let raw1 = unmultiply(
+            flag_word
+                ^ state
+                    .wrapping_add(0xbd19_c63c)
+                    .wrapping_add(0x416e_2af2_u32.wrapping_shr(state & 0x0d)),
+        );
+        let mut tree = vec![0_u8; 256 * 3];
+        tree[1] = 0x80;
+        tree[2] = 1;
+        let raw2 = unmultiply(
+            (tree.len() as u32)
+                .wrapping_add(state ^ 0x3b2b_f538)
+                .wrapping_sub(0x643a_3a3b_u32.wrapping_shl(state & 0x0b)),
+        );
+        let mut header = Vec::new();
+        header.extend_from_slice(&raw0.to_le_bytes());
+        header.extend_from_slice(&raw1.to_le_bytes());
+        header.extend_from_slice(&raw2.to_le_bytes());
+        for offset in (0..tree.len() & !3).step_by(4) {
+            let value = u32::from_le_bytes(tree[offset..offset + 4].try_into().unwrap());
+            tree[offset..offset + 4].copy_from_slice(&unmultiply(value).to_le_bytes());
+        }
+        header.extend_from_slice(&tree);
+        let mut plain = vec![0_u8; 36];
+        plain[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        plain[8..12].copy_from_slice(&16_u32.to_le_bytes());
+        plain[12..16].copy_from_slice(&32_u32.to_le_bytes());
+        plain[16..20].copy_from_slice(&8_u32.to_le_bytes());
+        plain[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        plain[24..28].copy_from_slice(&4_u32.to_le_bytes());
+        let mut state_word = 0_u32;
+        let mut left = 0xe34e_ac63_u32;
+        let mut right = 0x07b4_8238_u32;
+        for (index, chunk) in plain.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let index32 = index as u32;
+            left = state_word
+                .wrapping_add(0x72f6_fcbe)
+                .wrapping_add(left.wrapping_add(0x4f8b_1bca).wrapping_mul(left))
+                .wrapping_shr(index32.wrapping_mul(index32) & 0x0f);
+            right = state_word
+                .wrapping_sub(0x71b6_a98d)
+                .wrapping_add(right.wrapping_sub(0x1605_a81c).wrapping_mul(right))
+                .wrapping_shl(index32 & 7);
+            state_word = left ^ right;
+            let mut value = u32::from_le_bytes(*chunk);
+            value ^= state_word;
+            value = value.wrapping_add(state_word);
+            value ^= 0xaf57_f7fb_u32.wrapping_mul(index32 & 3);
+            value = value.wrapping_sub(0xb43b_9baf_u32.wrapping_mul(index32 & 0x0d));
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        let segment_offset = (header.len() + 8) as u32;
+        let table_state = state.wrapping_add(0xb31f_451c).wrapping_mul(state);
+        let table_xor = table_state.wrapping_shl(3);
+        let table_add = table_state.wrapping_sub(0x822f_e82d_u32.wrapping_mul(state));
+        for (index, word) in [segment_offset, plain.len() as u32].into_iter().enumerate() {
+            let adjustment = table_add.wrapping_shr((((index * 4) & 7) + 5) as u32);
+            let encoded = unmultiply(word.wrapping_sub(adjustment)) ^ table_xor;
+            header.extend_from_slice(&encoded.to_le_bytes());
+        }
+        header.extend_from_slice(&plain);
+        header
+    }
+
+    #[test]
+    fn auxiliary_allocation_rejects_one_byte_over_the_ceiling() {
+        let limits = ResourceLimits {
+            max_entry_bytes: 4,
+            max_total_bytes: 8,
+            ..ResourceLimits::default()
+        };
+        let mut budget = ByteBudget::new(&limits);
+        let error = allocate_auxiliary(5, &limits, &mut budget)
+            .expect_err("five bytes is over the four-byte ceiling");
+        assert!(matches!(
+            error,
+            Error::Limit(crate::android::LimitExceeded::Entry {
+                requested: 5,
+                limit: 4
+            })
+        ));
+        assert_eq!(budget.used(), 0, "a rejected size is not charged");
+
+        let decoded = allocate_auxiliary(4, &limits, &mut budget).expect("the ceiling is allowed");
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(budget.used(), 4);
+    }
+
+    #[test]
+    fn auxiliary_allocations_share_the_task_budget() {
+        let limits = ResourceLimits {
+            max_entry_bytes: 4,
+            max_total_bytes: 8,
+            ..ResourceLimits::default()
+        };
+        let mut budget = ByteBudget::new(&limits);
+        allocate_auxiliary(4, &limits, &mut budget).unwrap();
+        allocate_auxiliary(4, &limits, &mut budget).expect("eight bytes is the total ceiling");
+        let error = allocate_auxiliary(1, &limits, &mut budget)
+            .expect_err("the next byte is over the total");
+        assert!(matches!(
+            error,
+            Error::Limit(crate::android::LimitExceeded::Total { .. })
+        ));
+        assert_eq!(budget.used(), 8);
+    }
 
     fn auxiliary_image(symbol_count: u32) -> Vec<u8> {
         let mut data = vec![0_u8; 0x279];

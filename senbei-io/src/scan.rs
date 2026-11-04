@@ -111,6 +111,21 @@ pub struct ScanStats {
 /// [`find_targets`], but with the pre-filter explicitly controlled. When
 /// `scan_all` is true selected target names below [`MIN_SIZE`] are also probed.
 pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
+    find_targets_with_limits(
+        root,
+        scan_all,
+        &senbei_engine::android::ResourceLimits::default(),
+    )
+}
+
+/// Like [`find_targets_opts`], with Android probe allocations bounded by the
+/// same limits as restoration. An over-limit probe remains a restore candidate
+/// so the job reports the limit error rather than silently skipping the file.
+pub fn find_targets_with_limits(
+    root: &Path,
+    scan_all: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+) -> ScanResult {
     // Phase 1: serial traversal collecting regular-file paths only. No file is
     // opened here; `readdir` is fast relative to the content probe that follows,
     // and `entry.metadata()` is served from the directory entry on Windows, so
@@ -177,7 +192,7 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
     let workers = senbei_engine::thread_cap().clamp(1, n.max(1));
     if workers <= 1 {
         for (p, c) in paths.iter().zip(class.iter_mut()) {
-            *c = classify(p);
+            *c = classify(p, limits);
         }
     } else {
         let chunk = n.div_ceil(workers);
@@ -185,7 +200,7 @@ pub fn find_targets_opts(root: &Path, scan_all: bool) -> ScanResult {
             for (pc, cc) in paths.chunks(chunk).zip(class.chunks_mut(chunk)) {
                 scope.spawn(move || {
                     for (p, c) in pc.iter().zip(cc.iter_mut()) {
-                        *c = classify(p);
+                        *c = classify(p, limits);
                     }
                 });
             }
@@ -239,7 +254,7 @@ pub fn scan_all_env() -> bool {
 /// payload lives in a section found via the section-header table at the *end*
 /// of the file, so an ELF64/AArch64 prefix triggers a full-file read. Only
 /// selected `.so` images pay for it.
-fn classify(path: &Path) -> Option<Class> {
+fn classify(path: &Path, limits: &senbei_engine::android::ResourceLimits) -> Option<Class> {
     let head = read_prefix(path, DETECT_PREFIX)?;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if crate::android::is_package_name(path) && crate::android::is_app_package(path, &head) {
@@ -253,7 +268,7 @@ fn classify(path: &Path) -> Option<Class> {
         }
         if crate::android::is_so_name(path)
             && crate::android::is_elf64_aarch64(&head)
-            && crate::android::is_protected_so_file(path)
+            && crate::android::probe_so_file_with_limits(path, limits).unwrap_or(true)
         {
             return Class::AndroidSo;
         }

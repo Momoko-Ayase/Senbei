@@ -14,6 +14,30 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Ceiling for one decoded container or compressed writer.
+///
+/// `decode_container` stays unlimited so existing callers keep their behavior.
+/// Extraction and restoration pass the shared engine entry ceiling here and
+/// reject the declared size before the output buffer is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimit {
+    pub max_output_bytes: u64,
+}
+
+impl OutputLimit {
+    fn check(self, bytes: usize, what: &str) -> Result<()> {
+        let requested = u64::try_from(bytes)
+            .map_err(|_| Error::Invalid(format!("{what} length exceeds u64")))?;
+        if requested > self.max_output_bytes {
+            return invalid(format!(
+                "{what} of {requested} bytes exceeds the {limit}-byte output ceiling",
+                limit = self.max_output_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Invalid(message.into()))
 }
@@ -417,7 +441,24 @@ impl HuffmanLzDecoder {
 
     /// Decode one compressed writer payload to its exact expected size.
     pub fn decode(&self, source: &[u8], output_size: usize) -> Result<Vec<u8>> {
-        let mut output = vec![0_u8; output_size];
+        self.decode_limited(source, output_size, None)
+    }
+
+    /// Decode one writer, rejecting `output_size` before its buffer is reserved.
+    pub fn decode_limited(
+        &self,
+        source: &[u8],
+        output_size: usize,
+        limit: Option<OutputLimit>,
+    ) -> Result<Vec<u8>> {
+        if let Some(limit) = limit {
+            limit.check(output_size, "compressed writer output")?;
+        }
+        let mut output = Vec::new();
+        output.try_reserve_exact(output_size).map_err(|_| {
+            Error::Invalid("compressed writer output reservation failed".to_owned())
+        })?;
+        output.resize(output_size, 0);
         let mut source_pos = 0_usize;
         let mut bit_buffer = 0_u64;
         let mut available = 0_u8;
@@ -548,7 +589,11 @@ pub fn transform_segment(
     aes_key: &[u8; 32],
     decrypt_aes: bool,
 ) -> Result<Vec<u8>> {
-    let mut transformed = data.to_vec();
+    let mut transformed = Vec::new();
+    transformed
+        .try_reserve_exact(data.len())
+        .map_err(|_| Error::Invalid("segment reservation failed".to_owned()))?;
+    transformed.extend_from_slice(data);
     let mut state = seed;
     let mut left = 0xe34e_ac63_u32;
     let mut right = 0x07b4_8238_u32;
@@ -590,11 +635,31 @@ pub fn transform_segment(
 /// Decode one complete protector container into its flat output buffer.
 ///
 /// This is the static equivalent of the decoder entrypoint embedded in Stage
-/// 2 and in each nested interpreter module.
+/// 2 and in each nested interpreter module. The declared output size is not
+/// capped; [`decode_container_with_limit`] applies the shared entry ceiling.
 pub fn decode_container(
     data: &[u8],
     config: &Module9bConfig,
     expected_size: usize,
+) -> Result<Vec<u8>> {
+    decode_container_inner(data, config, expected_size, None)
+}
+
+/// [`decode_container`] with a ceiling checked before the output is reserved.
+pub fn decode_container_with_limit(
+    data: &[u8],
+    config: &Module9bConfig,
+    expected_size: usize,
+    limit: OutputLimit,
+) -> Result<Vec<u8>> {
+    decode_container_inner(data, config, expected_size, Some(limit))
+}
+
+fn decode_container_inner(
+    data: &[u8],
+    config: &Module9bConfig,
+    expected_size: usize,
+    limit: Option<OutputLimit>,
 ) -> Result<Vec<u8>> {
     let header = ContainerHeader::parse(data, 0, config.container_seed)?;
     let header_size = usize::try_from(header.output_size)
@@ -604,9 +669,20 @@ pub fn decode_container(
             "container output size 0x{header_size:x} != expected 0x{expected_size:x}"
         ));
     }
+    if let Some(limit) = limit {
+        // Both declared sizes are rejected before the flat output exists, so a
+        // hostile container header cannot force the allocation by disagreeing
+        // with the record that pointed at it.
+        limit.check(header_size, "container output")?;
+        limit.check(expected_size, "container output")?;
+    }
     let decoder = HuffmanLzDecoder::new(&header.tree)?;
     let decrypt_aes = !(config.skip_aes || header.skip_aes);
-    let mut output = vec![0_u8; expected_size];
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_size)
+        .map_err(|_| Error::Invalid("container output reservation failed".to_owned()))?;
+    output.resize(expected_size, 0);
 
     for (segment_index, encoded) in header.segments.iter().enumerate() {
         let start = header
@@ -614,6 +690,9 @@ pub fn decode_container(
             .checked_add(encoded.offset as usize)
             .ok_or_else(|| Error::Invalid("encoded segment start overflow".to_owned()))?;
         let encoded_data = range(data, start, encoded.size as usize)?;
+        if let Some(limit) = limit {
+            limit.check(encoded.size as usize, "encoded segment")?;
+        }
         let transformed = transform_segment(
             encoded_data,
             config.container_seed,
@@ -662,18 +741,28 @@ pub fn decode_container(
                 ));
             }
             let source = &transformed[data_cursor..encoded_end];
-            let decoded = if encoded_size == output_size {
-                None
-            } else {
-                Some(decoder.decode(source, output_size)?)
-            };
-            let decoded = decoded.as_deref().unwrap_or(source);
+            if let Some(limit) = limit {
+                limit.check(encoded_size, "writer source")?;
+                limit.check(output_size, "writer destination")?;
+            }
             let target = base_offset
                 .checked_add(output_offset)
                 .ok_or_else(|| Error::Invalid("writer target offset overflow".to_owned()))?;
             let target_end = target
-                .checked_add(decoded.len())
+                .checked_add(output_size)
                 .ok_or_else(|| Error::Invalid("writer target end overflow".to_owned()))?;
+            if target_end > output.len() {
+                return invalid(format!(
+                    "segment {segment_index} writer {writer_index} target 0x{target:x}..0x{target_end:x} is outside the 0x{:x}-byte container",
+                    output.len()
+                ));
+            }
+            let decoded = if encoded_size == output_size {
+                None
+            } else {
+                Some(decoder.decode_limited(source, output_size, limit)?)
+            };
+            let decoded = decoded.as_deref().unwrap_or(source);
             let destination = output.get_mut(target..target_end).ok_or_else(|| {
                 Error::Invalid(format!(
                     "segment {segment_index} writer {writer_index} target is out of range"
@@ -709,4 +798,262 @@ mod tests {
     fn descriptor_rejects_truncated_input() {
         assert!(ProtectedDescriptor::decrypt(&[0_u8; 16], 1).is_err());
     }
+
+    /// A container whose declared output is past the ceiling.
+    ///
+    /// Parsing succeeds. Decoding must fail on that declared size before the
+    /// flat output is reserved, so the failure mentions the output ceiling and
+    /// not a later segment or writer error. The exact ceiling is allowed
+    /// through that check.
+    #[test]
+    fn oversized_container_is_rejected_before_its_output_is_reserved() {
+        let config = empty_config();
+        let over = synthetic_container(&config, 5, None);
+        let error = decode_container_with_limit(
+            &over,
+            &config,
+            5,
+            OutputLimit {
+                max_output_bytes: 4,
+            },
+        )
+        .expect_err("five-byte output is over the four-byte ceiling");
+        assert!(
+            error.to_string().contains("container output"),
+            "unexpected error: {error}"
+        );
+
+        let boundary = synthetic_container(&config, 4, None);
+        let error = decode_container_with_limit(
+            &boundary,
+            &config,
+            4,
+            OutputLimit {
+                max_output_bytes: 4,
+            },
+        )
+        .expect_err("the boundary container has no usable segment body");
+        assert!(
+            !error.to_string().contains("output ceiling"),
+            "the boundary size must pass the ceiling: {error}"
+        );
+    }
+
+    /// The container itself is within the ceiling. Its writer declares a
+    /// decoded length past that ceiling and must be rejected before Huffman
+    /// decoding reserves a buffer of that length.
+    #[test]
+    fn oversized_writer_is_rejected_before_decompression() {
+        let config = empty_config();
+        let data = synthetic_container(&config, 8, Some((0, 128)));
+        let error = decode_container_with_limit(
+            &data,
+            &config,
+            8,
+            OutputLimit {
+                // The segment body is 36 bytes, under this ceiling. The writer
+                // declares 128 decoded bytes, which is over it.
+                max_output_bytes: 64,
+            },
+        )
+        .expect_err("writer destination exceeds the container ceiling");
+        assert!(
+            error.to_string().contains("writer destination"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The declared writer length is within the entry ceiling and would be a
+    /// legal allocation on its own. It still starts past the flat container,
+    /// so the range check rejects it before Huffman decoding.
+    #[test]
+    fn writer_inside_the_entry_cap_but_outside_the_container_is_rejected_first() {
+        let config = empty_config();
+        let data = synthetic_container(&config, 8, Some((8, 4)));
+        let error = decode_container_with_limit(
+            &data,
+            &config,
+            8,
+            OutputLimit {
+                max_output_bytes: 64,
+            },
+        )
+        .expect_err("target 8..12 is outside an 8-byte container");
+        assert!(
+            error.to_string().contains("outside"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A one-byte writer that ends exactly at the container length is in range.
+    /// It is uncompressed, so success does not depend on a Huffman payload.
+    #[test]
+    fn writer_ending_at_the_container_length_is_accepted() {
+        let config = empty_config();
+        let data = synthetic_container(&config, 8, Some((7, 1)));
+        let decoded = decode_container_with_limit(
+            &data,
+            &config,
+            8,
+            OutputLimit {
+                max_output_bytes: 64,
+            },
+        )
+        .expect("a writer ending at the container length is in range");
+        assert_eq!(decoded.len(), 8);
+    }
+
+    fn empty_config() -> Module9bConfig {
+        Module9bConfig {
+            header_seed: 0,
+            container_seed: 0,
+            aes_key: [0; 32],
+            skip_aes: true,
+            schedule_offset: 0,
+        }
+    }
+
+    /// A container with one segment.
+    ///
+    /// `writer_output` replaces the segment body with a transformed writer
+    /// record declaring that decoded length. `None` leaves a four-byte body
+    /// that is only there so the header parses.
+    fn synthetic_container(
+        config: &Module9bConfig,
+        output_size: u32,
+        writer_output: Option<(u32, u32)>,
+    ) -> Vec<u8> {
+        let seed = config.container_seed;
+        let seed_square = seed.wrapping_mul(seed);
+        let state = seed_square.wrapping_shr(17) ^ seed_square.wrapping_shl(11);
+        let raw0 = gf32_unmultiply(
+            output_size
+                .wrapping_sub(0xa21d_fb3a_u32.wrapping_shl(state & 7))
+                .wrapping_sub(state.wrapping_mul(0xf87b_337c)),
+        );
+        // One segment, skip_aes = 1.
+        let flag_word = 1_u32 | (1_u32 << 8);
+        let raw1 = gf32_unmultiply(
+            flag_word
+                ^ state
+                    .wrapping_add(0xbd19_c63c)
+                    .wrapping_add(0x416e_2af2_u32.wrapping_shr(state & 0x0d)),
+        );
+        let mut tree = vec![0_u8; 256 * 3];
+        tree[1] = 0x80;
+        tree[2] = 1;
+        let tree_state = state.wrapping_add(0xf1cb_5b81).wrapping_mul(state);
+        let tree_delta = tree_state.wrapping_sub(0x23b3_2203_u32.wrapping_mul(state));
+        // Stored tree bytes are decrypted a word at a time and then adjusted a
+        // byte at a time, so the byte adjustment has to be undone first.
+        for (index, byte) in tree.iter_mut().enumerate() {
+            let shift = (index & 0x1b) as u32;
+            let left = gf32_mul_fixed(tree_state.wrapping_shl(shift));
+            let right = tree_delta.wrapping_shr((index & 0x17) as u32);
+            let adjustment = left.wrapping_sub(right).wrapping_shr((index & 0x1f) as u32);
+            *byte = byte.wrapping_sub(adjustment as u8);
+        }
+        let raw2 = gf32_unmultiply(
+            (tree.len() as u32)
+                .wrapping_add(state ^ 0x3b2b_f538)
+                .wrapping_sub(0x643a_3a3b_u32.wrapping_shl(state & 0x0b)),
+        );
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&raw0.to_le_bytes());
+        header.extend_from_slice(&raw1.to_le_bytes());
+        header.extend_from_slice(&raw2.to_le_bytes());
+        let mut stored_tree = tree;
+        for offset in (0..stored_tree.len() & !3).step_by(4) {
+            let value = u32::from_le_bytes(stored_tree[offset..offset + 4].try_into().unwrap());
+            stored_tree[offset..offset + 4].copy_from_slice(&gf32_unmultiply(value).to_le_bytes());
+        }
+        header.extend_from_slice(&stored_tree);
+
+        let body = match writer_output {
+            Some((writer_offset, writer_output)) => {
+                writer_body(config, writer_offset, writer_output)
+            }
+            None => vec![0_u8; 4],
+        };
+        let segment_offset = (header.len() + 8) as u32;
+        let table_state = state.wrapping_add(0xb31f_451c).wrapping_mul(state);
+        let table_xor = table_state.wrapping_shl(3);
+        let table_add = table_state.wrapping_sub(0x822f_e82d_u32.wrapping_mul(state));
+        for (index, plain) in [segment_offset, body.len() as u32].into_iter().enumerate() {
+            let adjustment = table_add.wrapping_shr((((index * 4) & 7) + 5) as u32);
+            // decode is `gf(encoded ^ xor) + adjustment`, so the stored word
+            // is `ungf(plain - adjustment) ^ xor`.
+            let encoded = gf32_unmultiply(plain.wrapping_sub(adjustment)) ^ table_xor;
+            header.extend_from_slice(&encoded.to_le_bytes());
+        }
+        header.extend_from_slice(&body);
+        header
+    }
+
+    /// Segment body that `transform_segment` turns into one writer record.
+    fn writer_body(config: &Module9bConfig, writer_offset: u32, writer_output: u32) -> Vec<u8> {
+        let mut plain = vec![0_u8; 36];
+        plain[..4].copy_from_slice(&0_u32.to_le_bytes());
+        plain[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        plain[8..12].copy_from_slice(&16_u32.to_le_bytes());
+        plain[12..16].copy_from_slice(&32_u32.to_le_bytes());
+        plain[16..20].copy_from_slice(&writer_offset.to_le_bytes());
+        plain[20..24].copy_from_slice(&writer_output.to_le_bytes());
+        plain[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        inverse_transform_segment(&plain, config.container_seed)
+    }
+
+    /// Invert [`transform_segment`] for `decrypt_aes = false`.
+    ///
+    /// The forward routine adds and xors a state that does not depend on the
+    /// ciphertext, so replaying that state and undoing the arithmetic recovers
+    /// the input that decodes to `plain`.
+    fn inverse_transform_segment(plain: &[u8], seed: u32) -> Vec<u8> {
+        let mut encoded = plain.to_vec();
+        let mut state = seed;
+        let mut left = 0xe34e_ac63_u32;
+        let mut right = 0x07b4_8238_u32;
+        for (index, chunk) in encoded.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let index32 = index as u32;
+            left = state
+                .wrapping_add(0x72f6_fcbe)
+                .wrapping_add(left.wrapping_add(0x4f8b_1bca).wrapping_mul(left))
+                .wrapping_shr(index32.wrapping_mul(index32) & 0x0f);
+            right = state
+                .wrapping_sub(0x71b6_a98d)
+                .wrapping_add(right.wrapping_sub(0x1605_a81c).wrapping_mul(right))
+                .wrapping_shl(index32 & 7);
+            state = left ^ right;
+            let mut value = u32::from_le_bytes(*chunk);
+            value ^= state;
+            value = value.wrapping_add(state);
+            value ^= 0xaf57_f7fb_u32.wrapping_mul(index32 & 3);
+            value = value.wrapping_sub(0xb43b_9baf_u32.wrapping_mul(index32 & 0x0d));
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        encoded
+    }
+
+    fn gf32_unmultiply(encoded: u32) -> u32 {
+        // Multiply by the inverse of the fixed element 0x94511dd2.
+        let mut multiplier = GF32_INVERSE;
+        let mut value = encoded;
+        let mut result = 0_u32;
+        while multiplier != 0 {
+            if multiplier & 1 != 0 {
+                result ^= value;
+            }
+            let carry = value >> 31;
+            value = value.wrapping_shl(1);
+            if carry != 0 {
+                value ^= 0x5793_57eb;
+            }
+            multiplier >>= 1;
+        }
+        result
+    }
+
+    /// `gf32_mul_fixed(GF32_INVERSE) == 1`, so this undoes that multiply.
+    const GF32_INVERSE: u32 = 0xdc49_cd06;
 }

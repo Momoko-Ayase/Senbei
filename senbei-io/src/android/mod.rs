@@ -16,8 +16,11 @@
 //! app (wasm) never touches them.
 
 #[cfg(test)]
+mod resource_tests;
+#[cfg(test)]
 mod tests;
 
+mod archive_limits;
 mod context;
 mod manifest;
 
@@ -31,8 +34,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
 use senbei_crypto::hex_digest;
-use senbei_engine::android::{ExtractOptions, extract_stage2, is_protected_libil2cpp};
-use senbei_engine::android::{RestoreOptions, restore_libil2cpp};
+use senbei_engine::android::{ExtractOptions, extract_stage2_with_limits, is_protected_libil2cpp};
+use senbei_engine::android::{ResourceLimits, RestoreOptions, restore_libil2cpp_with_limits};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
@@ -94,6 +97,18 @@ pub fn is_protected_so_file(path: &Path) -> bool {
     is_elf64_aarch64(&bytes) && is_protected_libil2cpp(&bytes)
 }
 
+pub(crate) fn probe_so_file_with_limits(
+    path: &Path,
+    limits: &senbei_engine::android::ResourceLimits,
+) -> Result<bool> {
+    let file = File::open(path).with_context(|| format!("open `{}`", path.display()))?;
+    let bytes = map_read_only(&file, path)?;
+    if !is_elf64_aarch64(&bytes) {
+        return Ok(false);
+    }
+    senbei_engine::android::probe_libil2cpp_with_limits(&bytes, limits).map_err(Into::into)
+}
+
 pub fn file_content_identity(path: &Path) -> std::io::Result<String> {
     let file = File::open(path)?;
     // SAFETY: the file remains open for the mapping lifetime and the mapping
@@ -113,17 +128,18 @@ pub fn file_content_identity(path: &Path) -> std::io::Result<String> {
 /// that restore more than one application must keep those modules apart; this
 /// single-file entry point has only one application, so it keeps the module
 /// only long enough to unwrap embedded metadata (which does not consume it).
-pub(crate) fn restore_so_with_engine(
+pub(crate) fn restore_so_with_engine_limits(
     input: &Path,
     dest: &Path,
     verbose: bool,
+    limits: &ResourceLimits,
 ) -> Result<context::RestoredLibrary> {
     let temporary = tempfile::tempdir().context("create stage-2 workspace")?;
     let stage2_dir = temporary.path().join("stage2");
-    let extraction = extract_stage2(&ExtractOptions::with_defaults(
-        input.to_path_buf(),
-        stage2_dir.clone(),
-    ))
+    let extraction = extract_stage2_with_limits(
+        &ExtractOptions::with_defaults(input.to_path_buf(), stage2_dir.clone()),
+        limits,
+    )
     .context("extract stage-1/stage-2 payload")?;
     // Every module 0x0C is collected. Two distinct images in one library are a
     // conflict for that library's application, not a last-writer-wins update.
@@ -152,15 +168,18 @@ pub(crate) fn restore_so_with_engine(
         .pop()
         .map(|(image, bytes)| (Some(image), Some(bytes)))
         .unwrap_or((None, None));
-    restore_libil2cpp(&RestoreOptions {
-        input: input.to_path_buf(),
-        output: dest.to_path_buf(),
-        index: stage2_dir.join("index.json"),
-        dump_auxiliary: None,
-        outer_only: false,
-        preserve_entrypoint: false,
-        verbose,
-    })
+    restore_libil2cpp_with_limits(
+        &RestoreOptions {
+            input: input.to_path_buf(),
+            output: dest.to_path_buf(),
+            index: stage2_dir.join("index.json"),
+            dump_auxiliary: None,
+            outer_only: false,
+            preserve_entrypoint: false,
+            verbose,
+        },
+        limits,
+    )
     .context("restore protected library")?;
     let restored_file =
         File::open(dest).with_context(|| format!("read restored `{}`", dest.display()))?;
@@ -173,15 +192,30 @@ pub(crate) fn restore_so_with_engine(
 }
 
 pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Option<Vec<u8>>> {
-    Ok(context::EngineRestorer
+    restore_so_file_with_limits(input, dest, verbose, &ResourceLimits::default())
+}
+
+/// Restore a loose Android library with explicit resource ceilings.
+pub fn restore_so_file_with_limits(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    limits: &ResourceLimits,
+) -> Result<Option<Vec<u8>>> {
+    Ok(context::EngineRestorer(*limits)
         .restore(input, dest, verbose)?
         .embedded_metadata)
 }
 
-/// Fresh run-scoped cache. Library hits reuse a restored image; metadata hits
+/// Fresh run-scoped cache. Library hits reuse their module context; metadata hits
 /// are keyed by encrypted bytes and the module that recovered them.
+#[cfg(test)]
 pub(crate) fn run_cache() -> context::AndroidRunCache {
     context::AndroidRunCache::default()
+}
+
+pub(crate) fn run_cache_with_limits(limits: &ResourceLimits) -> context::AndroidRunCache {
+    context::AndroidRunCache::with_limits(limits)
 }
 
 /// Assign loose libraries and metadata to application contexts.
@@ -210,6 +244,7 @@ pub(crate) fn restore_loose_library(
     verbose: bool,
     cache: &mut context::AndroidRunCache,
 ) -> Result<LooseLibraryOutcome> {
+    let limits = cache.limits;
     restore_loose_library_with(
         input,
         dest,
@@ -217,7 +252,7 @@ pub(crate) fn restore_loose_library(
         app,
         verbose,
         cache,
-        &mut context::EngineRestorer,
+        &mut context::EngineRestorer(limits),
     )
 }
 
@@ -243,8 +278,13 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
     // A prior content-only success still needs context extraction. Restore it
     // in a private workspace, never over a destination that must stay untouched.
     let prior = cache.is_prior_success(&identity);
-    let workspace = prior.then(tempfile::tempdir).transpose().context("create duplicate context workspace")?;
-    let scratch = workspace.as_ref().map(|directory| directory.path().join("restored.so"));
+    let workspace = prior
+        .then(tempfile::tempdir)
+        .transpose()
+        .context("create duplicate context workspace")?;
+    let scratch = workspace
+        .as_ref()
+        .map(|directory| directory.path().join("restored.so"));
     let restore_dest = scratch.as_deref().unwrap_or(dest);
     match restorer.restore(input, restore_dest, verbose) {
         Ok(restored) => {
@@ -268,7 +308,11 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
             record_module(cache, app, &cached, label);
             cache.insert_library(identity, cached);
             Ok(LooseLibraryOutcome {
-                status: if prior { EntryStatus::Duplicate } else { EntryStatus::Restored },
+                status: if prior {
+                    EntryStatus::Duplicate
+                } else {
+                    EntryStatus::Restored
+                },
                 embedded,
             })
         }
@@ -323,7 +367,9 @@ pub(crate) fn restore_loose_metadata(
         restore_metadata_bytes_with_module(&data, module).with_context(|| label.to_owned())?;
     if report.remapped > 0 {
         write_metadata_blob(dest, &out)?;
-        if verbose { println!("Write to {}", dest.display()); }
+        if verbose {
+            println!("Write to {}", dest.display());
+        }
     }
     Ok(LooseMetadataOutcome {
         version: report.version,
@@ -336,7 +382,15 @@ pub(crate) fn restore_loose_metadata(
 /// the same manifest package name plus version. Bundles are never grouped
 /// with anything. Order inside a group does not matter; the caller restores
 /// every library in the group before any of its metadata.
+#[cfg(test)]
 pub(crate) fn loose_apk_groups(packages: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+    loose_apk_groups_cached(packages, &mut context::AndroidRunCache::default())
+}
+
+pub(crate) fn loose_apk_groups_cached(
+    packages: &[PathBuf],
+    cache: &mut context::AndroidRunCache,
+) -> Vec<Vec<PathBuf>> {
     let mut groups: Vec<(context::AppKey, Vec<PathBuf>)> = Vec::new();
     let mut alone = Vec::new();
     for package in packages {
@@ -346,7 +400,7 @@ pub(crate) fn loose_apk_groups(packages: &[PathBuf]) -> Vec<Vec<PathBuf>> {
             alone.push(vec![package.clone()]);
             continue;
         }
-        let key = apk_manifest_key(package);
+        let key = apk_manifest_key(package, cache);
         if let Some(key) = key {
             if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
                 members.push(package.clone());
@@ -362,9 +416,11 @@ pub(crate) fn loose_apk_groups(packages: &[PathBuf]) -> Vec<Vec<PathBuf>> {
     grouped
 }
 
-fn apk_manifest_key(package: &Path) -> Option<context::AppKey> {
-    let file = std::fs::File::open(package).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+fn apk_manifest_key(
+    package: &Path,
+    cache: &mut context::AndroidRunCache,
+) -> Option<context::AppKey> {
+    let mut archive = cache.archive.open_archive(package).ok()?;
     let parent = package
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -374,6 +430,7 @@ fn apk_manifest_key(package: &Path) -> Option<context::AppKey> {
         package,
         parent,
         &package.display().to_string(),
+        &mut cache.archive,
     )
     .ok()?;
     match inventory.key {
@@ -392,13 +449,14 @@ pub(crate) fn restore_package_cached(
     cache: &mut context::AndroidRunCache,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
+    let limits = cache.limits;
     restore_package_with_restorer(
         package,
         rel,
         out_root,
         cache,
         verbose,
-        &mut context::EngineRestorer,
+        &mut context::EngineRestorer(limits),
     )
 }
 
@@ -412,6 +470,7 @@ pub(crate) fn restore_apk_group(
     cache: &mut context::AndroidRunCache,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
+    let limits = cache.limits;
     let mut outcomes = Vec::new();
     for package in packages {
         let rel = package.strip_prefix(root).unwrap_or(package);
@@ -421,7 +480,7 @@ pub(crate) fn restore_apk_group(
             out_root,
             cache,
             verbose,
-            &mut context::EngineRestorer,
+            &mut context::EngineRestorer(limits),
             PackagePass::Libraries,
         )?);
     }
@@ -433,7 +492,7 @@ pub(crate) fn restore_apk_group(
             out_root,
             cache,
             verbose,
-            &mut context::EngineRestorer,
+            &mut context::EngineRestorer(limits),
             PackagePass::Metadata,
         )?);
     }
@@ -591,6 +650,26 @@ pub fn restore_package(
     seen: &mut HashSet<String>,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
+    restore_package_with_limits(
+        package,
+        rel,
+        out_root,
+        seen,
+        verbose,
+        &ResourceLimits::default(),
+    )
+}
+
+/// Restore one Android package with explicit archive and decoder ceilings.
+pub fn restore_package_with_limits(
+    package: &Path,
+    rel: &Path,
+    out_root: &Path,
+    seen: &mut HashSet<String>,
+    verbose: bool,
+    limits: &ResourceLimits,
+) -> Result<Vec<EntryOutcome>> {
+    let limits = *limits;
     // `seen` is the public successful-content set shared with loose libraries.
     // Metadata recovery context does not fit in that set, so this wrapper keeps
     // a run-scoped cache and only publishes content identities of entries that
@@ -598,7 +677,7 @@ pub fn restore_package(
     // package still skips those bytes; module context for metadata is rebuilt
     // inside this package (one package, or one manifest-scoped bundle, is one
     // application boundary).
-    let mut cache = context::AndroidRunCache::default();
+    let mut cache = context::AndroidRunCache::with_limits(&limits);
     for identity in seen.iter().cloned() {
         cache.insert_prior_success(identity);
     }
@@ -608,7 +687,7 @@ pub fn restore_package(
         out_root,
         &mut cache,
         verbose,
-        &mut context::EngineRestorer,
+        &mut context::EngineRestorer(limits),
     );
     // Publish successes even when the package returns `Err`. The caller's set
     // is only replaced after that, so a panic still leaves the old successes.
@@ -652,7 +731,7 @@ fn restore_package_pass<R: context::LibraryRestorer>(
         .is_some_and(|value| {
             value.eq_ignore_ascii_case("apks") || value.eq_ignore_ascii_case("xapk")
         });
-    let mut archive = open_package(package)?;
+    let mut archive = cache.archive.open_archive(package)?;
     let temporary = tempfile::tempdir().context("create package workspace")?;
     let mut outcomes = Vec::new();
     let mut state = PackageRestoreState {
@@ -687,7 +766,7 @@ fn restore_package_pass<R: context::LibraryRestorer>(
         }
     }
     // One direct package is one application inside its own package set (the
-    // package file). A plain manifest names it by package plus version; without
+    // package file). Its manifest names it by package plus version; without
     // both, the package is isolated. The ZIP file name is not a package id.
     // Inventory already walked this central directory; entry extraction below
     // reuses the same open and must not be charged as a second package.
@@ -702,6 +781,7 @@ fn restore_package_pass<R: context::LibraryRestorer>(
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(".")),
             &package.display().to_string(),
+            &mut state.cache.archive,
         )?)
     };
     direct.retain(|(_, name)| match pass {
@@ -733,21 +813,27 @@ fn restore_package_pass<R: context::LibraryRestorer>(
         base: PathBuf,
         app: context::AppKey,
         /// Manifest inventory, including the reopen key. Extraction opens
-        /// `path` again; `inventory.archive` is the pass a later budget must
-        /// not charge a second time.
+        /// `path` again; `inventory.archive` is not charged a second time.
         inventory: context::PackageInventory,
         entries: Vec<(usize, PathBuf)>,
     }
 
     let mut nested_packages = Vec::with_capacity(nested.len());
     for (index, name) in nested {
+        state.cache.limits.check_depth(1)?;
         let nested_label = rel.join(&name);
-        let nested_path = extract_entry(&mut archive, index, &temporary, &nested_label)
-            .with_context(|| format!("extract `{}`", nested_label.display()))?;
-        let mut nested_archive = open_package(&nested_path)?;
+        let nested_path = extract_entry(
+            &mut archive,
+            index,
+            &temporary,
+            &nested_label,
+            &mut state.cache.archive,
+        )
+        .with_context(|| format!("extract `{}`", nested_label.display()))?;
+        let mut nested_archive = state.cache.archive.open_archive(&nested_path)?;
         // Manifest first, before any library or metadata entry is chosen. Splits
         // that name the same package and version, inside this bundle only, share
-        // one context. A split with no plain package name or no version is
+        // one context. A split with no recognized package name or version is
         // isolated and cannot borrow a sibling's module. `nested_path` is the
         // reopen key: the central directory listed here is not charged again
         // when entries are extracted below.
@@ -756,6 +842,7 @@ fn restore_package_pass<R: context::LibraryRestorer>(
             &nested_path,
             package,
             &nested_path.display().to_string(),
+            &mut state.cache.archive,
         )?;
         let mut entries = Vec::new();
         for nested_index in 0..nested_archive.len() {
@@ -805,7 +892,7 @@ fn restore_package_pass<R: context::LibraryRestorer>(
                     nested_package.inventory.archive.reopen_key,
                     nested_package.path
                 );
-                let mut nested_archive = open_package(&nested_package.path)?;
+                let mut nested_archive = state.cache.archive.open_archive(&nested_package.path)?;
                 for (nested_index, entry_name) in nested_package
                     .entries
                     .iter()
@@ -853,14 +940,24 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
     app: &context::AppKey,
     state: &mut PackageRestoreState<'_, T>,
 ) -> Result<Vec<EntryOutcome>> {
-    let entry_path = extract_entry(archive, index, temporary, Path::new(label))?;
+    let entry_path = extract_entry(
+        archive,
+        index,
+        temporary,
+        Path::new(label),
+        &mut state.cache.archive,
+    )?;
     let entry_file =
         File::open(&entry_path).with_context(|| format!("open extracted `{label}`"))?;
     let entry_data = map_read_only(&entry_file, &entry_path)?;
 
     let protected_override = state.restorer.protected_override(&entry_path);
     let is_so = protected_override.is_some()
-        || (is_elf64_aarch64(&entry_data) && is_protected_libil2cpp(&entry_data));
+        || (is_elf64_aarch64(&entry_data)
+            && senbei_engine::android::probe_libil2cpp_with_limits(
+                &entry_data,
+                &state.cache.limits,
+            )?);
     let is_meta = !is_so && senbei_metadata::is_metadata(&entry_data);
     let outcome = |kind, status, provenance: Vec<String>| EntryOutcome {
         label: label.to_owned(),
@@ -894,12 +991,19 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
         drop(entry_data);
         drop(entry_file);
         let prior = state.cache.is_prior_success(&identity);
-        let workspace = prior.then(|| tempfile::tempdir_in(temporary.path())).transpose()
+        let workspace = prior
+            .then(|| tempfile::tempdir_in(temporary.path()))
+            .transpose()
             .context("create duplicate context workspace")?;
-        let scratch = workspace.as_ref().map(|directory| directory.path().join("restored.so"));
+        let scratch = workspace
+            .as_ref()
+            .map(|directory| directory.path().join("restored.so"));
         let restore_dest = scratch.as_deref().unwrap_or(dest);
         return Ok(
-            match state.restorer.restore(&entry_path, restore_dest, state.verbose) {
+            match state
+                .restorer
+                .restore(&entry_path, restore_dest, state.verbose)
+            {
                 Ok(restored) => {
                     // A prior content-only success is restored only in the
                     // private workspace to recover its module context.
@@ -1104,11 +1208,6 @@ fn write_metadata_blob(dest: &Path, data: &[u8]) -> Result<()> {
         .context("write metadata output")
 }
 
-fn open_package(path: &Path) -> Result<ZipArchive<std::fs::File>> {
-    let file = std::fs::File::open(path).with_context(|| format!("open `{}`", path.display()))?;
-    ZipArchive::new(file).with_context(|| format!("read package `{}`", path.display()))
-}
-
 /// Stream one package entry to a temporary, seekable file. The Android engine
 /// needs random access to ELF section tables, while the ZIP reader itself is
 /// consumed directly without creating an in-memory compressed or decompressed
@@ -1118,23 +1217,28 @@ fn extract_entry<R: Read + Seek>(
     index: usize,
     temporary: &tempfile::TempDir,
     label: &Path,
+    budget: &mut archive_limits::ArchiveBudget,
 ) -> Result<PathBuf> {
     let mut entry = archive.by_index(index)?;
-    let key = format!("{}-{index:08x}", label.display());
-    // `:` appears in `package::entry` labels and is invalid in Windows file
-    // names; sanitize every path-ish separator.
-    let destination = temporary.path().join(key.replace(['\\', '/', ':'], "_"));
     let output_size = entry.size();
-    let mut output = BufWriter::new(std::fs::File::create(&destination)?);
-    let written = std::io::copy(&mut entry, &mut output)?;
-    output.flush()?;
-    if written != output_size {
-        bail!(
-            "entry `{key}` decompressed to 0x{:x}, expected 0x{output_size:x}",
-            written
-        );
+    let mut file = tempfile::Builder::new()
+        .prefix("entry-")
+        .tempfile_in(temporary.path())?;
+    {
+        let mut output = BufWriter::new(file.as_file_mut());
+        budget.copy_entry(
+            &mut entry,
+            &mut output,
+            output_size,
+            &label.display().to_string(),
+        )?;
+        output.flush()?;
     }
-    Ok(destination)
+    // A failed copy drops the unique temporary immediately. Successful entries
+    // remain seekable until the enclosing package workspace is dropped.
+    file.into_temp_path()
+        .keep()
+        .context("retain extracted package entry")
 }
 
 fn map_read_only(file: &File, path: &Path) -> Result<Mmap> {

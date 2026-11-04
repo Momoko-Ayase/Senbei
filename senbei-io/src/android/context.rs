@@ -72,10 +72,12 @@ pub(crate) enum ContextAmbiguity {
 /// Run-scoped cache of restored libraries and application module contexts.
 ///
 /// The public package API still takes a content-identity set. This cache is
-/// internal: a library hit reuses the restored image, while a metadata hit is
-/// keyed by the recovery context as well as the encrypted bytes.
+/// internal: a library hit reuses only its recovered module context, while a
+/// metadata hit is keyed by recovery context as well as the encrypted bytes.
 #[derive(Debug, Default)]
 pub(crate) struct AndroidRunCache {
+    pub(super) limits: senbei_engine::android::ResourceLimits,
+    pub(super) archive: super::archive_limits::ArchiveBudget,
     apps: HashMap<AppKey, ApplicationModules>,
     /// Successfully restored protected libraries, keyed by encrypted content.
     libraries: HashMap<String, CachedLibrary>,
@@ -111,6 +113,14 @@ pub(crate) enum CachedMetadata {
 }
 
 impl AndroidRunCache {
+    pub(super) fn with_limits(limits: &senbei_engine::android::ResourceLimits) -> Self {
+        Self {
+            limits: *limits,
+            archive: super::archive_limits::ArchiveBudget::from_limits(limits),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn modules_mut(&mut self, key: &AppKey) -> &mut ApplicationModules {
         self.apps.entry(key.clone()).or_default()
     }
@@ -305,7 +315,7 @@ fn component_is(component: Component<'_>, expected: &str) -> bool {
 /// One ZIP whose central directory was listed while naming an application.
 ///
 /// `reopen_key` is the on-disk package (or extracted nested APK) to open again
-/// when entries are restored. A later resource budget must charge this archive's
+/// when entries are restored. The resource budget charges this archive's
 /// physical entry count on the first inventory pass only; reopening it for
 /// entry extraction is not a second package.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,10 +343,10 @@ pub(crate) struct PackageInventory {
 
 /// Manifest-first application identity for one ZIP package.
 ///
-/// Reads only the root `AndroidManifest.xml` entry, and only the leading window
-/// needed for the plain-XML `package` and version attributes. A missing or
-/// binary manifest does not fall back to the ZIP file name; the caller isolates
-/// that package. `package_set` is the bundle or directory that owns this set of
+/// Reads only a bounded root `AndroidManifest.xml` entry, supporting plain and
+/// compiled XML. A missing, truncated, or unrecognized manifest isolates the
+/// package instead of guessing from the ZIP filename. `package_set` is the
+/// bundle or directory that owns this set of
 /// splits — the same package name outside that boundary is a different app.
 ///
 /// The returned [`InventoriedArchive`] is the reopen handle. Callers restore
@@ -347,6 +357,7 @@ pub(crate) fn inventory_manifest_package<R: std::io::Read + std::io::Seek>(
     reopen_key: &Path,
     package_set: &Path,
     isolate_as: &str,
+    budget: &mut super::archive_limits::ArchiveBudget,
 ) -> Result<PackageInventory> {
     let entry_count = archive.len();
     let mut manifest_index = None;
@@ -379,20 +390,13 @@ pub(crate) fn inventory_manifest_package<R: std::io::Read + std::io::Seek>(
     };
     let mut entry = archive.by_index(index)?;
     // The package and version attributes are in the root `<manifest` start tag.
-    // Bound the read. A later shared ZIP budget should charge this probe; it
+    // Bound and charge this probe against the shared extraction budget. It
     // never opens assets or other entries. A manifest larger than the bound is
     // truncated and produces no identity rather than a partial guess.
     const MANIFEST_PROBE: usize = 4 * 1024 * 1024;
-    let mut buffer = vec![0_u8; MANIFEST_PROBE];
-    let mut filled = 0_usize;
-    while filled < buffer.len() {
-        match std::io::Read::read(&mut entry, &mut buffer[filled..])? {
-            0 => break,
-            read => filled += read,
-        }
-    }
-    buffer.truncate(filled);
-    let truncated = entry.size() > MANIFEST_PROBE as u64;
+    let size = entry.size();
+    let buffer = budget.read_probe(&mut entry, size, MANIFEST_PROBE, "AndroidManifest.xml")?;
+    let truncated = size > MANIFEST_PROBE as u64;
     let named = super::manifest::identity(&buffer, truncated);
     Ok(PackageInventory {
         key: match &named {
@@ -503,10 +507,11 @@ pub(crate) trait LibraryRestorer {
 }
 
 /// Production restorer: stage-2 extract, ELF rebuild, embedded metadata unwrap.
-pub(crate) struct EngineRestorer;
+#[derive(Default)]
+pub(crate) struct EngineRestorer(pub(super) senbei_engine::android::ResourceLimits);
 
 impl LibraryRestorer for EngineRestorer {
     fn restore(&mut self, input: &Path, dest: &Path, verbose: bool) -> Result<RestoredLibrary> {
-        crate::android::restore_so_with_engine(input, dest, verbose)
+        crate::android::restore_so_with_engine_limits(input, dest, verbose, &self.0)
     }
 }
