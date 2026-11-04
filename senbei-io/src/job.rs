@@ -213,64 +213,62 @@ pub fn run_folder_opts(
         bar.inc(1);
     }
 
-    // Android pass: protected AArch64 libraries and app packages. Loose `.so`
-    // files restore first so the cross-source dedup keeps them over a copy
-    // inside a package (loose beats `.apk` beats `.apks`/`.xapk` bundle).
-    let mut android_seen = std::collections::HashSet::new();
-    let mut android_method_index_module = None;
-    // Hashing a protected library costs a full read, so only pay it when a
-    // duplicate source can actually exist in this run.
-    let android_dedup = scan.android_so.len() > 1 || !scan.android_packages.is_empty();
-    for input in &scan.android_so {
-        let rel = rel_in_tree(root, input);
+    // Android pass. Loose libraries restore before packages so an identical
+    // library keeps the loose destination (loose beats `.apk` beats bundle).
+    // Module 0x0C stays inside the application that produced it: an extracted
+    // `lib/<abi>/` tree shares with that tree's `assets/` metadata only, and a
+    // package shares only with splits of the same package name and version.
+    let mut android_cache = crate::android::run_cache();
+    let loose = crate::android::loose_scopes(&scan.android_so, metas);
+    for scoped in loose.iter().filter(|scoped| {
+        scan.android_so
+            .iter()
+            .any(|library| library == &scoped.path)
+    }) {
+        let rel = rel_in_tree(root, &scoped.path);
         let dest = out_root.join(out_name(&rel));
-        // Failed restores must not hide an identical input encountered later.
-        // Unreadable here is fine: the restore reports the same error.
-        let identity = android_dedup
-            .then(|| crate::android::file_content_identity(input).ok())
-            .flatten();
-        if identity
-            .as_ref()
-            .is_some_and(|id| android_seen.contains(id))
-        {
-            s.skipped += 1;
-            if let Some(log) = &log {
-                log.step(&format!("SKIP {rel:?}: duplicate of an earlier target"));
-            }
-            bar.inc(1);
-            continue;
-        }
-        let input_owned = input.clone();
+        let input_owned = scoped.path.clone();
         let dest_owned = dest.clone();
+        let key = scoped.key.clone();
+        let label = rel.display().to_string();
         let result = senbei_engine::catch_unwind_quiet(|| {
-            crate::android::restore_so_file_with_method_index_module(
+            crate::android::restore_loose_library(
                 &input_owned,
                 &dest_owned,
+                &label,
+                &key,
                 verbose_steps,
-                &mut android_method_index_module,
+                &mut android_cache,
             )
         });
         match result {
-            Ok(Ok(embedded)) => {
-                s.unpacked += 1;
-                crate::ui::ok_label(
-                    &bar,
-                    suppress_file_lines,
-                    &rel.display().to_string(),
-                    "So",
-                    &dest,
-                );
-                if let Some(log) = &log {
-                    log.step(&format!("OK {rel:?} -> {dest:?} (Android SO)"));
+            Ok(Ok(outcome)) => match outcome.status {
+                crate::android::EntryStatus::Duplicate => {
+                    s.skipped += 1;
+                    if let Some(log) = &log {
+                        log.step(&format!("SKIP {rel:?}: duplicate of an earlier target"));
+                    }
                 }
-                let embedded_result = write_embedded_metadata(embedded, &dest);
-                if embedded_result.is_ok()
-                    && let Some(identity) = identity
-                {
-                    android_seen.insert(identity);
+                crate::android::EntryStatus::Failed(e) => {
+                    s.errors += 1;
+                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                    if let Some(log) = &log {
+                        log.step(&format!("ERR {rel:?}: {e:#}"));
+                    }
                 }
-                match embedded_result {
-                    Ok(Some(meta_dest)) => {
+                crate::android::EntryStatus::Restored => {
+                    s.unpacked += 1;
+                    crate::ui::ok_label(
+                        &bar,
+                        suppress_file_lines,
+                        &rel.display().to_string(),
+                        "So",
+                        &dest,
+                    );
+                    if let Some(log) = &log {
+                        log.step(&format!("OK {rel:?} -> {dest:?} (Android SO)"));
+                    }
+                    if let Some(meta_dest) = outcome.embedded {
                         s.metadata += 1;
                         crate::ui::ok_label(
                             &bar,
@@ -283,16 +281,11 @@ pub fn run_folder_opts(
                             log.step(&format!("META {rel:?} (embedded) -> {meta_dest:?}"));
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        s.errors += 1;
-                        crate::ui::err(&bar, suppress_file_lines, &rel, &e);
-                        if let Some(log) = &log {
-                            log.step(&format!("ERR {rel:?}: embedded metadata: {e:#}"));
-                        }
-                    }
                 }
-            }
+                crate::android::EntryStatus::NotTarget | crate::android::EntryStatus::Unchanged => {
+                    s.skipped += 1;
+                }
+            },
             Ok(Err(e)) => {
                 s.errors += 1;
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
@@ -314,71 +307,120 @@ pub fn run_folder_opts(
         }
         bar.inc(1);
     }
-    for package in &scan.android_packages {
-        let rel = rel_in_tree(root, package);
-        s.packages += 1;
-        let package_owned = package.clone();
-        let rel_owned = rel.clone().into_owned();
-        let out_root_owned = out_root.clone();
-        let mut seen_taken = std::mem::take(&mut android_seen);
-        let result = senbei_engine::catch_unwind_quiet(|| {
-            let outcomes = crate::android::restore_package_with_method_index_module(
-                &package_owned,
-                &rel_owned,
-                &out_root_owned,
-                &mut seen_taken,
-                verbose_steps,
-                &mut android_method_index_module,
-            );
-            (outcomes, seen_taken)
-        });
-        match result {
-            Ok((Ok(outcomes), seen_back)) => {
-                android_seen = seen_back;
-                apply_package_outcomes(outcomes, &mut s, &bar, suppress_file_lines, &log);
-            }
-            Ok((Err(e), seen_back)) => {
-                android_seen = seen_back;
-                s.errors += 1;
-                crate::ui::err(&bar, suppress_file_lines, &rel, &e);
-                if let Some(log) = &log {
-                    log.step(&format!("ERR {rel:?}: {e:#}"));
+    // Loose sibling APKs that name the same package and version are one split
+    // set. Their libraries run before their metadata because each package
+    // restores its own libraries first and the shared cache collects modules
+    // across the group. Bundles stay one package each.
+    let package_groups = crate::android::loose_apk_groups(&scan.android_packages);
+    for group in &package_groups {
+        if group.len() > 1 {
+            s.packages += group.len();
+            let group_owned = group.clone();
+            let root_owned = root.to_path_buf();
+            let out_root_owned = out_root.clone();
+            let result = senbei_engine::catch_unwind_quiet(|| {
+                crate::android::restore_apk_group(
+                    &group_owned,
+                    &root_owned,
+                    &out_root_owned,
+                    &mut android_cache,
+                    verbose_steps,
+                )
+            });
+            let rel = rel_in_tree(root, &group[0]);
+            match result {
+                Ok(Ok(outcomes)) => {
+                    apply_package_outcomes(outcomes, &mut s, &bar, suppress_file_lines, &log);
+                }
+                Ok(Err(e)) => {
+                    s.errors += 1;
+                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                    if let Some(log) = &log {
+                        log.step(&format!("ERR {rel:?}: {e:#}"));
+                    }
+                }
+                Err(panic) => {
+                    let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                    s.errors += 1;
+                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                    if let Some(log) = &log {
+                        log.step(&format!(
+                            "ERR {rel:?}: panic during package restore: {}",
+                            panic_payload(&panic)
+                        ));
+                    }
                 }
             }
-            Err(panic) => {
-                // The dedup set may be in an unknown state after a panic; a
-                // re-scan costs a duplicate restore at worst, never corruption.
-                let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
-                s.errors += 1;
-                crate::ui::err(&bar, suppress_file_lines, &rel, &e);
-                if let Some(log) = &log {
-                    log.step(&format!(
-                        "ERR {rel:?}: panic during package restore: {}",
-                        panic_payload(&panic)
-                    ));
-                }
-            }
+            bar.inc(group.len() as u64);
+            continue;
         }
-        bar.inc(1);
+        for package in group {
+            let rel = rel_in_tree(root, package);
+            s.packages += 1;
+            let package_owned = package.clone();
+            let rel_owned = rel.clone().into_owned();
+            let out_root_owned = out_root.clone();
+            let result = senbei_engine::catch_unwind_quiet(|| {
+                crate::android::restore_package_cached(
+                    &package_owned,
+                    &rel_owned,
+                    &out_root_owned,
+                    &mut android_cache,
+                    verbose_steps,
+                )
+            });
+            match result {
+                Ok(Ok(outcomes)) => {
+                    apply_package_outcomes(outcomes, &mut s, &bar, suppress_file_lines, &log);
+                }
+                Ok(Err(e)) => {
+                    s.errors += 1;
+                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                    if let Some(log) = &log {
+                        log.step(&format!("ERR {rel:?}: {e:#}"));
+                    }
+                }
+                Err(panic) => {
+                    // A panic may leave a partial module recorded. Keeping the cache
+                    // preserves successful dedup; a conflict still fails closed.
+                    let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                    s.errors += 1;
+                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                    if let Some(log) = &log {
+                        log.step(&format!(
+                            "ERR {rel:?}: panic during package restore: {}",
+                            panic_payload(&panic)
+                        ));
+                    }
+                }
+            }
+            bar.inc(1);
+        }
     }
 
-    // il2cpp metadata pass. Crackproof's `-GMD` option obfuscates the method
-    // tokens in `global-metadata.dat`; de-obfuscate any we find so the unpacked
-    // il2cpp game assembly resolves methods instead of indexing its per-module
-    // tables out of bounds (see [`senbei_metadata`]). This is additive to the
-    // Crackproof module unpack above — the metadata blob is not itself a
-    // Crackproof file.
-    for meta in metas.iter() {
-        let rel = rel_in_tree(root, meta);
+    // il2cpp metadata pass. A loose blob is paired only with the application
+    // assigned when the tree was grouped. v24.1 with a missing or conflicting
+    // module writes nothing. Other versions still restore when the application
+    // has no conflicting module. The paired libraries are recorded on the log
+    // line.
+    for scoped in loose
+        .iter()
+        .filter(|scoped| metas.iter().any(|meta| meta == &scoped.path))
+    {
+        let rel = rel_in_tree(root, &scoped.path);
         let dest = out_root.join(out_name(&rel));
-        let meta_owned = meta.clone();
+        let meta_owned = scoped.path.clone();
         let dest_owned = dest.clone();
+        let key = scoped.key.clone();
+        let label = rel.display().to_string();
         let result = senbei_engine::catch_unwind_quiet(|| {
-            deobfuscate_metadata_to_with_module(
+            crate::android::restore_loose_metadata(
                 &meta_owned,
                 &dest_owned,
+                &label,
+                &key,
                 verbose_steps,
-                android_method_index_module.as_deref(),
+                &mut android_cache,
             )
         });
         match result {
@@ -387,8 +429,10 @@ pub fn run_folder_opts(
                 crate::ui::metadata(&bar, suppress_file_lines, &rel, report.remapped, &dest);
                 if let Some(log) = &log {
                     log.step(&format!(
-                        "META {rel:?} -> {dest:?}: v{} remapped {} method fields",
-                        report.version, report.remapped
+                        "META {rel:?} -> {dest:?}: v{} remapped {} method fields{}",
+                        report.version,
+                        report.remapped,
+                        provenance_suffix(&report.provenance)
                     ));
                 }
             }
@@ -397,8 +441,9 @@ pub fn run_folder_opts(
             Ok(Ok(report)) => {
                 if let Some(log) = &log {
                     log.step(&format!(
-                        "META {rel:?}: v{} already de-obfuscated",
-                        report.version
+                        "META {rel:?}: v{} already de-obfuscated{}",
+                        report.version,
+                        provenance_suffix(&report.provenance)
                     ));
                 }
             }
@@ -709,6 +754,14 @@ pub fn out_name(input: &Path) -> PathBuf {
     }
 }
 
+fn provenance_suffix(sources: &[String]) -> String {
+    if sources.is_empty() {
+        String::new()
+    } else {
+        format!("; module 0x0C from {}", sources.join(", "))
+    }
+}
+
 /// Extract a printable message from a caught panic payload.
 fn panic_payload(panic: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
@@ -832,7 +885,12 @@ fn apply_package_outcomes(
                     }
                 }
                 if let Some(log) = log {
-                    log.step(&format!("OK {} -> {:?}", outcome.label, outcome.dest));
+                    log.step(&format!(
+                        "OK {} -> {:?}{}",
+                        outcome.label,
+                        outcome.dest,
+                        provenance_suffix(&outcome.provenance)
+                    ));
                 }
             }
             EntryStatus::Duplicate | EntryStatus::NotTarget | EntryStatus::Unchanged => {

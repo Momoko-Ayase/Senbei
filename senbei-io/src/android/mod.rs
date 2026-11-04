@@ -18,12 +18,17 @@
 #[cfg(test)]
 mod tests;
 
+mod context;
+mod manifest;
+
+use context::LibraryRestorer;
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
 use senbei_crypto::hex_digest;
 use senbei_engine::android::{ExtractOptions, extract_stage2, is_protected_libil2cpp};
@@ -103,16 +108,16 @@ pub fn file_content_identity(path: &Path) -> std::io::Result<String> {
 /// implementation detail of the two-phase restore, not user-facing output).
 /// Returns the unwrapped embedded metadata blob when the restored image
 /// carries one (see the module docs); the caller decides where to write it.
-struct SoRestoreContext {
-    embedded_metadata: Option<Vec<u8>>,
-    method_index_module: Option<Vec<u8>>,
-}
-
-fn restore_so_file_with_context(
+///
+/// Module `0x0C` recovered here belongs to this library's application. Callers
+/// that restore more than one application must keep those modules apart; this
+/// single-file entry point has only one application, so it keeps the module
+/// only long enough to unwrap embedded metadata (which does not consume it).
+pub(crate) fn restore_so_with_engine(
     input: &Path,
     dest: &Path,
     verbose: bool,
-) -> Result<SoRestoreContext> {
+) -> Result<context::RestoredLibrary> {
     let temporary = tempfile::tempdir().context("create stage-2 workspace")?;
     let stage2_dir = temporary.path().join("stage2");
     let extraction = extract_stage2(&ExtractOptions::with_defaults(
@@ -120,15 +125,33 @@ fn restore_so_file_with_context(
         stage2_dir.clone(),
     ))
     .context("extract stage-1/stage-2 payload")?;
-    let method_index_module = extraction
+    // Every module 0x0C is collected. Two distinct images in one library are a
+    // conflict for that library's application, not a last-writer-wins update.
+    let mut modules = Vec::new();
+    for module in extraction
         .module_registry
         .iter()
-        .find(|module| module.command_id == 0x0c)
-        .map(|module| {
-            std::fs::read(stage2_dir.join(&module.image_path))
-                .with_context(|| format!("read decoded module 0x0C `{}`", module.image_path))
-        })
-        .transpose()?;
+        .filter(|module| module.command_id == 0x0c)
+    {
+        let bytes = std::fs::read(stage2_dir.join(&module.image_path))
+            .with_context(|| format!("read decoded module 0x0C `{}`", module.image_path))?;
+        if modules
+            .iter()
+            .all(|(_, existing): &(_, Vec<u8>)| existing != &bytes)
+        {
+            modules.push((module.image_path.clone(), bytes));
+        }
+    }
+    ensure!(
+        modules.len() <= 1,
+        "library `{}` contains {} distinct module 0x0C images",
+        input.display(),
+        modules.len()
+    );
+    let (module_image, method_index_module) = modules
+        .pop()
+        .map(|(image, bytes)| (Some(image), Some(bytes)))
+        .unwrap_or((None, None));
     restore_libil2cpp(&RestoreOptions {
         input: input.to_path_buf(),
         output: dest.to_path_buf(),
@@ -139,30 +162,289 @@ fn restore_so_file_with_context(
         verbose,
     })
     .context("restore protected library")?;
-    let restored =
-        std::fs::read(dest).with_context(|| format!("read restored `{}`", dest.display()))?;
-    Ok(SoRestoreContext {
+    let restored_file =
+        File::open(dest).with_context(|| format!("read restored `{}`", dest.display()))?;
+    let restored = map_read_only(&restored_file, dest)?;
+    Ok(context::RestoredLibrary {
         embedded_metadata: senbei_metadata::android::extract_embedded_metadata(&restored),
         method_index_module,
+        module_image,
     })
 }
 
 pub fn restore_so_file(input: &Path, dest: &Path, verbose: bool) -> Result<Option<Vec<u8>>> {
-    let mut method_index_module = None;
-    restore_so_file_with_method_index_module(input, dest, verbose, &mut method_index_module)
+    Ok(context::EngineRestorer
+        .restore(input, dest, verbose)?
+        .embedded_metadata)
 }
 
-pub(crate) fn restore_so_file_with_method_index_module(
+/// Fresh run-scoped cache. Library hits reuse a restored image; metadata hits
+/// are keyed by encrypted bytes and the module that recovered them.
+pub(crate) fn run_cache() -> context::AndroidRunCache {
+    context::AndroidRunCache::default()
+}
+
+/// Assign loose libraries and metadata to application contexts.
+pub(crate) fn loose_scopes(
+    libraries: &[PathBuf],
+    metadata: &[PathBuf],
+) -> Vec<context::ScopedInput> {
+    context::group_loose_inputs(libraries, metadata)
+}
+
+/// One loose library restore, including the embedded metadata blob when the
+/// rebuilt image carried one. `Duplicate` means an earlier successful restore
+/// of the same encrypted bytes already populated this application.
+#[derive(Debug)]
+pub(crate) struct LooseLibraryOutcome {
+    pub status: EntryStatus,
+    /// Embedded metadata already written as part of this successful restore.
+    pub embedded: Option<PathBuf>,
+}
+
+pub(crate) fn restore_loose_library(
     input: &Path,
     dest: &Path,
+    label: &str,
+    app: &context::AppKey,
     verbose: bool,
-    method_index_module: &mut Option<Vec<u8>>,
-) -> Result<Option<Vec<u8>>> {
-    let restored = restore_so_file_with_context(input, dest, verbose)?;
-    if let Some(module) = restored.method_index_module {
-        *method_index_module = Some(module);
+    cache: &mut context::AndroidRunCache,
+) -> Result<LooseLibraryOutcome> {
+    restore_loose_library_with(
+        input,
+        dest,
+        label,
+        app,
+        verbose,
+        cache,
+        &mut context::EngineRestorer,
+    )
+}
+
+fn restore_loose_library_with<R: context::LibraryRestorer>(
+    input: &Path,
+    dest: &Path,
+    label: &str,
+    app: &context::AppKey,
+    verbose: bool,
+    cache: &mut context::AndroidRunCache,
+    restorer: &mut R,
+) -> Result<LooseLibraryOutcome> {
+    let identity = file_content_identity(input).with_context(|| format!("hash `{label}`"))?;
+    if let Some(cached) = cache.library(&identity).cloned() {
+        // Same encrypted library. Record its module on this application and
+        // write nothing: a duplicate has no output of its own.
+        record_module(cache, app, &cached, label);
+        return Ok(LooseLibraryOutcome {
+            status: EntryStatus::Duplicate,
+            embedded: None,
+        });
     }
-    Ok(restored.embedded_metadata)
+    // A prior content-only success still needs context extraction. Restore it
+    // in a private workspace, never over a destination that must stay untouched.
+    let prior = cache.is_prior_success(&identity);
+    let workspace = prior.then(tempfile::tempdir).transpose().context("create duplicate context workspace")?;
+    let scratch = workspace.as_ref().map(|directory| directory.path().join("restored.so"));
+    let restore_dest = scratch.as_deref().unwrap_or(dest);
+    match restorer.restore(input, restore_dest, verbose) {
+        Ok(restored) => {
+            // The library file is already at `dest`. Embedded metadata is part
+            // of the same success: cache the module only after that write.
+            let mut embedded = None;
+            if !prior && let Some(blob) = &restored.embedded_metadata {
+                let meta_dest = embedded_metadata_dest(dest);
+                if let Err(error) = write_metadata_blob(&meta_dest, blob) {
+                    return Ok(LooseLibraryOutcome {
+                        status: EntryStatus::Failed(error),
+                        embedded: None,
+                    });
+                }
+                embedded = Some(meta_dest);
+            }
+            let cached = context::CachedLibrary {
+                method_index_module: restored.method_index_module,
+                module_image: restored.module_image,
+            };
+            record_module(cache, app, &cached, label);
+            cache.insert_library(identity, cached);
+            Ok(LooseLibraryOutcome {
+                status: if prior { EntryStatus::Duplicate } else { EntryStatus::Restored },
+                embedded,
+            })
+        }
+        Err(error) => Ok(LooseLibraryOutcome {
+            status: EntryStatus::Failed(error),
+            embedded: None,
+        }),
+    }
+}
+
+/// Metadata restored under one application context, plus the libraries whose
+/// module was paired with it.
+#[derive(Debug)]
+pub(crate) struct LooseMetadataOutcome {
+    pub version: u32,
+    pub remapped: usize,
+    pub provenance: Vec<String>,
+}
+
+pub(crate) fn restore_loose_metadata(
+    input: &Path,
+    dest: &Path,
+    label: &str,
+    app: &context::AppKey,
+    verbose: bool,
+    cache: &mut context::AndroidRunCache,
+) -> Result<LooseMetadataOutcome> {
+    let data = std::fs::read(input).with_context(|| format!("read `{label}`"))?;
+    let version = metadata_version(&data);
+    // Only raw v24 consumes module 0x0C. v29/v31/v39 and the structural path
+    // must not fail, and must not record a module they did not use, when the
+    // application's libraries disagree or have no module.
+    let (module, provenance) = if version == Some(24) {
+        let modules = cache.modules(app).cloned();
+        match context::binding_module(modules.as_ref()) {
+            Ok(module) => (
+                module.map(|bytes| bytes.to_vec()),
+                provenance_labels(&context::provenance_for(modules.as_ref(), None)),
+            ),
+            Err(ambiguity) => {
+                let provenance = context::provenance_for(modules.as_ref(), Some(&ambiguity));
+                bail!(provenance_error(&provenance));
+            }
+        }
+    } else {
+        (None, Vec::new())
+    };
+    let module = module.as_deref();
+    // Loose metadata retains one output per path, as before. Do not keep all
+    // restored blobs in the folder cache just to avoid a repeated permutation.
+    let (out, report) =
+        restore_metadata_bytes_with_module(&data, module).with_context(|| label.to_owned())?;
+    if report.remapped > 0 {
+        write_metadata_blob(dest, &out)?;
+        if verbose { println!("Write to {}", dest.display()); }
+    }
+    Ok(LooseMetadataOutcome {
+        version: report.version,
+        remapped: report.remapped,
+        provenance,
+    })
+}
+
+/// Group loose `.apk` files that are a split set: same parent directory and
+/// the same manifest package name plus version. Bundles are never grouped
+/// with anything. Order inside a group does not matter; the caller restores
+/// every library in the group before any of its metadata.
+pub(crate) fn loose_apk_groups(packages: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+    let mut groups: Vec<(context::AppKey, Vec<PathBuf>)> = Vec::new();
+    let mut alone = Vec::new();
+    for package in packages {
+        let extension = package.extension().and_then(|value| value.to_str());
+        let is_apk = extension.is_some_and(|value| value.eq_ignore_ascii_case("apk"));
+        if !is_apk {
+            alone.push(vec![package.clone()]);
+            continue;
+        }
+        let key = apk_manifest_key(package);
+        if let Some(key) = key {
+            if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
+                members.push(package.clone());
+            } else {
+                groups.push((key, vec![package.clone()]));
+            }
+        } else {
+            alone.push(vec![package.clone()]);
+        }
+    }
+    let mut grouped: Vec<_> = groups.into_iter().map(|(_, members)| members).collect();
+    grouped.append(&mut alone);
+    grouped
+}
+
+fn apk_manifest_key(package: &Path) -> Option<context::AppKey> {
+    let file = std::fs::File::open(package).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let parent = package
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let inventory = context::inventory_manifest_package(
+        &mut archive,
+        package,
+        parent,
+        &package.display().to_string(),
+    )
+    .ok()?;
+    match inventory.key {
+        context::AppKey::Manifest { .. } => Some(inventory.key),
+        _ => None,
+    }
+}
+
+/// Restore one package against the folder run's cache. Successful library
+/// identities are published back through the cache itself; the public
+/// [`restore_package`] wrapper remains for callers that only have a `HashSet`.
+pub(crate) fn restore_package_cached(
+    package: &Path,
+    rel: &Path,
+    out_root: &Path,
+    cache: &mut context::AndroidRunCache,
+    verbose: bool,
+) -> Result<Vec<EntryOutcome>> {
+    restore_package_with_restorer(
+        package,
+        rel,
+        out_root,
+        cache,
+        verbose,
+        &mut context::EngineRestorer,
+    )
+}
+
+/// One folder split-set: every library in the group, then every metadata blob.
+/// A library-only pass records modules without writing metadata, so a metadata
+/// blob in an earlier sibling cannot run before a library in a later one.
+pub(crate) fn restore_apk_group(
+    packages: &[PathBuf],
+    root: &Path,
+    out_root: &Path,
+    cache: &mut context::AndroidRunCache,
+    verbose: bool,
+) -> Result<Vec<EntryOutcome>> {
+    let mut outcomes = Vec::new();
+    for package in packages {
+        let rel = package.strip_prefix(root).unwrap_or(package);
+        outcomes.extend(restore_package_pass(
+            package,
+            rel,
+            out_root,
+            cache,
+            verbose,
+            &mut context::EngineRestorer,
+            PackagePass::Libraries,
+        )?);
+    }
+    for package in packages {
+        let rel = package.strip_prefix(root).unwrap_or(package);
+        outcomes.extend(restore_package_pass(
+            package,
+            rel,
+            out_root,
+            cache,
+            verbose,
+            &mut context::EngineRestorer,
+            PackagePass::Metadata,
+        )?);
+    }
+    Ok(outcomes)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackagePass {
+    All,
+    Libraries,
+    Metadata,
 }
 
 /// Content identity for cross-source deduplication: the same library may
@@ -198,9 +480,13 @@ pub(crate) fn restore_metadata_bytes_with_module(
         .get(4..8)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .map(u32::from_le_bytes);
-    if version == Some(24)
-        && let Some(module) = method_index_module
-    {
+    if version == Some(24) {
+        // v24.1 method indices come only from this application's module 0x0C.
+        // Falling through to the structural remap would report "unsupported
+        // version" and could be mistaken for a clean skip. No module is a
+        // failed binding, not an unsupported layout.
+        let module = method_index_module
+            .ok_or_else(|| anyhow::anyhow!("no module 0x0C for v24.1 metadata"))?;
         let (out, report) = senbei_metadata::android::restore_method_indices_v24_1(data, module)
             .map_err(anyhow::Error::new)?;
         return Ok((
@@ -252,6 +538,9 @@ pub struct EntryOutcome {
     pub dest: PathBuf,
     pub kind: EntryKind,
     pub status: EntryStatus,
+    /// Libraries whose module `0x0C` was paired with this metadata entry.
+    /// Empty for libraries and for metadata that had no paired module.
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,18 +567,10 @@ pub enum EntryStatus {
     Failed(anyhow::Error),
 }
 
-struct PackageRestoreContext<'a> {
-    method_index_module: &'a mut Option<Vec<u8>>,
+struct PackageRestoreState<'a, R> {
+    restorer: &'a mut R,
+    cache: &'a mut context::AndroidRunCache,
     verbose: bool,
-}
-
-impl<'a> PackageRestoreContext<'a> {
-    fn new(verbose: bool, method_index_module: &'a mut Option<Vec<u8>>) -> Self {
-        Self {
-            method_index_module,
-            verbose,
-        }
-    }
 }
 
 fn package_entry_priority(path: &Path) -> u8 {
@@ -310,24 +591,60 @@ pub fn restore_package(
     seen: &mut HashSet<String>,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
-    let mut method_index_module = None;
-    restore_package_with_method_index_module(
+    // `seen` is the public successful-content set shared with loose libraries.
+    // Metadata recovery context does not fit in that set, so this wrapper keeps
+    // a run-scoped cache and only publishes content identities of entries that
+    // actually succeeded. A caller that passes identities restored by an earlier
+    // package still skips those bytes; module context for metadata is rebuilt
+    // inside this package (one package, or one manifest-scoped bundle, is one
+    // application boundary).
+    let mut cache = context::AndroidRunCache::default();
+    for identity in seen.iter().cloned() {
+        cache.insert_prior_success(identity);
+    }
+    let outcomes = restore_package_with_restorer(
         package,
         rel,
         out_root,
-        seen,
+        &mut cache,
         verbose,
-        &mut method_index_module,
-    )
+        &mut context::EngineRestorer,
+    );
+    // Publish successes even when the package returns `Err`. The caller's set
+    // is only replaced after that, so a panic still leaves the old successes.
+    let succeeded = cache.successful_content_identities();
+    seen.clear();
+    seen.extend(succeeded);
+    outcomes
 }
 
-pub(crate) fn restore_package_with_method_index_module(
+pub(crate) fn restore_package_with_restorer<R: context::LibraryRestorer>(
     package: &Path,
     rel: &Path,
     out_root: &Path,
-    seen: &mut HashSet<String>,
+    cache: &mut context::AndroidRunCache,
     verbose: bool,
-    method_index_module: &mut Option<Vec<u8>>,
+    restorer: &mut R,
+) -> Result<Vec<EntryOutcome>> {
+    restore_package_pass(
+        package,
+        rel,
+        out_root,
+        cache,
+        verbose,
+        restorer,
+        PackagePass::All,
+    )
+}
+
+fn restore_package_pass<R: context::LibraryRestorer>(
+    package: &Path,
+    rel: &Path,
+    out_root: &Path,
+    cache: &mut context::AndroidRunCache,
+    verbose: bool,
+    restorer: &mut R,
+    pass: PackagePass,
 ) -> Result<Vec<EntryOutcome>> {
     let bundle = package
         .extension()
@@ -338,7 +655,11 @@ pub(crate) fn restore_package_with_method_index_module(
     let mut archive = open_package(package)?;
     let temporary = tempfile::tempdir().context("create package workspace")?;
     let mut outcomes = Vec::new();
-    let mut context = PackageRestoreContext::new(verbose, method_index_module);
+    let mut state = PackageRestoreState {
+        restorer,
+        cache,
+        verbose,
+    };
 
     let mut direct = Vec::new();
     let mut nested = Vec::new();
@@ -361,32 +682,60 @@ pub(crate) fn restore_package_with_method_index_module(
             {
                 nested.push((index, name));
             }
-        } else {
-            if is_android_entry_name(&name) {
-                direct.push((index, name));
-            }
+        } else if is_android_entry_name(&name) {
+            direct.push((index, name));
         }
     }
-    direct.sort_by_key(|(_, name)| package_entry_priority(name));
-    for (index, name) in direct {
-        let label = format!("{}::{}", rel.display(), name.display());
-        let dest = out_root.join(rel).join(crate::job::out_name(&name));
-        let mut entry_outcomes = restore_package_entry(
+    // One direct package is one application inside its own package set (the
+    // package file). A plain manifest names it by package plus version; without
+    // both, the package is isolated. The ZIP file name is not a package id.
+    // Inventory already walked this central directory; entry extraction below
+    // reuses the same open and must not be charged as a second package.
+    let direct_inventory = if direct.is_empty() {
+        None
+    } else {
+        Some(context::inventory_manifest_package(
             &mut archive,
-            index,
-            &label,
-            &dest,
-            &temporary,
-            seen,
-            &mut context,
-        )
-        .with_context(|| format!("extract `{label}`"))?;
-        outcomes.append(&mut entry_outcomes);
+            package,
+            package
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+            &package.display().to_string(),
+        )?)
+    };
+    direct.retain(|(_, name)| match pass {
+        PackagePass::Libraries => package_entry_priority(name) == 0,
+        PackagePass::Metadata => package_entry_priority(name) == 1,
+        PackagePass::All => true,
+    });
+    direct.sort_by_key(|(_, name)| package_entry_priority(name));
+    if let Some(inventory) = direct_inventory {
+        for (index, name) in direct {
+            let label = format!("{}::{}", rel.display(), name.display());
+            let dest = out_root.join(rel).join(crate::job::out_name(&name));
+            let mut entry_outcomes = restore_package_entry(
+                &mut archive,
+                index,
+                &label,
+                &dest,
+                &temporary,
+                &inventory.key,
+                &mut state,
+            )
+            .with_context(|| format!("extract `{label}`"))?;
+            outcomes.append(&mut entry_outcomes);
+        }
     }
     struct NestedPackage {
         label: PathBuf,
         path: PathBuf,
         base: PathBuf,
+        app: context::AppKey,
+        /// Manifest inventory, including the reopen key. Extraction opens
+        /// `path` again; `inventory.archive` is the pass a later budget must
+        /// not charge a second time.
+        inventory: context::PackageInventory,
         entries: Vec<(usize, PathBuf)>,
     }
 
@@ -396,6 +745,18 @@ pub(crate) fn restore_package_with_method_index_module(
         let nested_path = extract_entry(&mut archive, index, &temporary, &nested_label)
             .with_context(|| format!("extract `{}`", nested_label.display()))?;
         let mut nested_archive = open_package(&nested_path)?;
+        // Manifest first, before any library or metadata entry is chosen. Splits
+        // that name the same package and version, inside this bundle only, share
+        // one context. A split with no plain package name or no version is
+        // isolated and cannot borrow a sibling's module. `nested_path` is the
+        // reopen key: the central directory listed here is not charged again
+        // when entries are extracted below.
+        let inventory = context::inventory_manifest_package(
+            &mut nested_archive,
+            &nested_path,
+            package,
+            &nested_path.display().to_string(),
+        )?;
         let mut entries = Vec::new();
         for nested_index in 0..nested_archive.len() {
             let (entry_name, is_dir) = {
@@ -415,40 +776,61 @@ pub(crate) fn restore_package_with_method_index_module(
             label: nested_label,
             path: nested_path,
             base: rel.join(name.with_extension("")),
+            app: inventory.key.clone(),
+            inventory,
             entries,
         });
     }
 
     // A bundle can put libil2cpp.so in an ABI split while metadata stays in
-    // base.apk. Share one context across the whole bundle and process all SOs
-    // before any metadata, regardless of which nested APK owns each entry.
-    for priority in [0_u8, 1_u8] {
-        for nested_package in &nested_packages {
-            let mut nested_archive = open_package(&nested_package.path)?;
-            for (nested_index, entry_name) in nested_package
-                .entries
-                .iter()
-                .filter(|(_, entry_name)| package_entry_priority(entry_name) == priority)
-            {
-                let label = format!(
-                    "{}::{}",
-                    nested_package.label.display(),
-                    entry_name.display()
+    // base.apk. Splits of the same manifest package share one context. All of
+    // that application's libraries are restored before its metadata, independent
+    // of nested-APK order. Different package names never share a module.
+    let mut app_order: Vec<context::AppKey> = Vec::new();
+    for nested_package in &nested_packages {
+        if !app_order.contains(&nested_package.app) {
+            app_order.push(nested_package.app.clone());
+        }
+    }
+    let priorities: &[u8] = match pass {
+        PackagePass::Libraries => &[0],
+        PackagePass::Metadata => &[1],
+        PackagePass::All => &[0, 1],
+    };
+    for app in &app_order {
+        for priority in priorities {
+            for nested_package in nested_packages.iter().filter(|nested| &nested.app == app) {
+                // Same file the inventory listed. Reopening is not a new package.
+                debug_assert_eq!(
+                    nested_package.inventory.archive.reopen_key,
+                    nested_package.path
                 );
-                let dest = out_root
-                    .join(&nested_package.base)
-                    .join(crate::job::out_name(entry_name));
-                let mut entry_outcomes = restore_package_entry(
-                    &mut nested_archive,
-                    *nested_index,
-                    &label,
-                    &dest,
-                    &temporary,
-                    seen,
-                    &mut context,
-                )
-                .with_context(|| format!("extract `{label}`"))?;
-                outcomes.append(&mut entry_outcomes);
+                let mut nested_archive = open_package(&nested_package.path)?;
+                for (nested_index, entry_name) in nested_package
+                    .entries
+                    .iter()
+                    .filter(|(_, entry_name)| package_entry_priority(entry_name) == *priority)
+                {
+                    let label = format!(
+                        "{}::{}",
+                        nested_package.label.display(),
+                        entry_name.display()
+                    );
+                    let dest = out_root
+                        .join(&nested_package.base)
+                        .join(crate::job::out_name(entry_name));
+                    let mut entry_outcomes = restore_package_entry(
+                        &mut nested_archive,
+                        *nested_index,
+                        &label,
+                        &dest,
+                        &temporary,
+                        app,
+                        &mut state,
+                    )
+                    .with_context(|| format!("extract `{label}`"))?;
+                    outcomes.append(&mut entry_outcomes);
+                }
             }
         }
     }
@@ -458,105 +840,248 @@ pub(crate) fn restore_package_with_method_index_module(
 /// Probe one extracted package entry and restore it when it is a target.
 /// Returns one outcome per produced/consumed artifact: the entry itself, plus
 /// an `EmbeddedMetadata` outcome when the restored library carried a blob.
-fn restore_package_entry<R: Read + Seek>(
+///
+/// `app` is the application this entry was inventoried into. Libraries record
+/// their module there; metadata reads it back and refuses a conflicting or
+/// missing binding before writing.
+fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
     archive: &mut ZipArchive<R>,
     index: usize,
     label: &str,
     dest: &Path,
     temporary: &tempfile::TempDir,
-    seen: &mut HashSet<String>,
-    context: &mut PackageRestoreContext<'_>,
+    app: &context::AppKey,
+    state: &mut PackageRestoreState<'_, T>,
 ) -> Result<Vec<EntryOutcome>> {
     let entry_path = extract_entry(archive, index, temporary, Path::new(label))?;
     let entry_file =
         File::open(&entry_path).with_context(|| format!("open extracted `{label}`"))?;
     let entry_data = map_read_only(&entry_file, &entry_path)?;
 
-    let is_so = is_elf64_aarch64(&entry_data) && is_protected_libil2cpp(&entry_data);
+    let protected_override = state.restorer.protected_override(&entry_path);
+    let is_so = protected_override.is_some()
+        || (is_elf64_aarch64(&entry_data) && is_protected_libil2cpp(&entry_data));
     let is_meta = !is_so && senbei_metadata::is_metadata(&entry_data);
-    let outcome = |kind, status| EntryOutcome {
+    let outcome = |kind, status, provenance: Vec<String>| EntryOutcome {
         label: label.to_owned(),
         dest: dest.to_path_buf(),
         kind,
         status,
+        provenance,
     };
     if !is_so && !is_meta {
-        return Ok(vec![outcome(EntryKind::So, EntryStatus::NotTarget)]);
+        return Ok(vec![outcome(
+            EntryKind::So,
+            EntryStatus::NotTarget,
+            Vec::new(),
+        )]);
     }
     let identity = content_identity(&entry_data);
-    if seen.contains(&identity) {
-        let kind = if is_so {
-            EntryKind::So
-        } else {
-            EntryKind::Metadata { remapped: 0 }
-        };
-        return Ok(vec![outcome(kind, EntryStatus::Duplicate)]);
+    if is_so && state.cache.library(&identity).is_some() {
+        if let Some(cached) = state.cache.library(&identity).cloned() {
+            // Duplicate libraries still belong to the application that contains
+            // them. The cached module is recorded here and no output is written.
+            record_module(state.cache, app, &cached, label);
+        }
+        return Ok(vec![outcome(
+            EntryKind::So,
+            EntryStatus::Duplicate,
+            Vec::new(),
+        )]);
     }
 
     if is_so {
         drop(entry_data);
         drop(entry_file);
+        let prior = state.cache.is_prior_success(&identity);
+        let workspace = prior.then(|| tempfile::tempdir_in(temporary.path())).transpose()
+            .context("create duplicate context workspace")?;
+        let scratch = workspace.as_ref().map(|directory| directory.path().join("restored.so"));
+        let restore_dest = scratch.as_deref().unwrap_or(dest);
         return Ok(
-            match restore_so_file_with_context(&entry_path, dest, context.verbose) {
+            match state.restorer.restore(&entry_path, restore_dest, state.verbose) {
                 Ok(restored) => {
-                    if let Some(module) = restored.method_index_module {
-                        *context.method_index_module = Some(module);
+                    // A prior content-only success is restored only in the
+                    // private workspace to recover its module context.
+                    let mut outcomes = Vec::new();
+                    let mut embedded_failed = None;
+                    if !prior {
+                        outcomes.push(outcome(EntryKind::So, EntryStatus::Restored, Vec::new()));
                     }
-                    let mut outcomes = vec![outcome(EntryKind::So, EntryStatus::Restored)];
-                    if let Some(blob) = restored.embedded_metadata {
+                    if !prior && let Some(blob) = &restored.embedded_metadata {
                         let meta_dest = embedded_metadata_dest(dest);
-                        let status = match write_metadata_blob(&meta_dest, &blob) {
-                            Ok(()) => EntryStatus::Restored,
-                            Err(error) => EntryStatus::Failed(error),
+                        match write_metadata_blob(&meta_dest, blob) {
+                            Ok(()) => outcomes.push(EntryOutcome {
+                                label: format!("{label} (embedded metadata)"),
+                                dest: meta_dest,
+                                kind: EntryKind::EmbeddedMetadata,
+                                status: EntryStatus::Restored,
+                                provenance: Vec::new(),
+                            }),
+                            Err(error) => embedded_failed = Some(error),
+                        }
+                    }
+                    if let Some(error) = embedded_failed {
+                        vec![outcome(
+                            EntryKind::So,
+                            EntryStatus::Failed(error),
+                            Vec::new(),
+                        )]
+                    } else {
+                        let cached = context::CachedLibrary {
+                            method_index_module: restored.method_index_module.clone(),
+                            module_image: restored.module_image.clone(),
                         };
-                        outcomes.push(EntryOutcome {
-                            label: format!("{label} (embedded metadata)"),
-                            dest: meta_dest,
-                            kind: EntryKind::EmbeddedMetadata,
-                            status,
-                        });
+                        record_module(state.cache, app, &cached, label);
+                        state.cache.insert_library(identity, cached);
+                        if prior {
+                            vec![outcome(EntryKind::So, EntryStatus::Duplicate, Vec::new())]
+                        } else {
+                            outcomes
+                        }
                     }
-                    if outcomes
-                        .iter()
-                        .all(|outcome| !matches!(outcome.status, EntryStatus::Failed(_)))
-                    {
-                        seen.insert(identity);
-                    }
-                    outcomes
                 }
-                Err(error) => vec![outcome(EntryKind::So, EntryStatus::Failed(error))],
+                Err(error) => vec![outcome(
+                    EntryKind::So,
+                    EntryStatus::Failed(error),
+                    Vec::new(),
+                )],
             },
         );
     }
 
-    // Metadata entry: write only when the restore actually changed protected method fields —
-    // a clean blob needs no copy (same contract as loose metadata files).
-    let kind_and_status = match restore_metadata_bytes_with_module(
-        &entry_data,
-        context.method_index_module.as_deref(),
-    ) {
+    let version = metadata_version(&entry_data);
+    // Module 0x0C is a v24.1 input only. Later layouts ignore it, so a missing
+    // or conflicting module does not block them and is not listed as paired.
+    let (module, provenance) = if version == Some(24) {
+        let modules = state.cache.modules(app).cloned();
+        match context::binding_module(modules.as_ref()) {
+            Ok(module) => (
+                module.map(|bytes| bytes.to_vec()),
+                context::provenance_for(modules.as_ref(), None),
+            ),
+            Err(ambiguity) => {
+                let provenance = context::provenance_for(modules.as_ref(), Some(&ambiguity));
+                return Ok(vec![outcome(
+                    EntryKind::Metadata { remapped: 0 },
+                    EntryStatus::Failed(anyhow::anyhow!(provenance_error(&provenance))),
+                    provenance_labels(&provenance),
+                )]);
+            }
+        }
+    } else {
+        (None, context::MetadataProvenance::default())
+    };
+    let module_bytes = module;
+    let module = module_bytes.as_deref();
+    let context_identity = context::metadata_context_identity(module);
+    if let Some(cached) = state.cache.metadata(&identity, &context_identity).cloned() {
+        // A repeated blob is not written again. The cached bytes stay available
+        // for a *different* recovery context; this context already succeeded.
+        let kind = match &cached {
+            context::CachedMetadata::Unchanged => EntryKind::Metadata { remapped: 0 },
+            context::CachedMetadata::Restored { remapped, .. } => EntryKind::Metadata {
+                remapped: *remapped,
+            },
+        };
+        return Ok(vec![outcome(
+            kind,
+            EntryStatus::Duplicate,
+            provenance_labels(&provenance),
+        )]);
+    }
+
+    // Metadata entry: write only when the restore actually changed protected
+    // method fields — a clean blob needs no copy (same contract as loose files).
+    // The binding was resolved before this write.
+    let kind_and_status = match restore_metadata_bytes_with_module(&entry_data, module) {
         Ok((out, report)) if report.remapped > 0 => {
             let kind = EntryKind::Metadata {
                 remapped: report.remapped,
             };
             match write_metadata_blob(dest, &out) {
-                Ok(()) => (kind, EntryStatus::Restored),
+                Ok(()) => {
+                    state.cache.insert_metadata(
+                        identity,
+                        context_identity,
+                        context::CachedMetadata::Restored {
+                            remapped: report.remapped,
+                        },
+                    );
+                    (kind, EntryStatus::Restored)
+                }
                 Err(error) => (kind, EntryStatus::Failed(error)),
             }
         }
-        Ok(_) => (EntryKind::Metadata { remapped: 0 }, EntryStatus::Unchanged),
+        Ok(_) => {
+            state.cache.insert_metadata(
+                identity,
+                context_identity,
+                context::CachedMetadata::Unchanged,
+            );
+            (EntryKind::Metadata { remapped: 0 }, EntryStatus::Unchanged)
+        }
         Err(error) => (
             EntryKind::Metadata { remapped: 0 },
             EntryStatus::Failed(error),
         ),
     };
-    if matches!(
+    Ok(vec![outcome(
+        kind_and_status.0,
         kind_and_status.1,
-        EntryStatus::Restored | EntryStatus::Unchanged
-    ) {
-        seen.insert(identity);
+        provenance_labels(&provenance),
+    )])
+}
+
+fn record_module(
+    cache: &mut context::AndroidRunCache,
+    app: &context::AppKey,
+    restored: &context::CachedLibrary,
+    label: &str,
+) {
+    if let Some(module) = &restored.method_index_module {
+        cache.modules_mut(app).record(
+            module,
+            context::ModuleSource {
+                label: label.to_owned(),
+                image: restored.module_image.clone(),
+            },
+        );
     }
-    Ok(vec![outcome(kind_and_status.0, kind_and_status.1)])
+}
+
+fn metadata_version(data: &[u8]) -> Option<u32> {
+    data.get(4..8)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes)
+}
+
+fn provenance_labels(provenance: &context::MetadataProvenance) -> Vec<String> {
+    provenance
+        .sources
+        .iter()
+        .map(|source| match &source.image {
+            Some(image) => format!("{} ({image})", source.label),
+            None => source.label.clone(),
+        })
+        .collect()
+}
+
+fn provenance_error(provenance: &context::MetadataProvenance) -> String {
+    let why = provenance
+        .note
+        .clone()
+        .unwrap_or_else(|| "ambiguous module 0x0C binding".to_owned());
+    if provenance.sources.is_empty() {
+        return why;
+    }
+    let sources = provenance
+        .sources
+        .iter()
+        .map(|source| source.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{why}; modules from {sources}")
 }
 
 /// Output path for a metadata blob unwrapped from a restored library: next to
