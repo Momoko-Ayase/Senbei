@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-cli"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "senbei-engine",
  "senbei-io",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-crypto"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "aes",
  "thiserror",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-elf"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "goblin",
  "thiserror",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-engine"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "memmap2",
  "senbei-crypto",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-io"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "anyhow",
  "indicatif",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-metadata"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "serde",
  "thiserror",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-pe"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "thiserror",
 ]
