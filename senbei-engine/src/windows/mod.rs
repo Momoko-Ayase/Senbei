@@ -8,8 +8,8 @@ mod layout;
 pub(crate) mod parallel;
 
 use senbei_crypto::primitives;
-use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+
+pub(crate) use crate::panic_capture::{PanicCapture, current_panic_capture, with_panic_capture};
 
 pub use crate::thread_cap;
 pub use dll::{unpack_dll, unpack_dll_v};
@@ -26,130 +26,6 @@ pub use integrity::{
 /// Real protected binaries are far below this.
 pub(crate) const MAX_IMAGE_SIZE: u64 = senbei_crypto::MAX_IMAGE_SIZE;
 
-#[derive(Clone)]
-pub(crate) struct PanicCapture(Arc<Mutex<Option<PanicDetails>>>);
-
-#[derive(Clone)]
-struct PanicDetails {
-    message: String,
-    file: String,
-    line: u32,
-    column: u32,
-}
-
-thread_local! {
-    static ACTIVE_PANIC_CAPTURE: RefCell<Option<PanicCapture>> = const { RefCell::new(None) };
-}
-
-struct PanicCaptureGuard(Option<PanicCapture>);
-
-impl Drop for PanicCaptureGuard {
-    fn drop(&mut self) {
-        ACTIVE_PANIC_CAPTURE.with(|slot| {
-            slot.replace(self.0.take());
-        });
-    }
-}
-
-impl PanicCapture {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    fn record(&self, info: &std::panic::PanicHookInfo<'_>) {
-        let location = info.location();
-        let details = PanicDetails {
-            message: panic_message(info.payload()),
-            file: location
-                .map(|value| value.file().to_owned())
-                .unwrap_or_else(|| "<unknown>".to_owned()),
-            line: location.map_or(0, std::panic::Location::line),
-            column: location.map_or(0, std::panic::Location::column),
-        };
-        let mut captured = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if captured.is_none() {
-            *captured = Some(details);
-        }
-    }
-
-    fn into_error(self, payload: &(dyn std::any::Any + Send)) -> UnpackError {
-        let details = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .unwrap_or_else(|| PanicDetails {
-                message: panic_message(payload),
-                file: "<unknown>".to_owned(),
-                line: 0,
-                column: 0,
-            });
-        UnpackError::InternalPanic {
-            message: details.message,
-            file: details.file,
-            line: details.line,
-            column: details.column,
-        }
-    }
-
-    fn merge_from(&self, other: &Self) {
-        let details = other
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(details) = details else { return };
-        let mut captured = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if captured.is_none() {
-            *captured = Some(details);
-        }
-    }
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
-}
-
-fn install_panic_capture_hook() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let capture = ACTIVE_PANIC_CAPTURE
-                .try_with(|slot| slot.borrow().clone())
-                .ok()
-                .flatten();
-            if let Some(capture) = capture {
-                capture.record(info);
-            } else {
-                previous(info);
-            }
-        }));
-    });
-}
-
-pub(crate) fn current_panic_capture() -> Option<PanicCapture> {
-    ACTIVE_PANIC_CAPTURE.with(|slot| slot.borrow().clone())
-}
-
-pub(crate) fn with_panic_capture<R>(capture: Option<PanicCapture>, f: impl FnOnce() -> R) -> R {
-    let previous = ACTIVE_PANIC_CAPTURE.with(|slot| slot.replace(capture));
-    let _guard = PanicCaptureGuard(previous);
-    f()
-}
-
 /// Run an unpack pipeline, converting any internal panic into a clean
 /// [`UnpackError::InternalPanic`] so the public API stays panic-free on any input
 /// (truncated/garbled files chase offsets out of bounds). The panic location and
@@ -161,14 +37,22 @@ pub(crate) fn catch_unpack<F>(f: F) -> Result<Vec<u8>, UnpackError>
 where
     F: FnOnce() -> Result<Vec<u8>, UnpackError>,
 {
-    install_panic_capture_hook();
+    crate::panic_capture::install_hook();
     let capture = PanicCapture::new();
     let r = with_panic_capture(Some(capture.clone()), || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
     });
     match r {
         Ok(result) => result,
-        Err(payload) => Err(capture.into_error(payload.as_ref())),
+        Err(payload) => {
+            let details = capture.details(payload.as_ref());
+            Err(UnpackError::InternalPanic {
+                message: details.message,
+                file: details.file,
+                line: details.line,
+                column: details.column,
+            })
+        },
     }
 }
 

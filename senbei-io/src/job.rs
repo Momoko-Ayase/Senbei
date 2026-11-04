@@ -165,10 +165,6 @@ pub fn run_folder_opts(
         ..Summary::default()
     };
 
-    // Silence the default panic hook's stderr spew during per-file processing.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {})); // suppress "thread panicked" messages
-
     for input in candidates {
         let rel = rel_in_tree(root, input);
         let dest = out_root.join(out_name(&rel));
@@ -176,9 +172,9 @@ pub fn run_folder_opts(
         // Wrap in catch_unwind so a single bad file never aborts the folder run.
         let input_owned = input.clone();
         let dest_owned = dest.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = senbei_engine::catch_unwind_quiet(|| {
             unpack_one_v(&input_owned, &dest_owned, verbose_steps)
-        }));
+        });
 
         match result {
             Ok(Ok((kind, report))) => {
@@ -246,14 +242,14 @@ pub fn run_folder_opts(
         }
         let input_owned = input.clone();
         let dest_owned = dest.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = senbei_engine::catch_unwind_quiet(|| {
             crate::android::restore_so_file_with_method_index_module(
                 &input_owned,
                 &dest_owned,
                 verbose_steps,
                 &mut android_method_index_module,
             )
-        }));
+        });
         match result {
             Ok(Ok(embedded)) => {
                 s.unpacked += 1;
@@ -325,7 +321,7 @@ pub fn run_folder_opts(
         let rel_owned = rel.clone().into_owned();
         let out_root_owned = out_root.clone();
         let mut seen_taken = std::mem::take(&mut android_seen);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = senbei_engine::catch_unwind_quiet(|| {
             let outcomes = crate::android::restore_package_with_method_index_module(
                 &package_owned,
                 &rel_owned,
@@ -335,7 +331,7 @@ pub fn run_folder_opts(
                 &mut android_method_index_module,
             );
             (outcomes, seen_taken)
-        }));
+        });
         match result {
             Ok((Ok(outcomes), seen_back)) => {
                 android_seen = seen_back;
@@ -377,14 +373,14 @@ pub fn run_folder_opts(
         let dest = out_root.join(out_name(&rel));
         let meta_owned = meta.clone();
         let dest_owned = dest.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = senbei_engine::catch_unwind_quiet(|| {
             deobfuscate_metadata_to_with_module(
                 &meta_owned,
                 &dest_owned,
                 verbose_steps,
                 android_method_index_module.as_deref(),
             )
-        }));
+        });
         match result {
             Ok(Ok(report)) if report.remapped > 0 => {
                 s.metadata += 1;
@@ -452,9 +448,6 @@ pub fn run_folder_opts(
             }
         }
     }
-
-    // Restore the original panic hook.
-    std::panic::set_hook(default_hook);
 
     bar.finish_and_clear();
     s.duration_ms = t0.elapsed().as_millis();

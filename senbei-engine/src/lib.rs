@@ -1,7 +1,10 @@
 //! Platform-specific unpacking engines.
 
 pub mod android;
+mod panic_capture;
 pub mod windows;
+
+pub use panic_capture::catch_unwind_quiet;
 
 pub use windows::{
     Detected, IntegrityReport, Kind, UnpackError, check_integrity, detect, unpack_auto,
