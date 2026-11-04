@@ -224,6 +224,9 @@ pub enum UnpackError {
         exe: Box<UnpackError>,
     },
 
+    #[error("structurally invalid layout candidate: {}", issues.join("; "))]
+    InvalidLayoutCandidate { issues: Vec<String> },
+
     #[error(
         "PE32 second-stage range is invalid (offset {offset}, size {size}, image length {image_len})"
     )]

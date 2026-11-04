@@ -13,17 +13,67 @@
 //!
 //! All reads are bounds-checked; the check never panics on any input.
 
+/// How serious one [`IntegrityReport`] defect is for choosing a DLL layout.
+///
+/// This does not change what [`check`] puts in [`IntegrityReport::issues`].
+/// Callers that surface suspect output still read that list. Layout selection
+/// uses [`IntegrityFinding::severity`] so a warning (the image may still be the
+/// right layout) is not treated as "try the other pipeline".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegritySeverity {
+    /// The loader or runtime rejects the image before executing it, or a
+    /// directory the header claims to own does not resolve inside the file.
+    /// A DLL layout that reports one of these is the wrong layout.
+    Fatal,
+    /// The image is a PE, but a recoverable region looks unrestored. Real
+    /// outputs can carry these and still be the layout that must be kept
+    /// (a native DLL with no base relocations, an entry stub left as zeros
+    /// or `int3`).
+    Warning,
+}
+
+/// One defect from [`check`], with the severity layout selection needs.
+///
+/// `message` is the same string stored in [`IntegrityReport::issues`]. Severity
+/// is decided while the check still knows which rule fired, not by reading the
+/// message back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityFinding {
+    pub severity: IntegritySeverity,
+    pub message: String,
+}
+
 /// Result of a static integrity check over an unpacked image.
 #[derive(Debug, Clone, Default)]
 pub struct IntegrityReport {
     /// Each entry describes one detected defect. Empty means no defect found.
+    /// Order and wording match [`IntegrityReport::findings`].
     pub issues: Vec<String>,
+    /// The same defects as `issues`, each tagged fatal or warning.
+    pub findings: Vec<IntegrityFinding>,
 }
 
 impl IntegrityReport {
     /// True when no defects were detected.
     pub fn ok(&self) -> bool {
         self.issues.is_empty()
+    }
+
+    /// True when every defect is a [`IntegritySeverity::Warning`].
+    ///
+    /// An empty report is not fatal. Layout selection uses this to keep a DLL
+    /// image whose only defects are warnings, and to reject one the loader
+    /// cannot map.
+    pub fn has_fatal(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.severity == IntegritySeverity::Fatal)
+    }
+
+    fn push(&mut self, severity: IntegritySeverity, message: impl Into<String>) {
+        let message = message.into();
+        self.issues.push(message.clone());
+        self.findings.push(IntegrityFinding { severity, message });
     }
 }
 
@@ -92,9 +142,12 @@ fn check_common_entry_branches(
             .ok()
             .is_some_and(|rva| is_executable_rva(secs, rva));
         if !valid {
-            report.issues.push(format!(
-                "entry point {name} target 0x{target:X} is outside executable sections (DD8 selection is likely wrong)"
-            ));
+            report.push(
+                IntegritySeverity::Fatal,
+                format!(
+                    "entry point {name} target 0x{target:X} is outside executable sections (DD8 selection is likely wrong)"
+                ),
+            );
         }
     }
 }
@@ -107,26 +160,31 @@ pub fn check(out: &[u8]) -> IntegrityReport {
 
     // --- DOS + PE headers ---------------------------------------------------
     if rd_u16(out, 0) != Some(0x5A4D) {
-        r.issues.push("missing 'MZ' DOS signature".into());
+        r.push(IntegritySeverity::Fatal, "missing 'MZ' DOS signature");
         return r; // nothing else is meaningful
     }
     let pe_off = match rd_u32(out, 0x3C) {
         Some(v) => v,
         None => {
-            r.issues.push("truncated DOS header (no e_lfanew)".into());
+            r.push(
+                IntegritySeverity::Fatal,
+                "truncated DOS header (no e_lfanew)",
+            );
             return r;
         }
     };
     if rd_u32(out, pe_off) != Some(0x0000_4550) {
-        r.issues
-            .push(format!("missing 'PE\\0\\0' signature at 0x{pe_off:X}"));
+        r.push(
+            IntegritySeverity::Fatal,
+            format!("missing 'PE\\0\\0' signature at 0x{pe_off:X}"),
+        );
         return r;
     }
 
     let num_sections = match rd_u16(out, pe_off.wrapping_add(6)) {
         Some(v) => v as u32,
         None => {
-            r.issues.push("truncated COFF header".into());
+            r.push(IntegritySeverity::Fatal, "truncated COFF header");
             return r;
         }
     };
@@ -134,7 +192,7 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     let magic = match rd_u16(out, opt) {
         Some(v) => v,
         None => {
-            r.issues.push("truncated optional header".into());
+            r.push(IntegritySeverity::Fatal, "truncated optional header");
             return r;
         }
     };
@@ -142,36 +200,44 @@ pub fn check(out: &[u8]) -> IntegrityReport {
         0x20B => true,
         0x10B => false,
         other => {
-            r.issues
-                .push(format!("bad optional-header magic 0x{other:X}"));
+            r.push(
+                IntegritySeverity::Fatal,
+                format!("bad optional-header magic 0x{other:X}"),
+            );
             return r;
         }
     };
 
     if num_sections == 0 || num_sections > 96 {
-        r.issues
-            .push(format!("implausible section count {num_sections}"));
+        r.push(
+            IntegritySeverity::Fatal,
+            format!("implausible section count {num_sections}"),
+        );
     }
 
     let size_of_image = rd_u32(out, pe_off.wrapping_add(80)).unwrap_or(0);
     if size_of_image == 0 {
-        r.issues.push("SizeOfImage is zero".into());
+        r.push(IntegritySeverity::Fatal, "SizeOfImage is zero");
     }
 
     // --- Section table ------------------------------------------------------
     let headers = match senbei_pe::parse(out) {
         Ok(headers) => headers,
         Err(_) => {
-            r.issues
-                .push("section table extends past end of file".into());
+            r.push(
+                IntegritySeverity::Fatal,
+                "section table extends past end of file",
+            );
             return r;
         }
     };
     let parsed_sections = match senbei_pe::sections(out, headers) {
         Ok(sections) => sections,
         Err(_) => {
-            r.issues
-                .push("section table extends past end of file".into());
+            r.push(
+                IntegritySeverity::Fatal,
+                "section table extends past end of file",
+            );
             return r;
         }
     };
@@ -182,10 +248,13 @@ pub fn check(out: &[u8]) -> IntegrityReport {
             if section.raw_size != 0 {
                 let end = section.raw_offset.wrapping_add(section.raw_size) as usize;
                 if end > file_len {
-                    r.issues.push(format!(
-                        "section #{i} raw data [0x{:X}..0x{end:X}] exceeds file size 0x{file_len:X}",
-                        section.raw_offset
-                    ));
+                    r.push(
+                        IntegritySeverity::Fatal,
+                        format!(
+                            "section #{i} raw data [0x{:X}..0x{end:X}] exceeds file size 0x{file_len:X}",
+                            section.raw_offset
+                        ),
+                    );
                 }
             }
             section
@@ -222,9 +291,13 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     if is_dll && !is_managed {
         let reloc_rva = rd_u32(out, dd_base.wrapping_add(5 * 8)).unwrap_or(0);
         if reloc_rva == 0 {
-            r.issues.push(
-                "native DLL has no base relocation table (DD[5] is zero) — will crash when loaded at a non-preferred base"
-                    .into(),
+            // Warning, not fatal: a native DLL can ship without base relocations
+            // (`IMAGE_FILE_RELOCS_STRIPPED`, or a module that is only ever loaded
+            // at its preferred base). Rejecting the layout here would fall back
+            // to the other pipeline and change bytes that previously unpacked.
+            r.push(
+                IntegritySeverity::Warning,
+                "native DLL has no base relocation table (DD[5] is zero) — will crash when loaded at a non-preferred base",
             );
         }
     }
@@ -237,28 +310,38 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     if ep == 0 {
         // A DLL may legitimately have no entry point; an EXE never does.
         if !is_dll {
-            r.issues.push("entry point RVA is zero".into());
+            r.push(IntegritySeverity::Fatal, "entry point RVA is zero");
         }
     } else if !is_managed {
         match rva_to_off(out, headers, ep, 16) {
             None => {
-                r.issues.push(format!(
-                    "entry point RVA 0x{ep:X} does not map into any section"
-                ));
+                r.push(
+                    IntegritySeverity::Fatal,
+                    format!("entry point RVA 0x{ep:X} does not map into any section"),
+                );
             }
             Some(off) => {
                 let stub = &out[off as usize..off as usize + 16];
                 if stub.iter().all(|&b| b == 0) {
-                    r.issues.push(format!(
-                        "entry point at RVA 0x{ep:X} is all zeros (stub not recovered)"
-                    ));
+                    // Warning: the entry maps and is executable, but its bytes
+                    // were not recovered. That is the suspect signal for an
+                    // already-chosen layout, not proof another layout is the
+                    // right one.
+                    r.push(
+                        IntegritySeverity::Warning,
+                        format!("entry point at RVA 0x{ep:X} is all zeros (stub not recovered)"),
+                    );
                 } else if stub.iter().all(|&b| b == 0xCC) {
                     // 16 bytes of int3 padding where the entry stub should be:
                     // the stub region was never recovered, the loader walks
-                    // straight into a debug-break wall.
-                    r.issues.push(format!(
-                        "entry point at RVA 0x{ep:X} is all int3 padding (stub not recovered)"
-                    ));
+                    // straight into a debug-break wall. Same severity as a
+                    // zeroed stub: the image is mapped, the bytes look unrestored.
+                    r.push(
+                        IntegritySeverity::Warning,
+                        format!(
+                            "entry point at RVA 0x{ep:X} is all int3 padding (stub not recovered)"
+                        ),
+                    );
                 }
                 // The entry must live in an executable section.
                 let exec = secs.iter().any(|s| {
@@ -268,9 +351,10 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                         && (s.characteristics & 0x2000_0000) != 0
                 });
                 if !exec {
-                    r.issues.push(format!(
-                        "entry point RVA 0x{ep:X} is not in an executable section"
-                    ));
+                    r.push(
+                        IntegritySeverity::Fatal,
+                        format!("entry point RVA 0x{ep:X} is not in an executable section"),
+                    );
                 }
                 if let Some(entry_stub) = out.get(off as usize..off as usize + 18) {
                     check_common_entry_branches(entry_stub, ep, &secs, &mut r);
@@ -293,9 +377,10 @@ pub fn check(out: &[u8]) -> IntegrityReport {
         let imp_rva = rd_u32(out, dd_base.wrapping_add(8)).unwrap_or(0);
         if imp_rva != 0 {
             match rva_to_off(out, headers, imp_rva, 20) {
-                None => r.issues.push(format!(
-                    "import directory RVA 0x{imp_rva:X} does not map into any section"
-                )),
+                None => r.push(
+                    IntegritySeverity::Fatal,
+                    format!("import directory RVA 0x{imp_rva:X} does not map into any section"),
+                ),
                 Some(desc_off) => {
                     // 256 descriptors is far beyond any real import table; the
                     // cap keeps a corrupt, never-null table from walking on.
@@ -308,14 +393,24 @@ pub fn check(out: &[u8]) -> IntegrityReport {
                             break;
                         }
                         match rva_to_off(out, headers, name_rva, 1) {
-                            None => r.issues.push(format!(
-                                "import descriptor {i} DLL name RVA 0x{name_rva:X} does not map into any section"
-                            )),
+                            None => r.push(
+                                IntegritySeverity::Fatal,
+                                format!(
+                                    "import descriptor {i} DLL name RVA 0x{name_rva:X} does not map into any section"
+                                ),
+                            ),
                             Some(noff) => {
                                 if !looks_like_dll_name(out, noff) {
-                                    r.issues.push(format!(
-                                        "import descriptor {i} DLL name at RVA 0x{name_rva:X} is not readable ASCII (imports left encrypted?)"
-                                    ));
+                                    // Warning: the name is inside the image, so
+                                    // the directory is structurally present.
+                                    // Unreadable bytes are the "left encrypted"
+                                    // suspect signal, not an unmapped PE.
+                                    r.push(
+                                        IntegritySeverity::Warning,
+                                        format!(
+                                            "import descriptor {i} DLL name at RVA 0x{name_rva:X} is not readable ASCII (imports left encrypted?)"
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -336,29 +431,39 @@ pub fn check(out: &[u8]) -> IntegrityReport {
     // begins with the "BSJB" signature.
     if is_managed {
         match rva_to_off(out, headers, clr_rva, 0x48) {
-            None => r.issues.push(format!(
-                "CLR (COR20) directory RVA 0x{clr_rva:X} does not map into any section"
-            )),
+            None => r.push(
+                IntegritySeverity::Fatal,
+                format!("CLR (COR20) directory RVA 0x{clr_rva:X} does not map into any section"),
+            ),
             Some(coff) => {
                 let cb = rd_u32(out, coff).unwrap_or(0);
                 if cb != 0x48 {
-                    r.issues.push(format!(
-                        "COR20 header at RVA 0x{clr_rva:X} has cb 0x{cb:X} (expected 0x48) — CLR header corrupt"
-                    ));
+                    r.push(
+                        IntegritySeverity::Fatal,
+                        format!(
+                            "COR20 header at RVA 0x{clr_rva:X} has cb 0x{cb:X} (expected 0x48) — CLR header corrupt"
+                        ),
+                    );
                 } else {
                     // MetaData RVA/size live at COR20 + 0x08 / + 0x0C.
                     let md_rva = rd_u32(out, coff.wrapping_add(8)).unwrap_or(0);
                     if md_rva != 0 {
                         match rva_to_off(out, headers, md_rva, 4) {
-                            None => r.issues.push(format!(
-                                "CLR MetaData RVA 0x{md_rva:X} does not map into any section"
-                            )),
+                            None => r.push(
+                                IntegritySeverity::Fatal,
+                                format!(
+                                    "CLR MetaData RVA 0x{md_rva:X} does not map into any section"
+                                ),
+                            ),
                             Some(moff) => {
                                 let sig = out.get(moff as usize..moff as usize + 4);
                                 if sig != Some(b"BSJB") {
-                                    r.issues.push(format!(
-                                        "CLR MetaData at RVA 0x{md_rva:X} lacks 'BSJB' signature (metadata corrupt — managed image will not load)"
-                                    ));
+                                    r.push(
+                                        IntegritySeverity::Fatal,
+                                        format!(
+                                            "CLR MetaData at RVA 0x{md_rva:X} lacks 'BSJB' signature (metadata corrupt — managed image will not load)"
+                                        ),
+                                    );
                                 }
                             }
                         }
