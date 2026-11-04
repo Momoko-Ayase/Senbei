@@ -15,6 +15,9 @@
 //! All functions in this module are native filesystem orchestration; the web
 //! app (wasm) never touches them.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, Write};
@@ -480,7 +483,8 @@ fn restore_package_entry<R: Read + Seek>(
     if !is_so && !is_meta {
         return Ok(vec![outcome(EntryKind::So, EntryStatus::NotTarget)]);
     }
-    if !seen.insert(content_identity(&entry_data)) {
+    let identity = content_identity(&entry_data);
+    if seen.contains(&identity) {
         let kind = if is_so {
             EntryKind::So
         } else {
@@ -512,6 +516,12 @@ fn restore_package_entry<R: Read + Seek>(
                             status,
                         });
                     }
+                    if outcomes
+                        .iter()
+                        .all(|outcome| !matches!(outcome.status, EntryStatus::Failed(_)))
+                    {
+                        seen.insert(identity);
+                    }
                     outcomes
                 }
                 Err(error) => vec![outcome(EntryKind::So, EntryStatus::Failed(error))],
@@ -540,6 +550,12 @@ fn restore_package_entry<R: Read + Seek>(
             EntryStatus::Failed(error),
         ),
     };
+    if matches!(
+        kind_and_status.1,
+        EntryStatus::Restored | EntryStatus::Unchanged
+    ) {
+        seen.insert(identity);
+    }
     Ok(vec![outcome(kind_and_status.0, kind_and_status.1)])
 }
 

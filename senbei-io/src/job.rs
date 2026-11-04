@@ -228,10 +228,14 @@ pub fn run_folder_opts(
     for input in &scan.android_so {
         let rel = rel_in_tree(root, input);
         let dest = out_root.join(out_name(&rel));
+        // Failed restores must not hide an identical input encountered later.
         // Unreadable here is fine: the restore reports the same error.
-        if android_dedup
-            && let Ok(identity) = crate::android::file_content_identity(input)
-            && !android_seen.insert(identity)
+        let identity = android_dedup
+            .then(|| crate::android::file_content_identity(input).ok())
+            .flatten();
+        if identity
+            .as_ref()
+            .is_some_and(|id| android_seen.contains(id))
         {
             s.skipped += 1;
             if let Some(log) = &log {
@@ -263,7 +267,13 @@ pub fn run_folder_opts(
                 if let Some(log) = &log {
                     log.step(&format!("OK {rel:?} -> {dest:?} (Android SO)"));
                 }
-                match write_embedded_metadata(embedded, &dest) {
+                let embedded_result = write_embedded_metadata(embedded, &dest);
+                if embedded_result.is_ok()
+                    && let Some(identity) = identity
+                {
+                    android_seen.insert(identity);
+                }
+                match embedded_result {
                     Ok(Some(meta_dest)) => {
                         s.metadata += 1;
                         crate::ui::ok_label(
