@@ -136,6 +136,11 @@ pub struct ValidationReport {
     pub dynamic_relocations: usize,
     pub pltgot_relocations: usize,
     pub has_louser: bool,
+    /// Cross-table findings that describe the output's structure without
+    /// rejecting it: a `PT_LOAD`/`DT_*`/relocation/hash/constructor invariant
+    /// a linker could not walk. Empty when every table is consistent. These are
+    /// diagnostics, not a runtime guarantee, and they never fail a restore.
+    pub diagnostics: Vec<String>,
 }
 
 /// Machine-readable result of the restoration.
@@ -2481,6 +2486,12 @@ fn validate_restored_binary(
     {
         return invalid("restored ELF table counts do not match materialization report");
     }
+    // Cross-table diagnostics run last and only describe the output: they add
+    // no new way for restoration to fail. A finding here says a linker could
+    // not walk a table in these bytes, which is a weaker claim than the hard
+    // checks above and must not decide whether an image is accepted.
+    let mut diagnostics = Vec::new();
+    super::verify::collect(data, &layout, &mut diagnostics);
     Ok(ValidationReport {
         format: "ELF64".to_owned(),
         machine: "AARCH64".to_owned(),
@@ -2490,6 +2501,7 @@ fn validate_restored_binary(
         dynamic_relocations,
         pltgot_relocations,
         has_louser,
+        diagnostics,
     })
 }
 

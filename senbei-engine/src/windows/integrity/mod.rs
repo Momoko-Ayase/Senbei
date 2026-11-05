@@ -11,7 +11,15 @@
 //! in a correctly unpacked image, so a clean report is not a guarantee of
 //! correctness, but a non-clean report is a reliable "this is broken" signal.
 //!
+//! Everything in this module is a *structural* statement about the output
+//! bytes. It never executes the image, never resolves an external symbol, and
+//! never reads a callback's bytes — a clean report therefore means "the loader
+//! would be able to walk these tables", not "this image runs".
+//!
 //! All reads are bounds-checked; the check never panics on any input.
+
+mod clr;
+mod directories;
 
 /// How serious one [`IntegrityReport`] defect is for choosing a DLL layout.
 ///
@@ -473,7 +481,69 @@ pub fn check(out: &[u8]) -> IntegrityReport {
         }
     }
 
+    // --- Structural diagnostics --------------------------------------------
+    // Everything below is advisory. These checks walk the directories the
+    // loader or the CLR reads in order, and they only report a table that
+    // cannot be walked from these bytes at all. They never decide whether a
+    // layout candidate is acceptable: an image whose directories are intact
+    // still need not run (see the module docs), and one that carries a
+    // protected-but-present directory must not be rejected for it. Reporting
+    // them as warnings keeps DLL layout selection and the golden outputs
+    // exactly where they were.
+    let mut diagnostics = Vec::new();
+    let image = directories::Image {
+        data: out,
+        headers,
+        sections: &secs,
+        is64,
+        image_base: headers.image_base,
+        size_of_image,
+    };
+    if is_managed {
+        if let Some(metadata) = clr_metadata(out, &image) {
+            // The metadata walk formats one message per malformed stream, so
+            // it gets a bounded sink like the directory walks.
+            let mut findings = crate::findings::Findings::new(&mut diagnostics);
+            clr::collect(&metadata, &mut findings);
+            findings.finish();
+        }
+    } else {
+        directories::collect(&image, &mut diagnostics);
+    }
+    for message in diagnostics {
+        r.push(IntegritySeverity::Warning, message);
+    }
+
     r
+}
+
+/// Locate the BSJB metadata blob of a managed image for the CLR diagnostics.
+///
+/// Returns `None` when the COR20 header or the blob itself does not resolve;
+/// the fatal checks above already report that case, and there is nothing
+/// further to enumerate.
+fn clr_metadata<'a>(out: &'a [u8], image: &directories::Image<'_>) -> Option<clr::Metadata<'a>> {
+    let (clr_rva, _) = senbei_pe::data_directory(out, image.headers, 14).ok()?;
+    if clr_rva == 0 {
+        return None;
+    }
+    let cor = image.file_range(clr_rva, 0x10)?;
+    let md_rva = rd_u32(out, (cor.start as u32).saturating_add(8))?;
+    let md_size = rd_u32(out, (cor.start as u32).saturating_add(12))?;
+    if md_rva == 0 {
+        return None;
+    }
+    // The blob's first four bytes must be backed by the file; its declared
+    // size may legitimately exceed the file only if the CLR would refuse it,
+    // which is exactly what the diagnostics report.
+    let start = image.file_range(md_rva, 4)?.start;
+    let available = out.len().saturating_sub(start);
+    let len = usize::try_from(md_size).unwrap_or(available).min(available);
+    Some(clr::Metadata {
+        data: out,
+        start,
+        len,
+    })
 }
 
 /// True if the NUL-terminated string starting at `off` looks like a DLL name:

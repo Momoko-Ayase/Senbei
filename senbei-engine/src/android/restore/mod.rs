@@ -2,6 +2,7 @@ mod artifact;
 mod constructors;
 mod error;
 mod pipeline;
+mod verify;
 
 pub use error::Error;
 pub use pipeline::{

@@ -647,8 +647,16 @@ mod dll_layout_selection {
             data[pe + 24 + 108..pe + 24 + 112].copy_from_slice(&16u32.to_le_bytes());
             let dd = pe + 24 + 112;
             if self.reloc && !self.managed {
-                data[dd + 5 * 8..dd + 5 * 8 + 4].copy_from_slice(&0x1800u32.to_le_bytes());
-                data[dd + 5 * 8 + 4..dd + 5 * 8 + 8].copy_from_slice(&8u32.to_le_bytes());
+                // A relocation directory has to be *backed by the file*: one
+                // block (page RVA 0x1000, 8-byte header + one HIGHLOW entry)
+                // at RVA 0x1020 -> file 0x220, inside the section's raw range.
+                data[dd + 5 * 8..dd + 5 * 8 + 4].copy_from_slice(&0x1020u32.to_le_bytes());
+                data[dd + 5 * 8 + 4..dd + 5 * 8 + 8].copy_from_slice(&12u32.to_le_bytes());
+                if data.len() >= 0x220 + 12 {
+                    data[0x220..0x224].copy_from_slice(&0x1000u32.to_le_bytes());
+                    data[0x224..0x228].copy_from_slice(&12u32.to_le_bytes());
+                    data[0x228..0x22a].copy_from_slice(&0x3000u16.to_le_bytes());
+                }
             }
             if self.import_name.is_some() || self.import_unmapped {
                 data[dd + 8..dd + 12].copy_from_slice(&0x1100u32.to_le_bytes());

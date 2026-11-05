@@ -1,6 +1,7 @@
 //! Platform-specific unpacking engines.
 
 pub mod android;
+mod findings;
 mod panic_capture;
 pub mod profile;
 pub mod windows;
