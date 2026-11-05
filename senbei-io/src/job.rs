@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::atomic::write_atomic;
 pub use crate::report::{Collector, Mode, REPORT_FORMAT_VERSION, Report};
 use crate::report::{
-    CompanionReport, CompanionState, ContainerReport, EntryKind, EntryReport, EntryStatus,
+    CompanionReport, CompanionState, ContainerReport, Digest, EntryKind, EntryReport, EntryStatus,
     InputReport, InputStatus, OutputFile, Role, Stage, StageReport, StageStatus,
 };
 pub use crate::windows::{
@@ -250,6 +250,11 @@ fn run_folder_inner(
         errors: scan_failed,
         ..Summary::default()
     };
+    // Research inspection runs the ordinary drivers but reads their results as
+    // observations: a failed recovery is a finding, not a failed inspection.
+    let research = reporter
+        .as_deref()
+        .is_some_and(|reporter| reporter.mode() == Mode::Inspect);
     if let Some(reporter) = reporter.as_deref_mut() {
         reporter.set_scan(crate::report::ScanReport {
             non_target_skipped: scan_stats.skipped,
@@ -265,23 +270,28 @@ fn run_folder_inner(
 
         // Wrap in catch_unwind so a single bad file never aborts the folder run.
         // A reporting run goes through the profiled entry point so the report
-        // carries the route the pipeline actually selected; an ordinary run
-        // keeps the unchanged call.
+        // carries the route the pipeline actually selected; a research run
+        // additionally keeps its structural facts. An ordinary run keeps the
+        // unchanged call.
         let profiled = reporter.is_some();
         let input_owned = input.clone();
         let dest_owned = dest.clone();
         let result = senbei_engine::catch_unwind_quiet(|| {
             if profiled {
-                let (profile, result) =
-                    unpack_one_profiled(&input_owned, &dest_owned, verbose_steps);
-                (Some(profile), result)
+                let (profile, observed, result) =
+                    unpack_one_researched(&input_owned, &dest_owned, verbose_steps, research);
+                (Some(profile), observed, result)
             } else {
-                (None, unpack_one_v(&input_owned, &dest_owned, verbose_steps))
+                (
+                    None,
+                    None,
+                    unpack_one_v(&input_owned, &dest_owned, verbose_steps),
+                )
             }
         });
 
         match result {
-            Ok((profile, Ok((kind, report)))) => {
+            Ok((profile, observed, Ok((kind, report)))) => {
                 s.unpacked += 1;
                 crate::ui::ok(&bar, suppress_file_lines, &rel, kind, &dest);
                 if let Some(log) = &log {
@@ -295,20 +305,27 @@ fn run_folder_inner(
                     }
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(windows_input(input, &dest, kind, &report, profile, started));
+                    let mut reported = windows_input(input, &dest, kind, &report, profile, started);
+                    apply_windows_research(&mut reported, observed);
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
-            Ok((profile, Err(e))) => {
+            Ok((profile, observed, Err(e))) => {
+                // A recovery that ran and failed is an ordinary driver outcome.
+                // The per-input report is what inspection reads, and
+                // `inspect_status` turns it into a finding rather than an error.
                 s.errors += 1;
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                 if let Some(log) = &log {
                     log.step(&format!("ERR {rel:?}: {e:#}"));
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(match profile {
+                    let mut reported = match profile {
                         Some(profile) => failed_input_with_profile(input, &e, profile, started),
                         None => failed_input(input, &e, started),
-                    });
+                    };
+                    apply_windows_research(&mut reported, observed);
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             Err(panic) => {
@@ -334,7 +351,11 @@ fn run_folder_inner(
     // Module 0x0C stays inside the application that produced it: an extracted
     // `lib/<abi>/` tree shares with that tree's `assets/` metadata only, and a
     // package shares only with splits of the same package name and version.
-    let mut android_cache = crate::android::run_cache_with_limits(limits);
+    let mut android_cache = if research {
+        crate::android::run_cache_for_research(limits)
+    } else {
+        crate::android::run_cache_with_limits(limits)
+    };
     let loose = crate::android::loose_scopes(&scan.android_so, metas);
     for scoped in loose.iter().filter(|scoped| {
         scan.android_so
@@ -360,70 +381,81 @@ fn run_folder_inner(
         });
         let report_outcome;
         let mut report_validation: Option<crate::android::ValidationDiagnostics> = None;
+        let mut report_research: Option<crate::report::AndroidResearchReport> = None;
+        let mut report_incomplete = false;
         match result {
-            Ok(Ok(outcome)) => match outcome.status {
-                crate::android::EntryStatus::Duplicate => {
-                    s.skipped += 1;
-                    if let Some(log) = &log {
-                        log.step(&format!("SKIP {rel:?}: duplicate of an earlier target"));
-                    }
-                    report_outcome = Some(InputStatus::Skipped);
-                }
-                crate::android::EntryStatus::Failed(e) => {
-                    s.errors += 1;
-                    crate::ui::err(&bar, suppress_file_lines, &rel, &e);
-                    if let Some(log) = &log {
-                        log.step(&format!("ERR {rel:?}: {e:#}"));
-                    }
-                    report_outcome = Some(InputStatus::Error);
-                }
-                crate::android::EntryStatus::Restored => {
-                    s.unpacked += 1;
-                    // Surface the engine's advisory findings. They never fail
-                    // a restore, so they stay warnings on the same log/UI path.
-                    report_validation = outcome.validation.clone();
-                    if let Some(validation) = &report_validation {
-                        if !suppress_file_lines {
-                            for message in &validation.messages {
-                                eprintln!("- {}  {}", rel.display(), message);
-                            }
-                        }
+            Ok(Ok(mut outcome)) => {
+                // A restore that failed after extraction still reports what the
+                // extraction observed, so the research facts are taken first.
+                report_research = outcome.research.take();
+                match outcome.status {
+                    crate::android::EntryStatus::Duplicate => {
+                        s.skipped += 1;
                         if let Some(log) = &log {
-                            for message in &validation.messages {
-                                log.step(&format!("WARN {rel:?}: {message}"));
+                            log.step(&format!("SKIP {rel:?}: duplicate of an earlier target"));
+                        }
+                        report_outcome = Some(InputStatus::Skipped);
+                    }
+                    crate::android::EntryStatus::Failed(e) => {
+                        s.errors += 1;
+                        crate::ui::err(&bar, suppress_file_lines, &rel, &e);
+                        if let Some(log) = &log {
+                            log.step(&format!("ERR {rel:?}: {e:#}"));
+                        }
+                        // Only a resource or I/O ceiling truncates the
+                        // analysis; a rejected candidate is a finding.
+                        report_incomplete = analysis_incomplete(&e);
+                        report_outcome = Some(InputStatus::Error);
+                    }
+                    crate::android::EntryStatus::Restored => {
+                        s.unpacked += 1;
+                        // Surface the engine's advisory findings. They never fail
+                        // a restore, so they stay warnings on the same log/UI path.
+                        report_validation = outcome.validation.clone();
+                        if let Some(validation) = &report_validation {
+                            if !suppress_file_lines {
+                                for message in &validation.messages {
+                                    eprintln!("- {}  {}", rel.display(), message);
+                                }
+                            }
+                            if let Some(log) = &log {
+                                for message in &validation.messages {
+                                    log.step(&format!("WARN {rel:?}: {message}"));
+                                }
                             }
                         }
-                    }
-                    crate::ui::ok_label(
-                        &bar,
-                        suppress_file_lines,
-                        &rel.display().to_string(),
-                        "So",
-                        &dest,
-                    );
-                    if let Some(log) = &log {
-                        log.step(&format!("OK {rel:?} -> {dest:?} (Android SO)"));
-                    }
-                    if let Some(meta_dest) = outcome.embedded {
-                        s.metadata += 1;
                         crate::ui::ok_label(
                             &bar,
                             suppress_file_lines,
-                            &format!("{} (embedded metadata)", rel.display()),
-                            "metadata",
-                            &meta_dest,
+                            &rel.display().to_string(),
+                            "So",
+                            &dest,
                         );
                         if let Some(log) = &log {
-                            log.step(&format!("META {rel:?} (embedded) -> {meta_dest:?}"));
+                            log.step(&format!("OK {rel:?} -> {dest:?} (Android SO)"));
                         }
+                        if let Some(meta_dest) = outcome.embedded {
+                            s.metadata += 1;
+                            crate::ui::ok_label(
+                                &bar,
+                                suppress_file_lines,
+                                &format!("{} (embedded metadata)", rel.display()),
+                                "metadata",
+                                &meta_dest,
+                            );
+                            if let Some(log) = &log {
+                                log.step(&format!("META {rel:?} (embedded) -> {meta_dest:?}"));
+                            }
+                        }
+                        report_outcome = Some(InputStatus::Ok);
                     }
-                    report_outcome = Some(InputStatus::Ok);
+                    crate::android::EntryStatus::NotTarget
+                    | crate::android::EntryStatus::Unchanged => {
+                        s.skipped += 1;
+                        report_outcome = Some(InputStatus::Skipped);
+                    }
                 }
-                crate::android::EntryStatus::NotTarget | crate::android::EntryStatus::Unchanged => {
-                    s.skipped += 1;
-                    report_outcome = Some(InputStatus::Skipped);
-                }
-            },
+            }
             Ok(Err(e)) => {
                 s.errors += 1;
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
@@ -449,8 +481,10 @@ fn run_folder_inner(
             && let Some(status) = report_outcome
         {
             let mut reported = android_library_input(&scoped.path, status, &dest, started);
+            reported.analysis_incomplete = report_incomplete;
             apply_android_validation(&mut reported, report_validation.as_ref());
-            reporter.push(reported);
+            reported.android_research = report_research;
+            reporter.push(inspect_status_if_research(reported, research));
         }
         bar.inc(1);
     }
@@ -463,14 +497,23 @@ fn run_folder_inner(
     for group in &package_groups {
         if group.len() > 1 {
             s.packages += group.len();
-            let group_owned = group.clone();
-            let root_owned = root.to_path_buf();
+            // Relative output paths are computed here, by the same helper the
+            // rest of the driver uses: they must stay relative so joining them
+            // under the output root cannot escape it.
+            let rels: Vec<PathBuf> = group
+                .iter()
+                .map(|package| rel_in_tree(root, package).into_owned())
+                .collect();
+            let members: Vec<(&Path, &Path)> = group
+                .iter()
+                .map(|package| package.as_path())
+                .zip(rels.iter().map(|rel| rel.as_path()))
+                .collect();
             let out_root_owned = out_root.clone();
             let group_started = Instant::now();
             let result = senbei_engine::catch_unwind_quiet(|| {
                 crate::android::restore_apk_group(
-                    &group_owned,
-                    &root_owned,
+                    &members,
                     &out_root_owned,
                     &mut android_cache,
                     verbose_steps,
@@ -490,7 +533,12 @@ fn run_folder_inner(
                                 .iter()
                                 .filter(|outcome| outcome.label.starts_with(&prefix))
                                 .collect();
-                            reporter.push(package_input(package, entries, group_started));
+                            reporter.push(package_input(
+                                package,
+                                entries,
+                                package_inventory(package, limits, research).as_ref(),
+                                group_started,
+                            ));
                         }
                     }
                     apply_package_outcomes(outcomes, &mut s, &bar, suppress_file_lines, &log);
@@ -501,16 +549,37 @@ fn run_folder_inner(
                     if let Some(log) = &log {
                         log.step(&format!("ERR {rel:?}: {e:#}"));
                     }
+                    // The failure belongs to the group, but the report is
+                    // per-split: each member names the cause once, and the
+                    // group is not counted again per restore phase.
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        for package in group {
+                            let mut reported = failed_input(package, &e, group_started);
+                            reported.android_research = crate::android::error_research(&e)
+                                .and_then(|capture| match capture {
+                                    crate::android::ResearchCapture::Library(report) => {
+                                        Some(report.clone())
+                                    }
+                                    crate::android::ResearchCapture::Metadata(_) => None,
+                                });
+                            reporter.push(reported);
+                        }
+                    }
                 }
                 Err(panic) => {
-                    let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                    let e = anyhow::anyhow!(
+                        "unexpected panic during package restore: {}",
+                        panic_payload(&panic)
+                    );
                     s.errors += 1;
                     crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                     if let Some(log) = &log {
-                        log.step(&format!(
-                            "ERR {rel:?}: panic during package restore: {}",
-                            panic_payload(&panic)
-                        ));
+                        log.step(&format!("ERR {rel:?}: {e:#}"));
+                    }
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        for package in group {
+                            reporter.push(failed_input(package, &e, group_started));
+                        }
                     }
                 }
             }
@@ -536,7 +605,12 @@ fn run_folder_inner(
             match result {
                 Ok(Ok(outcomes)) => {
                     if let Some(reporter) = reporter.as_deref_mut() {
-                        reporter.push(package_input(package, outcomes.iter().collect(), started));
+                        reporter.push(package_input(
+                            package,
+                            outcomes.iter().collect(),
+                            package_inventory(package, limits, research).as_ref(),
+                            started,
+                        ));
                     }
                     apply_package_outcomes(outcomes, &mut s, &bar, suppress_file_lines, &log);
                 }
@@ -610,7 +684,9 @@ fn run_folder_inner(
                     ));
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(metadata_input(&scoped.path, &report, Some(&dest), started));
+                    let mut reported = metadata_input(&scoped.path, &report, Some(&dest), started);
+                    reported.metadata_research = report.research.clone();
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             // Recognised metadata that needed no change (not -GMD-obfuscated):
@@ -624,7 +700,9 @@ fn run_folder_inner(
                     ));
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(metadata_input(&scoped.path, &report, None, started));
+                    let mut reported = metadata_input(&scoped.path, &report, None, started);
+                    reported.metadata_research = report.research.clone();
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             Ok(Err(e)) => {
@@ -658,27 +736,12 @@ fn run_folder_inner(
                     }
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    let mut input = failed_input(&scoped.path, &e, started);
-                    let identity = identity_of(&scoped.path);
-                    input.metadata = identity;
-                    input.metadata_version =
-                        unsupported.or_else(|| identity.map(|identity| identity.raw_version));
-                    if let Some(version) = unsupported {
-                        // Left untouched by design; not a failure of this run.
-                        input.status = InputStatus::Skipped;
-                        input.errors.clear();
-                        input.profile = Some(crate::report::metadata_unchanged_profile(identity));
-                        input.warning(format!(
-                            "unsupported metadata version {version}, left untouched"
-                        ));
-                    } else {
-                        input.profile = Some(crate::report::metadata_failed_profile(
-                            identity,
-                            senbei_engine::LayoutKind::MetadataStructural,
-                            &format!("{e:#}"),
-                        ));
-                    }
-                    reporter.push(input);
+                    reporter.push(metadata_failure_input(
+                        &scoped.path,
+                        &e,
+                        unsupported,
+                        started,
+                    ));
                 }
             }
             Err(panic) => {
@@ -793,6 +856,11 @@ fn run_file_inner(
     let name = out_name(Path::new(input.file_name().unwrap_or_default()));
     let dest = out_root.join(name);
     let mut s = Summary::default();
+    // Research inspection runs this same driver and reads its results as
+    // observations; everything else keeps the ordinary classification.
+    let research = reporter
+        .as_deref()
+        .is_some_and(|reporter| reporter.mode() == Mode::Inspect);
 
     let prefix = {
         use std::io::Read;
@@ -816,8 +884,8 @@ fn run_file_inner(
     let is_android_package = !is_android_so && crate::android::is_app_package(input, &prefix);
 
     if is_meta {
-        match deobfuscate_metadata_to_with_module(input, &dest, verbose && quiet == 0, None) {
-            Ok((report, layout)) if report.remapped > 0 => {
+        match deobfuscate_metadata_researched(input, &dest, verbose && quiet == 0, research, None) {
+            Ok((report, layout, metadata_research)) if report.remapped > 0 => {
                 s.metadata = 1;
                 if let Some(log) = &log {
                     log.step(&format!(
@@ -832,16 +900,13 @@ fn run_file_inner(
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(single_metadata_input(
-                        input,
-                        &report,
-                        layout,
-                        Some(&dest),
-                        t0,
-                    ));
+                    let mut reported =
+                        single_metadata_input(input, &report, layout, Some(&dest), research, t0);
+                    reported.metadata_research = metadata_research;
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
-            Ok((report, layout)) => {
+            Ok((report, layout, metadata_research)) => {
                 if let Some(log) = &log {
                     log.step(&format!(
                         "META {:?}: v{} already de-obfuscated",
@@ -855,7 +920,10 @@ fn run_file_inner(
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(single_metadata_input(input, &report, layout, None, t0));
+                    let mut reported =
+                        single_metadata_input(input, &report, layout, None, research, t0);
+                    reported.metadata_research = metadata_research;
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             Err(e) => {
@@ -868,27 +936,38 @@ fn run_file_inner(
                     eprintln!("error: {e:#}");
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    let mut input_report = failed_input(input, &e, t0);
-                    let identity = identity_of(input);
-                    input_report.metadata = identity;
-                    input_report.metadata_version = identity.map(|identity| identity.raw_version);
-                    input_report.profile = Some(crate::report::metadata_failed_profile(
-                        identity,
-                        senbei_engine::LayoutKind::MetadataStructural,
-                        &format!("{e:#}"),
-                    ));
-                    reporter.push(input_report);
+                    let unsupported = unsupported_version(&e);
+                    reporter.push(metadata_failure_input(input, &e, unsupported, t0));
                 }
             }
         }
     } else if is_android_so {
-        match crate::android::restore_so_file_with_diagnostics(
-            input,
-            &dest,
-            verbose && quiet == 0,
-            limits,
-        ) {
-            Ok((embedded, validation)) => {
+        let restore = if research {
+            crate::android::restore_so_file_researched(
+                input,
+                &dest,
+                verbose && quiet == 0,
+                limits,
+                research,
+            )
+            .map(|restored| {
+                (
+                    restored.embedded_metadata,
+                    restored.validation,
+                    restored.research,
+                )
+            })
+        } else {
+            crate::android::restore_so_file_with_diagnostics(
+                input,
+                &dest,
+                verbose && quiet == 0,
+                limits,
+            )
+            .map(|(embedded, validation)| (embedded, validation, None))
+        };
+        match restore {
+            Ok((embedded, validation, android_research)) => {
                 s.unpacked = 1;
                 if let Some(log) = &log {
                     log.step(&format!("OK {:?} -> {:?} (Android SO)", input, dest));
@@ -924,7 +1003,8 @@ fn run_file_inner(
                 if let Some(reporter) = reporter.as_deref_mut() {
                     let mut reported = android_library_input(input, InputStatus::Ok, &dest, t0);
                     apply_android_validation(&mut reported, validation.as_ref());
-                    reporter.push(reported);
+                    reported.android_research = android_research;
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             Err(e) => {
@@ -936,7 +1016,23 @@ fn run_file_inner(
                     eprintln!("error: {e:#}");
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(android_library_input(input, InputStatus::Error, &dest, t0));
+                    let mut reported = android_library_input_with_error(
+                        input,
+                        InputStatus::Error,
+                        &dest,
+                        t0,
+                        Some(&e),
+                    );
+                    // A restore that failed after extraction keeps what the
+                    // extraction already reported.
+                    reported.android_research =
+                        crate::android::error_research(&e).and_then(|capture| match capture {
+                            crate::android::ResearchCapture::Library(report) => {
+                                Some(report.clone())
+                            }
+                            crate::android::ResearchCapture::Metadata(_) => None,
+                        });
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
         }
@@ -944,18 +1040,24 @@ fn run_file_inner(
         s.packages = 1;
         let rel = PathBuf::from(input.file_name().unwrap_or_default());
         let mut seen = std::collections::HashSet::new();
-        match crate::android::restore_package_with_limits(
+        match crate::android::restore_package_with_limits_and_research(
             input,
             &rel,
             &out_root,
             &mut seen,
             verbose && quiet == 0,
             limits,
+            research,
         ) {
             Ok(outcomes) => {
                 let bar = crate::ui::progress(0, true);
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(package_input(input, outcomes.iter().collect(), t0));
+                    reporter.push(package_input(
+                        input,
+                        outcomes.iter().collect(),
+                        package_inventory(input, limits, research).as_ref(),
+                        t0,
+                    ));
                 }
                 apply_package_outcomes(outcomes, &mut s, &bar, quiet >= 1, &log);
             }
@@ -974,16 +1076,19 @@ fn run_file_inner(
         }
     } else {
         // A reporting run uses the profiled entry point so the report carries
-        // the route that was actually selected; the unprofiled call is
-        // unchanged for every other run.
-        let profiled = if reporter.is_some() {
-            Some(unpack_one_profiled(input, &dest, verbose && quiet == 0))
-        } else {
-            None
-        };
-        let (profile, result) = match profiled {
-            Some((profile, result)) => (Some(profile), result),
-            None => (None, unpack_one_v(input, &dest, verbose && quiet == 0)),
+        // the route that was actually selected; a research run keeps its
+        // structural facts too. The unprofiled call is unchanged otherwise.
+        let (profile, observed, result) = match reporter.is_some() {
+            true => {
+                let (profile, observed, result) =
+                    unpack_one_researched(input, &dest, verbose && quiet == 0, research);
+                (Some(profile), observed, result)
+            }
+            false => (
+                None,
+                None,
+                unpack_one_v(input, &dest, verbose && quiet == 0),
+            ),
         };
         match result {
             Ok((kind, report)) => {
@@ -1011,7 +1116,9 @@ fn run_file_inner(
                     }
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
-                    reporter.push(windows_input(input, &dest, kind, &report, profile, t0));
+                    let mut reported = windows_input(input, &dest, kind, &report, profile, t0);
+                    apply_windows_research(&mut reported, observed);
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
             Err(e) => {
@@ -1023,10 +1130,12 @@ fn run_file_inner(
                     eprintln!("error: {e:#}");
                 }
                 if let Some(reporter) = reporter {
-                    reporter.push(match profile {
+                    let mut reported = match profile {
                         Some(profile) => failed_input_with_profile(input, &e, profile, t0),
                         None => failed_input(input, &e, t0),
-                    });
+                    };
+                    apply_windows_research(&mut reported, observed);
+                    reporter.push(inspect_status_if_research(reported, research));
                 }
             }
         }
@@ -1133,14 +1242,32 @@ fn deobfuscate_metadata_to_with_module(
     verbose: bool,
     method_index_module: Option<&[u8]>,
 ) -> anyhow::Result<(senbei_metadata::Report, senbei_engine::LayoutKind)> {
+    let (report, layout, _) =
+        deobfuscate_metadata_researched(input, dest, verbose, false, method_index_module)?;
+    Ok((report, layout))
+}
+
+/// [`deobfuscate_metadata_to_with_module`], optionally keeping what the
+/// transform observed (tried seeds, discovery, its own report).
+fn deobfuscate_metadata_researched(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    research: bool,
+    method_index_module: Option<&[u8]>,
+) -> anyhow::Result<(
+    senbei_metadata::Report,
+    senbei_engine::LayoutKind,
+    Option<serde_json::Value>,
+)> {
     let data = std::fs::read(input)?;
     // The Android seeded-permutation variant is tried first (it validates
     // every restored RID); the structural remap is the fallback and the
     // Windows path. The [`senbei_metadata::Error`] is preserved in the chain
     // (rather than stringified) so the folder driver can apply its
     // unsupported-version policy.
-    let (out, report, layout) =
-        crate::android::restore_metadata_bytes_with_module(&data, method_index_module)
+    let (out, report, layout, metadata_research) =
+        crate::android::restore_metadata_with_module(&data, method_index_module, research)
             .map_err(|e| e.context(format!("{input:?}")))?;
     if report.remapped > 0 {
         if let Some(parent) = dest.parent() {
@@ -1151,7 +1278,7 @@ fn deobfuscate_metadata_to_with_module(
             println!("Write to {}", dest.display());
         }
     }
-    Ok((report, layout))
+    Ok((report, layout, metadata_research))
 }
 
 /// Write an embedded metadata blob (unwrapped from a restored Android
@@ -1234,74 +1361,154 @@ fn apply_package_outcomes(
 // Inspect and dry-run drivers
 // ---------------------------------------------------------------------------
 
-/// Inspect `path` without recovering or writing anything.
+/// Inspect `path`: run the real static recovery and report everything it saw.
 ///
-/// Reads only what detection needs: a short prefix per file, the protected
-/// library probe for selected `.so` files, package manifests and central
-/// directories, and the 8-byte il2cpp metadata header. No output, no log, and
-/// no temporary file outside what a package inventory needs to read a nested
-/// manifest. The report never claims recovery or a static-validation verdict.
+/// Inspection is the research mode, so it runs the ordinary drivers — same
+/// scan, same routing, same trial-and-validate layout selection, same Android
+/// application context and deduplication — into a temporary directory that is
+/// dropped afterwards. No output survives, no log is written, and the input
+/// binary is never executed. The report therefore describes attempts that
+/// really ran, plus the structural facts the engines published for them.
 pub fn inspect_path(
     path: &Path,
     scan_all: bool,
     limits: &senbei_engine::android::ResourceLimits,
 ) -> anyhow::Result<Report> {
     let mut collector = Collector::new(Mode::Inspect);
+    let workspace = tempfile::tempdir()?;
+    let out_dir = workspace.path().to_path_buf();
     if path.is_dir() {
-        inspect_folder(path, scan_all, limits, &mut collector);
+        run_folder_inner(
+            path,
+            Some(&out_dir),
+            2,
+            false,
+            true,
+            scan_all,
+            limits,
+            Some(&mut collector),
+        )?;
     } else {
-        let started = Instant::now();
-        match inspect_file(path, limits) {
-            Ok(input) => collector.push(input),
-            Err(error) => collector.push(inspect_failed_input(path, &error, started)),
-        }
+        run_file_inner(
+            path,
+            Some(&out_dir),
+            2,
+            false,
+            true,
+            limits,
+            Some(&mut collector),
+        )?;
     }
     Ok(collector.finish())
 }
 
-fn inspect_folder(
-    root: &Path,
-    scan_all: bool,
-    limits: &senbei_engine::android::ResourceLimits,
-    collector: &mut Collector,
-) {
-    let scan = crate::scan::find_targets_with_limits(root, scan_all, limits);
-    collector.set_scan(crate::report::ScanReport {
-        non_target_skipped: scan.stats.skipped,
-        walk_errors: scan.stats.walk_errors,
-        probe_errors: scan.stats.probe_errors,
-    });
-    let mut inputs: Vec<&PathBuf> = Vec::new();
-    inputs.extend(scan.crackproof.iter());
-    inputs.extend(scan.metadata.iter());
-    inputs.extend(scan.android_so.iter());
-    inputs.extend(scan.android_packages.iter());
-    for path in inputs {
-        let started = Instant::now();
-        match inspect_file(path, limits) {
-            Ok(input) => collector.push(input),
-            Err(error) => collector.push(inspect_failed_input(path, &error, started)),
-        }
+/// Restate one driver report as an inspection observation.
+///
+/// The drivers classify an input by what they did with it. Inspection asks a
+/// different question — "what is this, and what happened when it was tried" —
+/// so a recognised target stays `recognized` whether recovery succeeded,
+/// failed, or found nothing to change. Only a genuine read or infrastructure
+/// failure is an error, and a recovery failure is a research finding rather
+/// than a failed inspection.
+/// Restate a driver report as an inspection observation when the run is a
+/// research inspection; leave an ordinary unpack report untouched.
+fn inspect_status_if_research(input: InputReport, research: bool) -> InputReport {
+    if research {
+        inspect_status(input)
+    } else {
+        input
     }
 }
 
-/// Inspect one file, choosing the report from its content.
-fn inspect_file(
-    input: &Path,
-    limits: &senbei_engine::android::ResourceLimits,
-) -> anyhow::Result<InputReport> {
-    let started = Instant::now();
-    let prefix = read_prefix(input)?;
-    if senbei_metadata::is_metadata(&prefix) {
-        return Ok(inspect_metadata(input, &prefix, started));
+/// Record what a research unpack observed on a Windows input report.
+fn apply_windows_research(report: &mut InputReport, observed: Option<UnpackResearch>) {
+    let Some(observed) = observed else {
+        return;
+    };
+    report.source = Some(observed.source);
+    if let Some(companion) = report.companion.as_mut() {
+        // The sibling's identity, from the bytes the pipeline already read.
+        companion.source = observed.companion;
     }
-    if crate::android::is_app_package(input, &prefix) {
-        return inspect_app_package(input, limits, started);
+    report.research = observed.report;
+    // The digest describes bytes that were produced and then dropped; the file
+    // itself is never kept, which `Collector` states on the output stage.
+    report.recovered = observed.recovered;
+}
+
+fn inspect_status(mut input: InputReport) -> InputReport {
+    // A file that cannot be read was never inspected: that is a real failure,
+    // not a finding about the protection.
+    if read_prefix(Path::new(&input.path)).is_err() {
+        input.status = InputStatus::Error;
+        return input;
     }
-    if crate::android::is_elf64_aarch64(&prefix) {
-        return inspect_android_library(input, limits, started);
+    // A container is incomplete when any of its entries was.
+    input.analysis_incomplete |= input.entries.iter().any(|entry| entry.analysis_incomplete);
+    let recognition = input.profile.as_ref().map(|profile| profile.recognition);
+    let container_target = input.entries.iter().any(|entry| {
+        matches!(
+            entry.status,
+            EntryStatus::Restored
+                | EntryStatus::Unchanged
+                | EntryStatus::Duplicate
+                | EntryStatus::Error
+        )
+    });
+    let recognized = match recognition {
+        Some(senbei_engine::RecognitionStatus::Recognized) => true,
+        // A container has no single profile: any entry that was probed and
+        // acted on says the container held a target.
+        None => container_target,
+        _ => false,
+    };
+    if input.analysis_incomplete {
+        // The analysis stopped on an I/O or resource failure before it could
+        // conclude anything. A known target does not make a truncated analysis
+        // complete, so this stays an error with its reason.
+        input.status = InputStatus::Error;
+    } else if recognized {
+        // A recovery that ran and failed is a finding about a real target, not
+        // a failed inspection.
+        input.status = InputStatus::Recognized;
+    } else {
+        // A plain non-target: the driver calls that an error because it could
+        // not unpack it, but inspection only observed that there is no target.
+        input.status = InputStatus::Skipped;
     }
-    inspect_windows(input, started)
+    input
+}
+
+/// Whether a failure stopped the analysis before it could describe the input.
+///
+/// A candidate route that simply did not apply is a research finding. An I/O
+/// failure, a resource ceiling, or a broken container means the analysis never
+/// reached a conclusion, and calling that "recognized" would claim more than
+/// was established. Classification is by error type, never by message text.
+pub(crate) fn analysis_incomplete(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+        if cause
+            .downcast_ref::<senbei_engine::android::LimitExceeded>()
+            .is_some()
+        {
+            return true;
+        }
+        // The Android engines wrap limits and I/O in their own error types;
+        // their source chains are walked by `chain()` above, and the direct
+        // variants are caught here.
+        matches!(
+            cause.downcast_ref::<senbei_engine::android::ExtractionError>(),
+            Some(senbei_engine::android::ExtractionError::Io { .. })
+                | Some(senbei_engine::android::ExtractionError::Limit(_))
+        ) || matches!(
+            cause.downcast_ref::<senbei_engine::android::RestoreError>(),
+            Some(senbei_engine::android::RestoreError::Io { .. })
+                | Some(senbei_engine::android::RestoreError::Limit(_))
+        )
+    })
 }
 
 fn read_prefix(path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -1311,182 +1518,6 @@ fn read_prefix(path: &Path) -> anyhow::Result<Vec<u8>> {
     let read = file.read(&mut buffer)?;
     buffer.truncate(read);
     Ok(buffer)
-}
-
-/// Inspect a Windows input without recovering it.
-///
-/// The stub and its optional `._` sibling are read separately and independently:
-/// inspection reports the pairing it observed and never turns a missing or
-/// non-pairing sibling into a recovery failure. That matters because the file
-/// entry point *does* refuse a companion-declaring stub without its payload —
-/// correct for recovery, wrong for a description of what is on disk.
-fn inspect_windows(input: &Path, started: Instant) -> anyhow::Result<InputReport> {
-    // The stub's own bytes must be readable for inspection to say anything.
-    // Failure here is a genuine read error and fails inspection.
-    let stub = std::fs::read(input)?;
-    let (companion, state) = if crate::windows::is_pe_extension(input) {
-        match read_optional_companion(input) {
-            // A sibling pairs only when its header matches this stub's payload
-            // region; `splice_companion` is that exact test.
-            Ok(Some(payload)) => {
-                if crate::windows::splice_companion(&stub, &payload).is_some() {
-                    (Some(payload), CompanionState::Spliced)
-                } else {
-                    // A sibling exists but is not this stub's payload.
-                    (Some(payload), CompanionState::Unmatched)
-                }
-            }
-            Ok(None) => (None, CompanionState::Absent),
-            // A sibling exists but cannot be read. Inspection still describes
-            // the stub; the unreadable sibling is reported, not raised.
-            Err(_) => (None, CompanionState::Unreadable),
-        }
-    } else {
-        (None, CompanionState::Absent)
-    };
-
-    // Inspect the bytes recovery would actually unpack: the spliced payload
-    // when the pairing is real, otherwise the file as it sits on disk.
-    let spliced_pair = match (state, companion.as_deref()) {
-        (CompanionState::Spliced, Some(payload)) => {
-            crate::windows::splice_companion(&stub, payload)
-        }
-        _ => None,
-    };
-    let inspected: &[u8] = spliced_pair.as_deref().unwrap_or(&stub);
-
-    let mut profile = senbei_engine::inspect_profile(inspected);
-    if spliced_pair.is_some() {
-        // Evidence of a pairing that was actually performed, not of one that
-        // was merely expected.
-        profile.record_companion_spliced();
-    }
-    let mut report = InputReport::new(input, Role::Content);
-    report.status = match profile.recognition {
-        senbei_engine::RecognitionStatus::Recognized => InputStatus::Recognized,
-        _ => InputStatus::Skipped,
-    };
-    report.companion =
-        crate::windows::is_pe_extension(input).then(|| companion_report(input, state));
-    // A sibling that does not pair, or cannot be read, describes the input —
-    // neither is a failure of the inspection.
-    if let Some(companion) = report.companion.as_mut() {
-        match companion.state {
-            CompanionState::Unmatched => {
-                companion.detail =
-                    Some("a sibling `._` exists but is not this stub's payload".to_owned());
-            }
-            CompanionState::Unreadable => {
-                companion.detail = Some("the sibling `._` could not be read".to_owned());
-            }
-            _ => {}
-        }
-    }
-    report.profile = Some(profile);
-    report.stages = vec![
-        StageReport::new(Stage::Detection, StageStatus::Ok).timed(crate::report::now_ms(started)),
-        StageReport::new(Stage::Recovery, StageStatus::Skipped)
-            .detail("inspection only: no recovery was run"),
-    ];
-    report.duration_ms = crate::report::now_ms(started);
-    Ok(report)
-}
-
-/// Companion state for a run that only knows whether a payload was spliced.
-///
-/// `Spliced` means the pairing actually happened; otherwise any sibling on disk
-/// was not this stub's payload.
-fn observed_companion_state(input: &Path, spliced: bool) -> CompanionState {
-    if spliced {
-        return CompanionState::Spliced;
-    }
-    match sibling_path(input) {
-        Some(path) if path.is_file() => CompanionState::Unmatched,
-        _ => CompanionState::Absent,
-    }
-}
-
-/// `<input>._`, the companion payload path for `input`.
-fn sibling_path(input: &Path) -> Option<PathBuf> {
-    let name = input.file_name()?;
-    let mut sibling = name.to_os_string();
-    sibling.push("._");
-    Some(input.with_file_name(sibling))
-}
-
-/// What the `._` companion relationship is for `input`, observed on disk.
-fn companion_report(input: &Path, state: CompanionState) -> CompanionReport {
-    let path = sibling_path(input);
-    CompanionReport {
-        state,
-        path: match state {
-            CompanionState::Absent => None,
-            _ => path.map(|path| path.display().to_string()),
-        },
-        detail: None,
-    }
-}
-
-fn inspect_metadata(input: &Path, prefix: &[u8], started: Instant) -> InputReport {
-    let mut report = InputReport::new(input, Role::Content);
-    let identity = senbei_metadata::identify(prefix);
-    report.metadata = identity;
-    report.metadata_version = identity.map(|identity| identity.raw_version);
-    // Header identification is a layout/capability fact, not a protection or
-    // recovery verdict.
-    report.status = InputStatus::Skipped;
-    report.profile = Some(crate::report::metadata_unchanged_profile(identity));
-    report.stages = vec![
-        StageReport::new(Stage::Detection, StageStatus::Ok).timed(crate::report::now_ms(started)),
-        StageReport::new(Stage::Recovery, StageStatus::Skipped)
-            .detail("inspection only: no transform was run"),
-    ];
-    report.duration_ms = crate::report::now_ms(started);
-    report
-}
-
-fn inspect_android_library(
-    input: &Path,
-    limits: &senbei_engine::android::ResourceLimits,
-    started: Instant,
-) -> anyhow::Result<InputReport> {
-    let (profile, result) = crate::android::probe_so_profiled(input, limits)?;
-    let mut report = InputReport::new(input, Role::Content);
-    report.status = match (&profile.recognition, &result) {
-        (senbei_engine::RecognitionStatus::Recognized, _) => InputStatus::Recognized,
-        _ => InputStatus::Skipped,
-    };
-    if let Err(error) = &result {
-        report.error(format!("{error:#}"));
-        report.status = InputStatus::Error;
-    }
-    report.profile = Some(profile);
-    report.stages = vec![
-        StageReport::new(Stage::Detection, StageStatus::Ok).timed(crate::report::now_ms(started)),
-        StageReport::new(Stage::Recovery, StageStatus::Skipped)
-            .detail("inspection only: no restore was run"),
-    ];
-    report.duration_ms = crate::report::now_ms(started);
-    Ok(report)
-}
-
-fn inspect_app_package(
-    input: &Path,
-    limits: &senbei_engine::android::ResourceLimits,
-    started: Instant,
-) -> anyhow::Result<InputReport> {
-    let mut report = InputReport::new(input, Role::Container);
-    let container = crate::android::inspect_package(input, limits)?;
-    report.status = InputStatus::Skipped;
-    report.container = Some(container);
-    report.stages = vec![
-        StageReport::new(Stage::ManifestInventory, StageStatus::Ok)
-            .timed(crate::report::now_ms(started)),
-        StageReport::new(Stage::EntryProbe, StageStatus::Skipped)
-            .detail("inspection only: container entries were listed, not probed"),
-    ];
-    report.duration_ms = crate::report::now_ms(started);
-    Ok(report)
 }
 
 /// Run the real recovery and keep nothing.
@@ -1557,6 +1588,39 @@ pub fn unpack_one_profiled(
     senbei_engine::ProtectionProfile,
     anyhow::Result<(senbei_engine::Kind, senbei_engine::IntegrityReport)>,
 ) {
+    let (profile, _, result) = unpack_one_researched(input, dest, verbose, false);
+    (profile, result)
+}
+
+/// What a reporting unpack observed from the bytes it already had in hand.
+pub(crate) struct UnpackResearch {
+    /// Identity of the physical input file, never of a synthetic spliced view.
+    pub source: Digest,
+    /// Identity of the `._` sibling whose bytes were read for pairing.
+    pub companion: Option<Digest>,
+    /// Structural research, kept only when the run asked for it.
+    pub report: Option<crate::report::WindowsResearchReport>,
+    /// Identity of the recovered image, which is discarded rather than written.
+    pub recovered: Option<Digest>,
+}
+
+/// [`unpack_one_profiled`], optionally keeping the structural inspection of
+/// both the protected input and the image recovery produced.
+///
+/// The recovery itself is the ordinary one and runs exactly once: the trace
+/// sink only records what the pipeline publishes. Research mode inspects the
+/// same bytes recovery used (the spliced view when a companion paired) and the
+/// restored image before its bytes are dropped.
+fn unpack_one_researched(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    research: bool,
+) -> (
+    senbei_engine::ProtectionProfile,
+    Option<UnpackResearch>,
+    anyhow::Result<(senbei_engine::Kind, senbei_engine::IntegrityReport)>,
+) {
     // Read the stub and its `._` sibling exactly as the file entry point does.
     let (stub, companion) = match read_stub_and_companion(input) {
         Ok(pair) => pair,
@@ -1564,30 +1628,87 @@ pub fn unpack_one_profiled(
             let mut profile = observed_profile(input);
             profile.recovery = senbei_engine::RecoveryStatus::Blocked;
             profile.push_error(format!("{error:#}"));
-            return (profile, Err(error));
+            return (profile, None, Err(error));
         }
     };
+    // The bytes recovery will actually see. A companion that pairs replaces
+    // the stub's payload region; anything else leaves the file as it is.
+    let spliced = companion
+        .as_deref()
+        .and_then(|payload| crate::windows::splice_companion(&stub, payload));
+    let (view, input_view) = match spliced.as_deref() {
+        Some(view) => (view, crate::report::ResearchInputView::SplicedCompanion),
+        None => (stub.as_slice(), crate::report::ResearchInputView::Original),
+    };
+    let inspected = research.then(|| senbei_engine::inspect_research(view));
+    // Identity of the file as it sits on disk, before any splice, and of the
+    // sibling whose bytes were read for pairing. Both hash bytes already in
+    // memory: the report must never read a companion a second time.
+    let source = Digest::of(&stub);
+    let companion_digest = companion.as_deref().map(Digest::of);
     // The byte entry point owns the splice, companion overlays, and the check
     // over the image actually returned — the same steps as `unpack_one_v`.
-    let (profile, recovered) =
-        crate::windows::unpack_bytes_profiled_v(&stub, companion.as_deref(), verbose);
+    // The trace sink only observes, and only a research run asks for it.
+    let (trace, (profile, recovered)) = if research {
+        let (trace, outcome) = senbei_engine::with_research_trace(|| {
+            crate::windows::unpack_bytes_profiled_v(&stub, companion.as_deref(), verbose)
+        });
+        (Some(trace), outcome)
+    } else {
+        (
+            None,
+            crate::windows::unpack_bytes_profiled_v(&stub, companion.as_deref(), verbose),
+        )
+    };
     let image = match recovered {
         Ok(image) => image,
         // The profile already records which candidates ran and why they failed.
-        Err(error) => return (profile, Err(error.into())),
+        Err(error) => {
+            let observed = Some(UnpackResearch {
+                source,
+                companion: companion_digest,
+                report: match (inspected, trace) {
+                    (Some(input), Some(trace)) => Some(crate::report::WindowsResearchReport {
+                        input_view,
+                        input,
+                        restored: None,
+                        trace,
+                    }),
+                    _ => None,
+                },
+                recovered: None,
+            });
+            return (profile, observed, Err(error.into()));
+        }
     };
+    // Inspect the post-overlay image now, while its bytes are still here, then
+    // let them go: research inspection never keeps a recovered file.
+    let observed = Some(UnpackResearch {
+        source,
+        companion: companion_digest,
+        report: match (inspected, trace) {
+            (Some(input), Some(trace)) => Some(crate::report::WindowsResearchReport {
+                input_view,
+                input,
+                restored: Some(senbei_engine::inspect_research(&image.bytes)),
+                trace,
+            }),
+            _ => None,
+        },
+        recovered: Some(Digest::of(&image.bytes)),
+    });
     if let Some(parent) = dest.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-        return (profile, Err(error.into()));
+        return (profile, observed, Err(error.into()));
     }
     if let Err(error) = write_atomic(dest, &image.bytes) {
-        return (profile, Err(error.into()));
+        return (profile, observed, Err(error.into()));
     }
     if verbose {
         println!("Write to {}", dest.display());
     }
-    (profile, Ok((image.kind, image.integrity)))
+    (profile, observed, Ok((image.kind, image.integrity)))
 }
 
 /// The input's bytes and its `<input>._` companion payload, when one exists.
@@ -1627,6 +1748,88 @@ fn read_stub_and_companion(input: &Path) -> anyhow::Result<(Vec<u8>, Option<Vec<
     }
 }
 
+/// `<input>._`, the companion payload path for `input`.
+fn sibling_path(input: &Path) -> Option<PathBuf> {
+    let name = input.file_name()?;
+    let mut sibling = name.to_os_string();
+    sibling.push("._");
+    Some(input.with_file_name(sibling))
+}
+
+/// Outcome of looking for `<input>._`, with the bytes when there were any.
+///
+/// The bytes are kept so the report can name the sibling's identity without
+/// reading it a second time; a `._` that exists but cannot be read is its own
+/// state, never a mismatch.
+pub(crate) enum CompanionProbe {
+    Absent,
+    Read(Vec<u8>),
+    Unreadable(String),
+}
+
+pub(crate) fn probe_companion(input: &Path) -> CompanionProbe {
+    let Some(path) = sibling_path(input) else {
+        return CompanionProbe::Absent;
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => CompanionProbe::Read(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CompanionProbe::Absent,
+        // A directory, a lock, or a permission problem: the sibling is there,
+        // but its bytes were never seen, so it must not be called a mismatch.
+        Err(error) => CompanionProbe::Unreadable(format!("{error}")),
+    }
+}
+
+/// Companion state for a run that only knows whether a payload was spliced.
+///
+/// `Spliced` means the pairing actually happened. Otherwise the sibling is
+/// reported for what it is: unreadable if it could not be read, unmatched when
+/// its bytes exist but do not pair with this stub, absent when there is none.
+pub(crate) fn observed_companion_state(
+    input: &Path,
+    spliced: bool,
+) -> (CompanionState, Option<Digest>, Option<String>) {
+    if spliced {
+        return (CompanionState::Spliced, None, None);
+    }
+    match probe_companion(input) {
+        CompanionProbe::Absent => (CompanionState::Absent, None, None),
+        CompanionProbe::Read(bytes) => (CompanionState::Unmatched, Some(Digest::of(&bytes)), None),
+        CompanionProbe::Unreadable(reason) => (CompanionState::Unreadable, None, Some(reason)),
+    }
+}
+
+/// What the `._` companion relationship is for `input`, observed on disk.
+///
+/// `source` is the identity of a sibling whose bytes were seen. `Unreadable`
+/// carries no identity because none were: a digest of nothing would be a lie.
+pub(crate) fn companion_report(
+    input: &Path,
+    state: CompanionState,
+    source: Option<Digest>,
+    unreadable: Option<String>,
+) -> CompanionReport {
+    let path = sibling_path(input);
+    CompanionReport {
+        state,
+        path: match state {
+            CompanionState::Absent => None,
+            _ => path.map(|path| path.display().to_string()),
+        },
+        detail: match state {
+            CompanionState::Unmatched => {
+                Some("a sibling `._` exists but is not this stub's payload".to_owned())
+            }
+            CompanionState::Unreadable => Some(match unreadable {
+                Some(reason) => format!("the sibling `._` could not be read: {reason}"),
+                None => "the sibling `._` could not be read".to_owned(),
+            }),
+            _ => None,
+        },
+        source,
+    }
+}
+
 /// Input report for a Windows PE whose outcome a profiled run reported.
 fn windows_input(
     input: &Path,
@@ -1644,10 +1847,9 @@ fn windows_input(
     };
     let profile = profile.unwrap_or_else(|| recovered_profile(kind, report));
     entry.companion = crate::windows::is_pe_extension(input).then(|| {
-        companion_report(
-            input,
-            observed_companion_state(input, profile.observed.external_companion),
-        )
+        let (state, source, unreadable) =
+            observed_companion_state(input, profile.observed.external_companion);
+        companion_report(input, state, source, unreadable)
     });
     entry.profile = Some(profile);
     entry.outputs = vec![OutputFile::from_path(dest)];
@@ -1716,6 +1918,7 @@ fn recovered_profile(
 fn failed_input(input: &Path, error: &anyhow::Error, started: Instant) -> InputReport {
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = InputStatus::Error;
+    entry.analysis_incomplete = analysis_incomplete(error);
     let detail = format!("{error:#}");
     entry.error(detail.clone());
     entry.profile = Some(failure_profile(input, &detail));
@@ -1738,39 +1941,18 @@ fn failed_input_with_profile(
 ) -> InputReport {
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = InputStatus::Error;
+    entry.analysis_incomplete = analysis_incomplete(error);
     let detail = format!("{error:#}");
     entry.error(detail.clone());
     entry.companion = crate::windows::is_pe_extension(input).then(|| {
-        companion_report(
-            input,
-            observed_companion_state(input, profile.observed.external_companion),
-        )
+        let (state, source, unreadable) =
+            observed_companion_state(input, profile.observed.external_companion);
+        companion_report(input, state, source, unreadable)
     });
     entry.profile = Some(profile);
     entry
         .stages
         .push(StageReport::new(Stage::Recovery, StageStatus::Failed).detail(detail));
-    entry.duration_ms = crate::report::now_ms(started);
-    entry
-}
-
-/// Input report for an input inspection could not read.
-///
-/// Inspection is detection only, so a read error must not be dressed up as a
-/// failed recovery: no candidate is marked attempted, `recovery` stays
-/// `not_attempted`, `static_validation` stays `not_run`, and no route is
-/// selected. Whatever header evidence was obtainable is still reported.
-fn inspect_failed_input(input: &Path, error: &anyhow::Error, started: Instant) -> InputReport {
-    let mut entry = InputReport::new(input, Role::Content);
-    entry.status = InputStatus::Error;
-    let detail = format!("{error:#}");
-    entry.error(detail.clone());
-    let mut profile = observed_profile(input);
-    profile.push_error(detail.clone());
-    entry.profile = Some(profile);
-    entry
-        .stages
-        .push(StageReport::new(Stage::Detection, StageStatus::Failed).detail(detail));
     entry.duration_ms = crate::report::now_ms(started);
     entry
 }
@@ -1886,14 +2068,27 @@ fn failure_profile(input: &Path, detail: &str) -> senbei_engine::ProtectionProfi
 }
 
 /// Input report for a restored (or skipped) loose Android library.
-fn android_library_input(
+pub(crate) fn android_library_input(
     input: &Path,
     status: InputStatus,
     dest: &Path,
     started: Instant,
 ) -> InputReport {
+    android_library_input_with_error(input, status, dest, started, None)
+}
+
+/// [`android_library_input`], also recording whether the failure was a resource
+/// or I/O ceiling rather than an ordinary candidate rejection.
+fn android_library_input_with_error(
+    input: &Path,
+    status: InputStatus,
+    dest: &Path,
+    started: Instant,
+    error: Option<&anyhow::Error>,
+) -> InputReport {
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = status;
+    entry.analysis_incomplete = error.is_some_and(analysis_incomplete);
     match status {
         InputStatus::Ok => {
             entry.profile = Some(crate::report::android_recovered_profile());
@@ -1954,6 +2149,35 @@ fn apply_android_validation(
     report.stages.push(stage);
 }
 
+/// Profile for a metadata blob whose transform ran, validated, and needed no
+/// change.
+///
+/// The route was really taken and the bytes really validated, so the attempt is
+/// recorded — but a clean blob is no protection evidence, so recognition stays
+/// `not_recognized` and no protection verdict is claimed. Without this an
+/// inspection of an already-clean blob would say `not_attempted` while the
+/// research section next to it showed the route and its report.
+fn metadata_validated_unchanged_profile(
+    identity: Option<senbei_metadata::MetadataIdentity>,
+    route: senbei_engine::LayoutKind,
+) -> senbei_engine::ProtectionProfile {
+    use senbei_engine::{AttemptOutcome, LayoutAttempt, ProtectionProfile};
+    let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::metadata(
+        identity.map(|identity| identity.raw_version),
+    ));
+    profile.candidates = vec![LayoutAttempt {
+        layout: route,
+        outcome: AttemptOutcome::Succeeded,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    }];
+    profile.selected = Some(route);
+    profile.recovery = senbei_engine::RecoveryStatus::Succeeded;
+    profile.static_validation = senbei_engine::ValidationStatus::NotRun;
+    profile.recognition = senbei_engine::RecognitionStatus::NotRecognized;
+    profile
+}
+
 /// Input report for one loose il2cpp metadata blob.
 fn metadata_input(
     input: &Path,
@@ -1980,12 +2204,18 @@ fn metadata_input(
                 .timed(crate::report::now_ms(started)),
         );
     } else {
-        // Identified, valid, and already canonical: nothing to restore.
+        // Identified, valid, and already canonical: nothing to write. The
+        // transform still ran and validated, so a research report may say so
+        // even though the status stays "nothing needed".
         entry.status = InputStatus::Skipped;
-        entry.profile = Some(crate::report::metadata_unchanged_profile(identity));
-        entry
-            .stages
-            .push(StageReport::new(Stage::Recovery, StageStatus::Skipped));
+        entry.profile = Some(match report.research {
+            Some(_) => metadata_validated_unchanged_profile(identity, report.layout),
+            None => crate::report::metadata_unchanged_profile(identity),
+        });
+        entry.stages.push(
+            StageReport::new(Stage::Recovery, StageStatus::Skipped)
+                .detail("the transform ran and validated; nothing needed rewriting"),
+        );
     }
     entry.duration_ms = crate::report::now_ms(started);
     entry
@@ -1997,6 +2227,7 @@ fn single_metadata_input(
     report: &senbei_metadata::Report,
     layout: senbei_engine::LayoutKind,
     dest: Option<&Path>,
+    research: bool,
     started: Instant,
 ) -> InputReport {
     let identity = identity_of(input);
@@ -2008,10 +2239,11 @@ fn single_metadata_input(
     } else {
         InputStatus::Skipped
     };
-    entry.profile = Some(if dest.is_some() {
-        crate::report::metadata_recovered_profile(identity, layout)
-    } else {
-        crate::report::metadata_unchanged_profile(identity)
+    entry.profile = Some(match (dest.is_some(), research) {
+        (true, _) => crate::report::metadata_recovered_profile(identity, layout),
+        // The transform ran and validated; only the rewrite was unnecessary.
+        (false, true) => metadata_validated_unchanged_profile(identity, layout),
+        (false, false) => crate::report::metadata_unchanged_profile(identity),
     });
     entry.outputs = dest
         .map(|dest| vec![OutputFile::from_path(dest)])
@@ -2031,28 +2263,93 @@ fn single_metadata_input(
     entry
 }
 
+/// Report for an il2cpp metadata input whose transform failed.
+///
+/// One rule for folder and single-file runs, in every mode: an unsupported
+/// version was left untouched by design and is a skip; anything else is a real
+/// failure of this input, with the transform's own reason preserved. Research
+/// keeps the seeds and discovery the failing attempt produced.
+fn metadata_failure_input(
+    input: &Path,
+    error: &anyhow::Error,
+    unsupported: Option<u32>,
+    started: Instant,
+) -> InputReport {
+    // `failed_input` already classified the typed error; an unsupported
+    // version is a deliberate skip, not an incomplete analysis.
+    let mut report = failed_input(input, error, started);
+    if unsupported.is_some() {
+        report.analysis_incomplete = false;
+    }
+    let identity = identity_of(input);
+    report.metadata = identity;
+    report.metadata_version = unsupported.or_else(|| identity.map(|identity| identity.raw_version));
+    report.metadata_research =
+        crate::android::error_research(error).and_then(|capture| match capture {
+            crate::android::ResearchCapture::Metadata(value) => Some(value.clone()),
+            crate::android::ResearchCapture::Library(_) => None,
+        });
+    if let Some(version) = unsupported {
+        // Left untouched by design; not a failure of this run.
+        report.status = InputStatus::Skipped;
+        report.errors.clear();
+        report.profile = Some(crate::report::metadata_unchanged_profile(identity));
+        report.warning(format!(
+            "unsupported metadata version {version}, left untouched"
+        ));
+    } else {
+        report.profile = Some(crate::report::metadata_failed_profile(
+            identity,
+            senbei_engine::LayoutKind::MetadataStructural,
+            &format!("{error:#}"),
+        ));
+    }
+    report
+}
+
+/// Membership of a package, read only for a research inspection.
+///
+/// This is a container listing (central directories and a bounded manifest
+/// read), not a second restore: it never touches a protected entry's payload.
+fn package_inventory(
+    package: &Path,
+    limits: &senbei_engine::android::ResourceLimits,
+    research: bool,
+) -> Option<crate::report::ContainerReport> {
+    if !research {
+        return None;
+    }
+    crate::android::inspect_package(package, limits).ok()
+}
+
 /// Input report for one app package, from the entries it produced.
+///
+/// `inventory` additionally lists what the container holds — its manifests and
+/// the entries a restore would probe — kept apart from the entries that were
+/// actually probed, so a membership list is never read as inspected content.
 fn package_input(
     package: &Path,
     outcomes: Vec<&crate::android::EntryOutcome>,
+    inventory: Option<&crate::report::ContainerReport>,
     started: Instant,
 ) -> InputReport {
     let mut entry = InputReport::new(package, Role::Container);
-    entry.container = Some(ContainerReport {
-        kind: package
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .unwrap_or_default(),
-        // Inventory is only recorded by an explicit inspect run; a restore
-        // reports what it actually produced.
-        manifests: Vec::new(),
-        entry_count: outcomes.len(),
-        candidate_entries: outcomes
-            .iter()
-            .map(|outcome| outcome.label.clone())
-            .collect(),
-        nested_packages: Vec::new(),
+    entry.container = Some(match inventory {
+        Some(inventory) => inventory.clone(),
+        None => ContainerReport {
+            kind: package
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default(),
+            manifests: Vec::new(),
+            entry_count: outcomes.len(),
+            candidate_entries: outcomes
+                .iter()
+                .map(|outcome| outcome.label.clone())
+                .collect(),
+            nested_packages: Vec::new(),
+        },
     });
     entry.entries = outcomes
         .iter()
@@ -2073,6 +2370,9 @@ fn package_input(
                 .detail(diagnostics.join("; ")),
         );
     }
+    // A container's analysis is incomplete when any entry's was: the
+    // membership report may be truncated by the same ceiling.
+    entry.analysis_incomplete = entry.entries.iter().any(|entry| entry.analysis_incomplete);
     entry.status = if entry
         .entries
         .iter()
@@ -2114,6 +2414,8 @@ fn entry_report(outcome: &crate::android::EntryOutcome) -> EntryReport {
     report.provenance = outcome.provenance.clone();
     report.layout = outcome.layout;
     report.metadata_version = outcome.metadata_version;
+    report.android_research = outcome.research.clone();
+    report.metadata_research = outcome.metadata_research.clone();
     if let SourceKind::Metadata { remapped } = outcome.kind {
         report.remapped = Some(remapped);
     }
@@ -2122,6 +2424,9 @@ fn entry_report(outcome: &crate::android::EntryOutcome) -> EntryReport {
     }
     if let crate::android::EntryStatus::Failed(error) = &outcome.status {
         report.errors.push(format!("{error:#}"));
+        // A resource or I/O ceiling stopped this entry before its structure
+        // could be judged; a structural rejection is an observed finding.
+        report.analysis_incomplete = analysis_incomplete(error);
     }
     // The engine's advisory findings for this entry's own output. Only a
     // restored entry has an output they could describe.
@@ -2238,5 +2543,253 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod research_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Two splits that name the same package and version form one split set.
+    /// A restore failure there belongs to the group, but each split still gets
+    /// a report naming the cause — otherwise the JSON would say "no errors"
+    /// and an inspection would exit 0 over a failed restore.
+    #[test]
+    fn a_failed_split_set_reports_an_error_for_every_split() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let manifest = |package: &str, version: u32| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                 <manifest package=\"{package}\" android:versionCode=\"{version}\"></manifest>\n"
+            )
+        };
+        let write = |name: &str, entries: &[(&str, Vec<u8>)]| {
+            let path = root.join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            let mut archive = zip::ZipWriter::new(file);
+            for (entry, data) in entries {
+                archive
+                    .start_file(
+                        *entry,
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored),
+                    )
+                    .unwrap();
+                archive.write_all(data).unwrap();
+            }
+            archive.finish().unwrap();
+            path
+        };
+        // Same package and version: one split set. The library entry is larger
+        // than the entry ceiling, so the group restore really fails.
+        // The scan's size floor is applied before any content probe, so the
+        // archives carry an asset that clears it.
+        // Stored, not deflated: the scan's floor is the on-disk file size.
+        let padding: Vec<u8> = (0..8 * 1024).map(|index| (index % 251) as u8).collect();
+        let base = write(
+            "base.apk",
+            &[
+                (
+                    "AndroidManifest.xml",
+                    manifest("com.example.split", 7).into_bytes(),
+                ),
+                ("assets/pad.bin", padding.clone()),
+            ],
+        );
+        let config = write(
+            "config.apk",
+            &[
+                (
+                    "AndroidManifest.xml",
+                    manifest("com.example.split", 7).into_bytes(),
+                ),
+                ("assets/pad.bin", padding),
+                // Larger than the entry ceiling, so the group restore fails.
+                ("lib/arm64-v8a/libil2cpp.so", vec![0xAA; 2048]),
+            ],
+        );
+
+        let limits = senbei_engine::android::ResourceLimits {
+            max_entry_bytes: 512,
+            ..senbei_engine::android::ResourceLimits::default()
+        };
+        let mut collector = Collector::new(Mode::Inspect);
+        run_folder_inner(
+            root,
+            Some(&td.path().join("out")),
+            2,
+            false,
+            true,
+            false,
+            &limits,
+            Some(&mut collector),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&collector.finish().to_json()).unwrap();
+        let inputs = value["inputs"].as_array().unwrap();
+        assert!(
+            inputs.len() >= 2,
+            "each split is reported separately: {value}"
+        );
+        // A resource ceiling is an honest failure, not a failed inspection of a
+        // non-target: it is counted once per reported split, never twice for the
+        // group's two restore phases.
+        assert_eq!(
+            value["summary"]["errors"], 2,
+            "one error per split, counted exactly once: {value}"
+        );
+        for package in [&base, &config] {
+            let reported = inputs
+                .iter()
+                .find(|input| input["path"] == package.display().to_string())
+                .unwrap_or_else(|| panic!("{} must be reported: {value}", package.display()));
+            assert_eq!(reported["status"], "error", "{reported}");
+            assert!(
+                !reported["errors"].as_array().unwrap().is_empty(),
+                "the cause travels with the split: {reported}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod single_package_research_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A single package inspected on its own keeps the same per-entry engine
+    /// report a folder run would: the research flag must reach its restore
+    /// cache, not only the folder's shared one.
+    #[test]
+    fn a_single_package_inspection_keeps_its_entry_report() {
+        let td = tempfile::tempdir().unwrap();
+        let apk = td.path().join("app.apk");
+        let mut metadata = 0xFAB1_1BAF_u32.to_le_bytes().to_vec();
+        metadata.extend_from_slice(&31u32.to_le_bytes());
+        metadata.resize(0x300, 0);
+        // A plausible v31 header is not needed: the transform reports its own
+        // failure, and a failing transform is exactly what carries research.
+        let file = std::fs::File::create(&apk).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("AndroidManifest.xml", options).unwrap();
+        archive
+            .write_all(
+                b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                  <manifest package=\"com.example.one\" android:versionCode=\"1\"></manifest>\n",
+            )
+            .unwrap();
+        archive
+            .start_file("assets/global-metadata.dat", options)
+            .unwrap();
+        archive.write_all(&metadata).unwrap();
+        archive.start_file("assets/pad.bin", options).unwrap();
+        archive
+            .write_all(
+                &(0..8 * 1024)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<u8>>(),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+
+        let report = inspect_path(
+            &apk,
+            false,
+            &senbei_engine::android::ResourceLimits::default(),
+        )
+        .expect("inspection returns a report");
+        let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let input = &value["inputs"][0];
+        assert_eq!(input["role"], "container");
+        let entries = input["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the metadata entry was probed: {input}");
+        assert!(
+            entries[0]["metadata_research"].is_object(),
+            "a single package keeps the transform's research: {input}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod incomplete_analysis_tests {
+    use super::*;
+
+    fn limited() -> anyhow::Error {
+        anyhow::Error::new(senbei_engine::android::LimitExceeded::Entry {
+            requested: 4096,
+            limit: 1024,
+        })
+    }
+
+    /// A resource ceiling stops the analysis before it can conclude anything.
+    /// A known target does not make that a complete inspection.
+    #[test]
+    fn a_resource_ceiling_keeps_inspection_incomplete() {
+        let error = limited();
+        assert!(analysis_incomplete(&error));
+        // And it survives the Android engines' own wrappers.
+        let wrapped = anyhow::Error::new(senbei_engine::android::ExtractionError::Limit(
+            senbei_engine::android::LimitExceeded::Entry {
+                requested: 4096,
+                limit: 1024,
+            },
+        ));
+        assert!(analysis_incomplete(&wrapped));
+    }
+
+    /// An ordinary rejected candidate is a finding: the analysis concluded that
+    /// this layout does not apply.
+    #[test]
+    fn a_rejected_candidate_is_not_incomplete() {
+        assert!(!analysis_incomplete(&anyhow::anyhow!(
+            "stage5 marker not found — this build's layout is not supported"
+        )));
+        assert!(!analysis_incomplete(&anyhow::Error::new(
+            senbei_engine::android::RestoreError::Invalid("not a linker-walkable image".to_owned())
+        )));
+    }
+
+    /// The report restates a known target as recognized — unless the analysis
+    /// stopped on a resource or I/O ceiling.
+    #[test]
+    fn an_incomplete_analysis_stays_an_error_even_for_a_known_target() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("libil2cpp.so");
+        std::fs::write(&path, b"not really an ELF").unwrap();
+        let mut input = InputReport::new(&path, Role::Content);
+        input.status = InputStatus::Error;
+        input.profile = Some(crate::report::android_failed_profile("limit"));
+        input.analysis_incomplete = true;
+        let reported = inspect_status(input);
+        assert_eq!(reported.status, InputStatus::Error);
+        assert!(reported.analysis_incomplete);
+
+        // The same target without an incompleteness marker is a finding.
+        let mut complete = InputReport::new(&path, Role::Content);
+        complete.status = InputStatus::Error;
+        complete.profile = Some(crate::report::android_failed_profile("layout rejected"));
+        let reported = inspect_status(complete);
+        assert_eq!(reported.status, InputStatus::Recognized);
+        assert!(!reported.analysis_incomplete);
+    }
+
+    /// A container whose entry hit a ceiling is incomplete as a whole.
+    #[test]
+    fn a_container_inherits_an_incomplete_entry() {
+        let mut entry = EntryReport::new("app.apk::lib/arm64-v8a/libil2cpp.so", EntryStatus::Error);
+        entry.analysis_incomplete = true;
+        entry.errors.push("resource limit".to_owned());
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("app.apk");
+        std::fs::write(&path, b"PK").unwrap();
+        let mut input = InputReport::new(&path, Role::Container);
+        input.entries = vec![entry];
+        let reported = inspect_status(input);
+        assert_eq!(reported.status, InputStatus::Error);
+        assert!(reported.analysis_incomplete);
     }
 }

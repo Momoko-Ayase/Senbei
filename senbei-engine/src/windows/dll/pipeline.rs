@@ -13,12 +13,36 @@
 //!   CalculateChecksumWithSizeXor        -> primitives::calculate_checksum
 //!   CalculateCrc32                      -> crc32::compute (via above)
 
+use super::super::research::{self, AddressSpace, ResearchStage, TraceValue};
 use super::super::{
     BufferOperation, BytecodeStage, DecompressionStage, DescriptorTable, SectionPipeline,
     UnpackError,
 };
 use senbei_crypto::bytecode::{Op, OpsLut, generate};
 use senbei_crypto::primitives::{self, *};
+
+/// Per-code-block index for trace events. The four blocks share one research
+/// stage, so an explicit index keeps their events orderable.
+fn code_block_index(stage: DecompressionStage) -> u32 {
+    match stage {
+        DecompressionStage::DllCodeBlock1 => 1,
+        DecompressionStage::DllCodeBlock2 => 2,
+        DecompressionStage::DllCodeBlock3 => 3,
+        DecompressionStage::DllCodeBlock4 => 4,
+        _ => 0,
+    }
+}
+
+/// Address/offset as an unsigned trace value. Every field fed here is a
+/// computed working-image or file offset; the packer's values are 32-bit and
+/// negative encodings are still reported as their 32-bit bit pattern.
+fn trace_offset(value: i32) -> u64 {
+    u64::from(value as u32)
+}
+
+/// Section-block samples are bounded: a large image can hold thousands of
+/// blocks, and the sink limit must not be what stops the trace.
+const TRACE_BLOCK_SAMPLE: usize = 16;
 
 /// Read a signed 32-bit little-endian value.
 fn get_i32(d: &[u8], offset: i32) -> i32 {
@@ -78,6 +102,38 @@ fn decrypt_data4(
     let compressed_addr = get_i32(d, offset + 8);
     let decompressed_size = get_i32(d, offset + 12);
 
+    if research::trace_enabled() {
+        // One descriptor event per block; `block` makes the shared stage
+        // orderable without a stage variant per block.
+        research::emit_at(
+            ResearchStage::DllStages,
+            "code_block_descriptor",
+            TraceValue::U32s(vec![
+                code_block_index(stage),
+                addr as u32,
+                size as u32,
+                compressed_addr as u32,
+                decompressed_size as u32,
+            ]),
+            AddressSpace::WorkingImageRva,
+            trace_offset(offset),
+        );
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "aes_key_schedule",
+            decomp_params[3] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decomp_params[3]),
+        );
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "huffman_table",
+            decomp_params[1] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decomp_params[1]),
+        );
+    }
+
     aes_decrypt(d, addr as u32, size as u32, decomp_params[3] as u32);
     // DecryptData1(offset, key, 19) == primitives::decrypt_data3 with shift 19
     decrypt_data3(d, offset as u32, key as u32, 19);
@@ -85,7 +141,19 @@ fn decrypt_data4(
     if let Some(ops) = transform
         && size > 0
     {
+        if research::trace_enabled() {
+            research::emit_u32(ResearchStage::DllStages, "bytecode_ops", ops.len() as u32);
+        }
         OpsLut::new(ops).map_region(d, addr as usize, size as usize);
+    }
+    if size > 0 {
+        research::emit_range(
+            ResearchStage::DllStages,
+            "block_decrypted",
+            AddressSpace::WorkingImageRva,
+            trace_offset(addr),
+            size as u64,
+        );
     }
 
     if size != decompressed_size
@@ -98,7 +166,22 @@ fn decrypt_data4(
             decompressed_size as u32,
         )
     {
+        research::emit_note(
+            ResearchStage::DllStages,
+            "block_decompression",
+            TraceValue::Bool(false),
+            "block_decompression_failed",
+        );
         return Err(UnpackError::StageDecompressionFailed { stage, reason });
+    }
+    if size != decompressed_size {
+        research::emit_range(
+            ResearchStage::DllStages,
+            "block_decompression",
+            AddressSpace::WorkingImageRva,
+            trace_offset(compressed_addr),
+            decompressed_size.max(0) as u64,
+        );
     }
     Ok(())
 }
@@ -163,6 +246,9 @@ fn section_header_blank(file_data: &[u8], off: i32) -> bool {
 
 /// `ProcessImportTable`.
 fn process_import_table(d: &mut [u8], mut import_table_offset: i32) {
+    let table_start = import_table_offset;
+    let mut descriptors: u32 = 0;
+    let mut thunks: u64 = 0;
     while get_i32(d, import_table_offset + 12) != 0 {
         let name_offset = get_i32(d, import_table_offset + 12);
         decrypt_data7(d, name_offset as u32, name_offset as u8);
@@ -191,10 +277,22 @@ fn process_import_table(d: &mut [u8], mut import_table_offset: i32) {
                 d[entry as usize] = 0;
                 d[entry.wrapping_add(1) as usize] = 0;
             }
+            thunks += 1;
             thunk_addr += 8;
         }
+        descriptors += 1;
         import_table_offset += 20;
     }
+    // `table_start` is a working-image RVA; the pipeline reached this walk
+    // only after the import descriptor was validated by the caller.
+    research::emit_u32_at(
+        ResearchStage::Imports,
+        "import_descriptors",
+        descriptors,
+        AddressSpace::WorkingImageRva,
+        trace_offset(table_start),
+    );
+    research::emit_u64(ResearchStage::Imports, "import_thunks", thunks);
 }
 
 /// `DecryptAndDecompressData`.
@@ -215,11 +313,19 @@ fn decrypt_and_decompress_data(
         src_offset: i32,
         expected_crc: i32,
     }
+    let block_table_offset = section_data_offset;
     let mut blocks: Vec<Blk> = Vec::new();
     loop {
         // Guard: need 16 bytes at section_data_offset in `d`
         let off = section_data_offset as usize;
         if off.saturating_add(16) > d.len() {
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "block_table_out_of_bounds",
+                off as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(section_data_offset),
+            );
             return Err(UnpackError::DescriptorOutOfBounds {
                 table: DescriptorTable::DllSectionBlocks,
                 offset: off,
@@ -236,12 +342,61 @@ fn decrypt_and_decompress_data(
         if size == 0 {
             break;
         }
+        // The descriptor table itself is working-image data; its records are
+        // emitted (bounded) below after the loop has the totals.
         blocks.push(Blk {
             dest_offset,
             size,
             src_offset,
             expected_crc,
         });
+    }
+    if research::trace_enabled() {
+        let mut raw_total: u64 = 0;
+        let mut out_total: u64 = 0;
+        let mut compressed = 0u32;
+        for (index, block) in blocks.iter().enumerate() {
+            raw_total += block.size.max(0) as u64;
+            out_total += block.expected_crc.max(0) as u64;
+            if block.size != block.expected_crc {
+                compressed += 1;
+            }
+            if index < TRACE_BLOCK_SAMPLE {
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "block_descriptor",
+                    block.dest_offset as u32,
+                );
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "block_src",
+                    block.src_offset as u32,
+                );
+                research::emit_u32(ResearchStage::Sections, "block_raw_len", block.size as u32);
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "block_out_len",
+                    block.expected_crc as u32,
+                );
+            }
+        }
+        research::emit_u32_at(
+            ResearchStage::Sections,
+            "block_count",
+            blocks.len() as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(block_table_offset),
+        );
+        research::emit_u32(ResearchStage::Sections, "compressed_blocks", compressed);
+        research::emit_u64(ResearchStage::Sections, "raw_total_len", raw_total);
+        research::emit_u64(ResearchStage::Sections, "output_total_len", out_total);
+        research::emit_u32_at(
+            ResearchStage::Sections,
+            "section_image_base",
+            section_image_base as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(section_image_base),
+        );
     }
     // Pass 2: each block writes only [src_offset, src_offset+max(size,crc)) and
     // reads only immutable input + the (snapshotted) key tables, so blocks with
@@ -252,10 +407,42 @@ fn decrypt_and_decompress_data(
         let lut = OpsLut::new(decrypt_func);
         let ko0 = decomp_params[0];
         let ko2 = decomp_params[2];
-        let ks_snap = primitives::aes_schedule_snapshot(d, ko2 as u32)
-            .ok_or(UnpackError::InvalidAesKeySchedule { offset: ko2 as u32 })?;
-        let tab_snap = primitives::huffman_table_snapshot(d, ko0 as u32)
-            .ok_or(UnpackError::InvalidHuffmanTable { offset: ko0 as u32 })?;
+        if research::trace_enabled() {
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "aes_key_schedule",
+                ko2 as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(ko2),
+            );
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "huffman_table",
+                ko0 as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(ko0),
+            );
+        }
+        let ks_snap = primitives::aes_schedule_snapshot(d, ko2 as u32).ok_or_else(|| {
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "aes_schedule_invalid",
+                ko2 as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(ko2),
+            );
+            UnpackError::InvalidAesKeySchedule { offset: ko2 as u32 }
+        })?;
+        let tab_snap = primitives::huffman_table_snapshot(d, ko0 as u32).ok_or_else(|| {
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "huffman_table_invalid",
+                ko0 as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(ko0),
+            );
+            UnpackError::InvalidHuffmanTable { offset: ko0 as u32 }
+        })?;
         let spans: Vec<(usize, usize)> = blocks
             .iter()
             .map(|b| {
@@ -291,16 +478,45 @@ fn decrypt_and_decompress_data(
             }
             Ok(())
         };
-        super::super::parallel::parallel_for(d, &spans, 1, do_block)?;
+        // Workers cannot emit into the trace (the sink is thread-local), so
+        // the driver records the outcome after the fan-out returns.
+        if let Err(error) = super::super::parallel::parallel_for(d, &spans, 1, do_block) {
+            match &error {
+                UnpackError::SectionDecompressionFailed { block, .. } => {
+                    research::emit_u32(
+                        ResearchStage::Sections,
+                        "block_decompression_failed",
+                        *block as u32,
+                    );
+                }
+                _ => research::emit_note(
+                    ResearchStage::Sections,
+                    "block_pass_failed",
+                    TraceValue::Bool(false),
+                    "section block pass failed",
+                ),
+            }
+            return Err(error);
+        }
     }
 
     // Zero-fill loop.
+    let zero_fill_table = section_data_offset;
+    let mut zero_fill_records: u32 = 0;
+    let mut zero_fill_bytes: u64 = 0;
     loop {
         let off = section_data_offset as usize;
         // The entry block loop above correctly requires 16 bytes; this loop
         // decrypts 16 too, so guard 16 (an 8-byte guard would let
         // decrypt_data6_shift6 index past the end of a truncated descriptor).
         if off.saturating_add(16) > d.len() {
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "zero_fill_out_of_bounds",
+                off as u32,
+                AddressSpace::WorkingImageRva,
+                trace_offset(section_data_offset),
+            );
             return Err(UnpackError::DescriptorOutOfBounds {
                 table: DescriptorTable::DllZeroFill,
                 offset: off,
@@ -315,6 +531,8 @@ fn decrypt_and_decompress_data(
         if zero_size == 0 {
             break;
         }
+        zero_fill_records += 1;
+        zero_fill_bytes += zero_size.max(0) as u64;
         for i in 0..zero_size {
             let idx = (zero_offset + i) as usize;
             if idx >= d.len() {
@@ -327,6 +545,16 @@ fn decrypt_and_decompress_data(
             }
             d[idx] = 0;
         }
+    }
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::Sections,
+            "zero_fill_count",
+            zero_fill_records,
+            AddressSpace::WorkingImageRva,
+            trace_offset(zero_fill_table),
+        );
+        research::emit_u64(ResearchStage::Sections, "zero_fill_bytes", zero_fill_bytes);
     }
     Ok(())
 }
@@ -359,6 +587,45 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     let original_file_data = input;
 
     let keys = initialize_keys(file_data);
+    if research::trace_enabled() {
+        research::emit_u32s(
+            ResearchStage::Header,
+            "header_keys",
+            keys.iter().map(|key| *key as u32).collect(),
+        );
+        // keys[1] is the magic; keys[3] is the payload base, keys[6] the anchor.
+        research::emit_u32_at(
+            ResearchStage::Header,
+            "magic",
+            keys[1] as u32,
+            AddressSpace::ProtectedHeaderOffset,
+            4100,
+        );
+        // `keys[3]` is the destination base inside the working image; the
+        // payload's source bytes begin at `keys[4] + 4096` in the file.
+        research::emit_u32_at(
+            ResearchStage::Header,
+            "payload_base",
+            keys[3] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(keys[3]),
+        );
+        research::emit_u32(ResearchStage::Header, "payload_len", keys[5] as u32);
+        research::emit_u32_at(
+            ResearchStage::Header,
+            "payload_src",
+            (keys[4] as u32).wrapping_add(4096),
+            AddressSpace::FileOffset,
+            trace_offset(keys[4]).wrapping_add(4096),
+        );
+        research::emit_u32_at(
+            ResearchStage::Header,
+            "anchor",
+            keys[6] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(keys[6]),
+        );
+    }
     if verbose {
         println!("[1/9] Initializing keys...");
         println!("  keys[0] key       = 0x{:08X}", keys[0] as u32);
@@ -403,6 +670,41 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     }
     let mut out = vec![0u8; size_of_image as usize];
     let base_offset = keys[6] - keys[3] + 0x2000;
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::Payload,
+            "pe_offset",
+            pe_offset as u32,
+            AddressSpace::FileOffset,
+            trace_offset(pe_offset),
+        );
+        research::emit_u32(
+            ResearchStage::Payload,
+            "size_of_image",
+            size_of_image as u32,
+        );
+        research::emit_u32_at(
+            ResearchStage::Payload,
+            "base_offset",
+            base_offset as u32,
+            AddressSpace::DecodedPayloadOffset,
+            trace_offset(base_offset),
+        );
+        research::emit_u32_at(
+            ResearchStage::Payload,
+            "key_table_src",
+            (keys[4] as u32).wrapping_add(4096),
+            AddressSpace::FileOffset,
+            trace_offset(keys[4]).wrapping_add(4096),
+        );
+        research::emit_range(
+            ResearchStage::Payload,
+            "key_table",
+            AddressSpace::WorkingImageRva,
+            trace_offset(keys[3]),
+            (base_offset >> 2) as u64 * 4,
+        );
+    }
     if verbose {
         println!("[2/9] Decrypting key table...");
         println!("  size_of_image = 0x{:08X}", size_of_image as u32);
@@ -428,6 +730,20 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         let dst = (keys[3] + base_offset) as usize;
         let n = (keys[5] - base_offset) as usize;
         primitives::try_copy_from_slice(&mut out, dst, n, file_data, src)?;
+        research::emit_range(
+            ResearchStage::Payload,
+            "payload_copy",
+            AddressSpace::FileOffset,
+            src as u64,
+            n as u64,
+        );
+        research::emit_range(
+            ResearchStage::Payload,
+            "payload_dest",
+            AddressSpace::WorkingImageRva,
+            dst as u64,
+            n as u64,
+        );
     }
     write_i32(&mut out, keys[3], 4096);
     out[..4096].copy_from_slice(&file_data[..4096]);
@@ -442,6 +758,21 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     write_i32(&mut out, pe_offset + 156, v156);
     write_i32(&mut out, pe_offset + 176, 0);
     write_i32(&mut out, pe_offset + 180, 0);
+    if research::trace_enabled() {
+        // The four header dwords restored from the anchor area. Their source
+        // is a working-image read, and the destination is an RVA too.
+        research::emit_u32s(
+            ResearchStage::Payload,
+            "header_fixups",
+            vec![
+                v144 as u32,
+                v148 as u32,
+                v152 as u32,
+                v156 as u32,
+                (pe_offset + 144) as u32,
+            ],
+        );
+    }
 
     let mut checksum_offset1 = keys[6] + 5776;
     let mut xor_accumulator: u32 = 0;
@@ -461,6 +792,18 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     );
 
     let decrypted_addr1 = get_i32(&out, decrypt_offset1);
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "descriptor_key",
+            xor_accumulator ^ (checksum1 as u32) ^ enc_key,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decrypt_offset1),
+        );
+        research::emit_u32(ResearchStage::DllStages, "xor_accumulator", xor_accumulator);
+        research::emit_u32(ResearchStage::DllStages, "checksum1", checksum1 as u32);
+        research::emit_u32(ResearchStage::DllStages, "descriptor_shift", 21);
+    }
     if verbose {
         println!("[3/9] Decrypting primary descriptor...");
         println!("  xor_accumulator = 0x{:08X}", xor_accumulator);
@@ -471,6 +814,13 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     if decrypted_addr1 < keys[3]
         || primary_end.is_none_or(|end| end < 0 || end as usize > out.len())
     {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "primary_descriptor_invalid",
+            decrypted_addr1 as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decrypted_addr1),
+        );
         return Err(UnpackError::InvalidDllPrimaryDescriptor {
             address: decrypted_addr1 as u32,
             minimum: keys[3] as u32,
@@ -479,6 +829,20 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     }
     let import_offset = get_i32(&out, decrypted_addr1 + 3444);
     let decrypted_addr2_size = get_i32(&out, decrypted_addr1 + 3632);
+    research::emit_range(
+        ResearchStage::DllStages,
+        "primary_descriptor",
+        AddressSpace::WorkingImageRva,
+        trace_offset(decrypted_addr1),
+        3856,
+    );
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "import_offset",
+        import_offset as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(decrypted_addr1 + 3444),
+    );
     decrypt_data3(
         &mut out,
         (decrypted_addr1 + 3632) as u32,
@@ -487,24 +851,51 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     );
 
     let addr2 = decrypted_addr2_size;
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "secondary_descriptor",
+        addr2 as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(addr2),
+    );
     let reloc_block_offset = addr2 + 9248;
     let reloc_type = get_i32(&out, reloc_block_offset);
 
     if (reloc_type & 0x0F) == 1 {
+        research::emit_u32(ResearchStage::DllStages, "reloc_shift", 5);
         decrypt_data3_shift5(&mut out, addr2 + 9252);
     } else if reloc_type == 2 {
         let p = get_i32(&out, addr2 + 9252);
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "reloc_block",
+            p as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(addr2 + 9252),
+        );
         process_reloc_block(&mut out, p);
+    } else {
+        research::emit_u32(ResearchStage::DllStages, "reloc_type", reloc_type as u32);
     }
 
     let reloc_block_offset2 = reloc_block_offset + 16;
     let reloc_type2 = get_i32(&out, reloc_block_offset2);
 
     if (reloc_type2 & 0x0F) == 1 {
+        research::emit_u32(ResearchStage::DllStages, "reloc2_shift", 5);
         decrypt_data3_shift5(&mut out, reloc_block_offset2 + 4);
     } else if reloc_type2 == 2 {
         let p = get_i32(&out, reloc_block_offset2 + 4);
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "reloc2_block",
+            p as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(reloc_block_offset2 + 4),
+        );
         process_reloc_block(&mut out, p);
+    } else {
+        research::emit_u32(ResearchStage::DllStages, "reloc2_type", reloc_type2 as u32);
     }
 
     let mut decomp_params = [0i32; 4];
@@ -517,6 +908,36 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     decomp_params[2] = get_i32(&out, param_base + 32);
     decrypt_data3_shift5(&mut out, param_base + 40);
     decomp_params[3] = get_i32(&out, param_base + 40);
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "decomp_params",
+            param_base as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(param_base),
+        );
+        research::emit_u32s(
+            ResearchStage::DllStages,
+            "decomp_param_values",
+            decomp_params.iter().map(|value| *value as u32).collect(),
+        );
+        // param[0] is the Huffman table, param[2] the AES key schedule; both
+        // are working-image offsets read through the same buffer.
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "huffman_table",
+            decomp_params[0] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decomp_params[0]),
+        );
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "aes_key_schedule",
+            decomp_params[2] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(decomp_params[2]),
+        );
+    }
     if verbose {
         println!("[4/9] Processing relocations & decomp params...");
         println!("  addr2          = 0x{:08X}", addr2 as u32);
@@ -544,6 +965,10 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         table_val = table_val.wrapping_add(k);
     }
 
+    if research::trace_enabled() {
+        research::emit_u32(ResearchStage::DllStages, "checksum2", checksum2 as u32);
+        research::emit_u32(ResearchStage::DllStages, "table_key", table_val as u32);
+    }
     let addr3_offset = decrypted_addr1 + 3712;
     decrypt_data4(
         &mut out,
@@ -597,6 +1022,29 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     let lfsr = addr4 + 3200;
     // Decompress == primitives::decrypt_data6 (LFSR keystream, len at +95).
     decrypt_data6(&mut out, lfsr as u32);
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "file_lfsr",
+        lfsr as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(lfsr),
+    );
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "addr3b",
+        addr3b as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(addr3b),
+    );
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "addr4",
+        addr4 as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(addr4),
+    );
+    research::emit_u32(ResearchStage::DllStages, "crc_val", crc_val as u32);
+    research::emit_u32(ResearchStage::DllStages, "checksum3", checksum3 as u32);
     if verbose {
         println!("[6/9] Decrypting code blocks 2-3 (addr3b, addr4)...");
         println!("  crc_val   = 0x{:08X}", crc_val as u32);
@@ -616,9 +1064,38 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         lfsr_seed_val = lfsr_seed_val.wrapping_add(k);
     }
 
-    let decrypt_func = generate(&out, lfsr as u32).ok_or(UnpackError::BytecodeGenerationFailed(
-        BytecodeStage::DllPrimaryDecryptor,
-    ))?;
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "lfsr_seed",
+        lfsr_seed_val as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(addr4 + 3160),
+    );
+    research::emit_u32(ResearchStage::DllStages, "checksum4", checksum4 as u32);
+    let decrypt_func = generate(&out, lfsr as u32).ok_or_else(|| {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "bytecode_invalid",
+            lfsr as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(lfsr),
+        );
+        UnpackError::BytecodeGenerationFailed(BytecodeStage::DllPrimaryDecryptor)
+    })?;
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "bytecode_primary",
+            lfsr as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(lfsr),
+        );
+        research::emit_u32(
+            ResearchStage::DllStages,
+            "bytecode_ops",
+            decrypt_func.len() as u32,
+        );
+    }
 
     let addr5_offset = decrypted_addr1 + 3840;
     let addr5 = get_i32(&out, addr5_offset);
@@ -638,21 +1115,78 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
 
     let metadata_offset = addr5 + 12312;
     let mut metadata_addr = get_i32(&out, metadata_offset);
+    let metadata_table = metadata_addr;
 
     while get_i32(&out, metadata_addr + 4) != 0 {
         decrypt_data6_shift6(&mut out, metadata_addr, 16);
         metadata_addr += 16;
     }
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "metadata_descriptor",
+            metadata_table as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(metadata_table),
+        );
+        research::emit_u64(
+            ResearchStage::DllStages,
+            "metadata_descriptor_bytes",
+            (metadata_addr - metadata_table).max(0) as u64,
+        );
+    }
 
     let lfsr2 = metadata_offset + 88;
     decrypt_data6(&mut out, lfsr2 as u32);
+    research::emit_u32_at(
+        ResearchStage::DllStages,
+        "metadata_lfsr",
+        lfsr2 as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(lfsr2),
+    );
 
-    let decrypt_func2 = generate(&out, lfsr2 as u32).ok_or(
-        UnpackError::BytecodeGenerationFailed(BytecodeStage::DllSectionDecryptor),
-    )?;
+    let decrypt_func2 = generate(&out, lfsr2 as u32).ok_or_else(|| {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "bytecode_invalid",
+            lfsr2 as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(lfsr2),
+        );
+        UnpackError::BytecodeGenerationFailed(BytecodeStage::DllSectionDecryptor)
+    })?;
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::DllStages,
+            "bytecode_section",
+            lfsr2 as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(lfsr2),
+        );
+        research::emit_u32(
+            ResearchStage::DllStages,
+            "bytecode_section_ops",
+            decrypt_func2.len() as u32,
+        );
+    }
 
     let section_image_base = 4095 - get_i32(original_file_data, 4224);
     let section_data_offset = get_i32(&out, addr5 + 11976);
+    research::emit_u32_at(
+        ResearchStage::Sections,
+        "descriptor_table",
+        section_data_offset as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(section_data_offset),
+    );
+    research::emit_u32_at(
+        ResearchStage::Sections,
+        "section_image_base",
+        section_image_base as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(section_image_base),
+    );
     if verbose {
         println!("[8/9] Decrypting & decompressing sections...");
         println!(
@@ -674,6 +1208,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         96
     };
     let clr_dir_rva = get_i32(file_data, pe_offset + 24 + dd_base + 14 * 8);
+    research::emit_bool(ResearchStage::Sections, "managed_prefill", clr_dir_rva != 0);
     if clr_dir_rva != 0 {
         let sh_start = get_u16(file_data, (pe_offset + 20) as u32) as i32 + pe_offset + 24;
         for i in 0..section_count(file_data, pe_offset) {
@@ -693,6 +1228,20 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
                     let dd = sec_va as usize;
                     let n = copy_len as usize;
                     out[dd..dd + n].copy_from_slice(&file_data[s..s + n]);
+                    research::emit_range(
+                        ResearchStage::Sections,
+                        "managed_prefill_src",
+                        AddressSpace::FileOffset,
+                        s as u64,
+                        n as u64,
+                    );
+                    research::emit_range(
+                        ResearchStage::Sections,
+                        "managed_prefill_dst",
+                        AddressSpace::WorkingImageRva,
+                        dd as u64,
+                        n as u64,
+                    );
                 }
                 break;
             }
@@ -709,8 +1258,22 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     )?;
 
     let import_table_offset = get_i32(&out, addr5 + 12016);
+    research::emit_u32_at(
+        ResearchStage::Imports,
+        "import_table",
+        import_table_offset as u32,
+        AddressSpace::WorkingImageRva,
+        trace_offset(addr5 + 12016),
+    );
     if import_table_offset != 0 {
         process_import_table(&mut out, import_table_offset);
+    } else {
+        research::emit_note(
+            ResearchStage::Imports,
+            "import_table",
+            TraceValue::Bool(false),
+            "no import table",
+        );
     }
 
     out[..4096].copy_from_slice(&file_data[..4096]);
@@ -722,6 +1285,36 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     let section_start = section_header_base + 24;
     let image_data_addr = get_i32(original_file_data, section_start - 128);
     let image_data_size = get_i32(original_file_data, section_start - 124);
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "original_entry_field",
+            image_data_addr as u32,
+            AddressSpace::FileOffset,
+            trace_offset(section_start - 128),
+        );
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "image_data_addr",
+            image_data_addr as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(image_data_addr),
+        );
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "image_data_size",
+            image_data_size as u32,
+            AddressSpace::FileOffset,
+            trace_offset(section_start - 124),
+        );
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "section_header_base",
+            section_header_base as u32,
+            AddressSpace::FileOffset,
+            trace_offset(section_header_base),
+        );
+    }
 
     let mut entry_point_adjustment = 0i32;
     {
@@ -750,6 +1343,27 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         let dd = image_data_addr as usize;
         let n = image_data_size as usize;
         out[dd..dd + n].copy_from_slice(&file_data[s..s + n]);
+        research::emit_range(
+            ResearchStage::Finalize,
+            "image_data_src",
+            AddressSpace::FileOffset,
+            s as u64,
+            n as u64,
+        );
+        research::emit_range(
+            ResearchStage::Finalize,
+            "image_data_dst",
+            AddressSpace::WorkingImageRva,
+            dd as u64,
+            n as u64,
+        );
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "entry_point_adjustment",
+            entry_point_adjustment as u32,
+            AddressSpace::FileOffset,
+            trace_offset(entry_point_adjustment),
+        );
     }
 
     // Managed-only CLR header recopy (Task 3.2). No-op for native.
@@ -770,12 +1384,37 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
                 let dd = clr_rva as usize;
                 let n = clr_size as usize;
                 out[dd..dd + n].copy_from_slice(&file_data[s..s + n]);
+                research::emit_u32_at(
+                    ResearchStage::Finalize,
+                    "clr_header",
+                    clr_rva as u32,
+                    AddressSpace::WorkingImageRva,
+                    trace_offset(clr_rva),
+                );
+                research::emit_range(
+                    ResearchStage::Finalize,
+                    "clr_header_src",
+                    AddressSpace::FileOffset,
+                    s as u64,
+                    n as u64,
+                );
                 break;
             }
         }
+    } else {
+        research::emit_bool(ResearchStage::Finalize, "clr_header", false);
     }
 
+    // The anchor page rewrites the last stage of the header; the source and
+    // destination below are both readings of the working image.
     decrypt_data6_shift6(&mut out, keys[3] + 16, 656);
+    research::emit_range(
+        ResearchStage::Finalize,
+        "anchor_header",
+        AddressSpace::WorkingImageRva,
+        trace_offset(keys[3] + 16),
+        656,
+    );
     let pe_offset2 = get_i32(&out, 60);
     let final_size_of_image = get_i32(&out, keys[3] + 32);
     write_i32(&mut out, pe_offset2 + 40, final_size_of_image);
@@ -783,7 +1422,147 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         let s = (keys[3] + 48) as usize;
         let dd = (pe_offset2 + 136) as usize;
         out.copy_within(s..s + 128, dd);
+        research::emit_range(
+            ResearchStage::Finalize,
+            "data_directories",
+            AddressSpace::WorkingImageRva,
+            dd as u64,
+            128,
+        );
+    }
+
+    if research::trace_enabled() {
+        research::emit_u32_at(
+            ResearchStage::Finalize,
+            "final_pe_offset",
+            pe_offset2 as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(pe_offset2),
+        );
+        research::emit_u32(
+            ResearchStage::Output,
+            "final_size_of_image",
+            final_size_of_image as u32,
+        );
+        research::emit_u64(ResearchStage::Output, "output_len", out.len() as u64);
+        research::emit_u32_at(
+            ResearchStage::Output,
+            "output_base",
+            keys[3] as u32,
+            AddressSpace::WorkingImageRva,
+            trace_offset(keys[3]),
+        );
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windows::MAGIC_KONN;
+    use crate::windows::research::{ResearchTrace, with_research_trace};
+
+    /// A protected-shaped header `unpack_dll_inner` accepts far enough to emit
+    /// the header key events, then rejects at the PE offset check. Detection
+    /// fields are the same shape the synthetic detection test uses.
+    fn protected_header_input() -> Vec<u8> {
+        let mut data = vec![0u8; 0x1200];
+        let pe = 0x80i32;
+        data[60..64].copy_from_slice(&pe.to_le_bytes());
+        data[pe as usize..pe as usize + 4].copy_from_slice(b"PE\0\0");
+        // PE32+ optional header magic at pe + 24.
+        data[pe as usize + 24..pe as usize + 26].copy_from_slice(&0x20Bu16.to_le_bytes());
+        // Header key derivation: keys[0] = word(4096); keys[1] = keys[0] ^ word(4100).
+        let key0 = 1u32;
+        data[4096..4100].copy_from_slice(&key0.to_le_bytes());
+        data[4100..4104].copy_from_slice(&(key0 ^ MAGIC_KONN).to_le_bytes());
+        data
+    }
+
+    fn event_names(trace: &ResearchTrace) -> Vec<&'static str> {
+        trace.events.iter().map(|event| event.name).collect()
+    }
+
+    #[test]
+    fn trace_disabled_emits_nothing_and_keeps_the_result() {
+        let input = protected_header_input();
+        assert!(!research::trace_enabled());
+        let result = unpack_dll(&input);
+        // The synthetic header cannot recover an image; the point is that the
+        // untraced path is unaffected and no sink was installed.
+        assert!(result.is_err());
+        assert!(!research::trace_enabled());
+    }
+
+    #[test]
+    fn trace_records_header_facts_and_the_real_failure() {
+        let input = protected_header_input();
+        let (trace, result) = with_research_trace(|| unpack_dll(&input));
+        assert!(result.is_err(), "synthetic header must fail recovery");
+
+        let names = event_names(&trace);
+        assert!(
+            names.contains(&"header_keys"),
+            "header key table must be traced: {names:?}"
+        );
+        assert!(names.contains(&"magic"));
+        assert!(names.contains(&"payload_base"));
+
+        // Scalar header facts are real computed values, and the magic keeps
+        // the KONN encoding under the protected-header space.
+        let keys = trace
+            .events
+            .iter()
+            .find(|event| event.name == "header_keys")
+            .expect("header_keys event");
+        // keys[0] is the raw first word and keys[1] carries the magic; later
+        // entries are chained, so only these two are fixed by this input.
+        match &keys.value {
+            TraceValue::U32s(values) => {
+                assert_eq!(values.len(), 8);
+                assert_eq!(values[0], 1);
+                assert_eq!(values[1], MAGIC_KONN);
+            }
+            other => panic!("header_keys must be a word list, got {other:?}"),
+        }
+        let magic = trace
+            .events
+            .iter()
+            .find(|event| event.name == "magic")
+            .expect("magic event");
+        assert_eq!(magic.value, TraceValue::U32(MAGIC_KONN));
+        assert_eq!(
+            magic.address,
+            Some(crate::windows::research::TraceAddress {
+                space: AddressSpace::ProtectedHeaderOffset,
+                offset: 4100,
+            })
+        );
+
+        let anchor = trace
+            .events
+            .iter()
+            .find(|event| event.name == "anchor")
+            .expect("anchor event");
+        assert_eq!(
+            anchor.address.as_ref().map(|address| address.space),
+            Some(AddressSpace::WorkingImageRva)
+        );
+        let TraceValue::U32(anchor_rva) = &anchor.value else {
+            panic!("anchor must be an RVA");
+        };
+        assert_eq!(
+            anchor.address.as_ref().map(|address| address.offset),
+            Some(u64::from(*anchor_rva))
+        );
+
+        // Nothing may claim a layout selection or a validated image: the
+        // synthetic input never reaches section recovery.
+        assert!(
+            !names.iter().any(|name| name.contains("selected")),
+            "no selection claim on a failed recovery: {names:?}"
+        );
+        assert!(!names.contains(&"output_len"));
+    }
 }

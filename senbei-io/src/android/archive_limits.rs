@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use senbei_engine::android::ResourceLimits;
+use senbei_engine::android::{LimitExceeded, ResourceLimits};
 use zip::ZipArchive;
 
 use anyhow::{Context, Result, bail};
@@ -180,14 +180,25 @@ impl ArchiveBudget {
         label: &str,
     ) -> Result<Vec<u8>> {
         if size > self.max_entry_bytes {
-            bail!(
+            return Err(anyhow::Error::new(LimitExceeded::Entry {
+                requested: size,
+                limit: self.max_entry_bytes,
+            })
+            .context(format!(
                 "entry `{label}` exceeds extraction limit {}",
                 self.max_entry_bytes
-            );
+            )));
         }
         let length = size.min(maximum as u64);
         if length > self.max_total_bytes.saturating_sub(self.bytes) {
-            bail!("manifest `{label}` exceeds the remaining extraction byte limit");
+            return Err(anyhow::Error::new(LimitExceeded::Total {
+                requested: self.bytes.saturating_add(length),
+                adding: length,
+                limit: self.max_total_bytes,
+            })
+            .context(format!(
+                "manifest `{label}` exceeds the remaining extraction byte limit"
+            )));
         }
         let mut bytes = Vec::new();
         bytes
@@ -203,10 +214,14 @@ impl ArchiveBudget {
             .checked_add(entries)
             .context("archive entry count overflow")?;
         if total > self.max_entries {
-            bail!(
+            return Err(anyhow::Error::new(LimitExceeded::Entries {
+                requested: total,
+                limit: self.max_entries,
+            })
+            .context(format!(
                 "archive entry limit exceeded: {total} > {}",
                 self.max_entries
-            );
+            )));
         }
         self.entries = total;
         Ok(())
@@ -222,9 +237,21 @@ impl ArchiveBudget {
         let remaining = self.max_total_bytes.saturating_sub(self.bytes);
         let allowance = self.max_entry_bytes.min(remaining);
         if declared_size > allowance {
-            bail!(
+            let exceeded = if declared_size > self.max_entry_bytes {
+                LimitExceeded::Entry {
+                    requested: declared_size,
+                    limit: self.max_entry_bytes,
+                }
+            } else {
+                LimitExceeded::Total {
+                    requested: self.bytes.saturating_add(declared_size),
+                    adding: declared_size,
+                    limit: self.max_total_bytes,
+                }
+            };
+            return Err(anyhow::Error::new(exceeded).context(format!(
                 "entry `{label}` declares {declared_size} bytes, exceeding extraction limit {allowance}"
-            );
+            )));
         }
         // The advertised size is a stricter ceiling when it is smaller than
         // the budget. A dishonest header must not buy extra decompression work.
@@ -243,7 +270,13 @@ impl ArchiveBudget {
                 .checked_add(read as u64)
                 .context("decompressed entry size overflow")?;
             if next > limit {
-                bail!("entry `{label}` exceeds extraction limit {limit} while decompressing");
+                return Err(anyhow::Error::new(LimitExceeded::Entry {
+                    requested: next,
+                    limit,
+                })
+                .context(format!(
+                    "entry `{label}` exceeds extraction limit {limit} while decompressing"
+                )));
             }
             self.bytes = self
                 .bytes
@@ -346,7 +379,11 @@ fn inspect_archive(
             bail!("invalid ZIP64 end record");
         }
         if qword(&record, 4) > max_directory_bytes {
-            bail!("ZIP64 metadata exceeds the directory memory limit");
+            return Err(anyhow::Error::new(LimitExceeded::Entry {
+                requested: qword(&record, 4),
+                limit: max_directory_bytes,
+            })
+            .context("ZIP64 metadata exceeds the directory memory limit"));
         }
         zip64_record = Some(record_offset);
         directory_start = qword(&record, 48);
@@ -356,10 +393,22 @@ fn inspect_archive(
         bail!("inconsistent ZIP entry counts");
     }
     if entries > max_entries as u64 {
-        bail!("archive entry limit exceeded: {entries} > {max_entries}");
+        return Err(anyhow::Error::new(LimitExceeded::Entries {
+            requested: usize::try_from(entries).unwrap_or(usize::MAX),
+            limit: max_entries,
+        })
+        .context(format!(
+            "archive entry limit exceeded: {entries} > {max_entries}"
+        )));
     }
     if directory_bytes > max_directory_bytes {
-        bail!("ZIP directory size {directory_bytes} exceeds memory limit {max_directory_bytes}");
+        return Err(anyhow::Error::new(LimitExceeded::Entry {
+            requested: directory_bytes,
+            limit: max_directory_bytes,
+        })
+        .context(format!(
+            "ZIP directory size {directory_bytes} exceeds memory limit {max_directory_bytes}"
+        )));
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(ArchiveInfo {
@@ -421,6 +470,51 @@ mod tests {
     }
 
     #[test]
+    fn archive_ceilings_keep_typed_causes_and_context() {
+        let mut budget = ArchiveBudget::new(4, 6, 1);
+        budget.register_entries(1).unwrap();
+        let error = budget.register_entries(1).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Entries { .. })
+        ));
+        assert!(format!("{error:#}").contains("entry limit"));
+
+        let error = budget
+            .read_probe(&mut Cursor::new(b"abcde"), 5, 5, "manifest")
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Entry { .. })
+        ));
+        let error = budget
+            .copy_entry(&mut Cursor::new(b"abcde"), &mut Vec::new(), 5, "large")
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Entry { .. })
+        ));
+        assert!(format!("{error:#}").contains("extraction limit"));
+        budget
+            .copy_entry(&mut Cursor::new(b"abcd"), &mut Vec::new(), 4, "first")
+            .unwrap();
+        let error = budget
+            .copy_entry(&mut Cursor::new(b"abc"), &mut Vec::new(), 3, "second")
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Total { .. })
+        ));
+        let error = budget
+            .read_probe(&mut Cursor::new(b"abc"), 3, 3, "manifest")
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Total { .. })
+        ));
+    }
+
+    #[test]
     fn failed_writes_still_consume_the_read_budget() {
         struct FailingWriter;
         impl Write for FailingWriter {
@@ -457,8 +551,16 @@ mod tests {
     fn preflight_rejects_large_counts_and_directory_before_indexing() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&end_record(50, 1000)).unwrap();
-        assert!(preflight_archive(&mut file, 49, 1000).is_err());
-        assert!(preflight_archive(&mut file, 50, 999).is_err());
+        let count_error = preflight_archive(&mut file, 49, 1000).unwrap_err();
+        assert!(matches!(
+            count_error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Entries { .. })
+        ));
+        let size_error = preflight_archive(&mut file, 50, 999).unwrap_err();
+        assert!(matches!(
+            size_error.downcast_ref::<LimitExceeded>(),
+            Some(LimitExceeded::Entry { .. })
+        ));
         assert_eq!(preflight_archive(&mut file, 50, 1000).unwrap(), 50);
     }
 

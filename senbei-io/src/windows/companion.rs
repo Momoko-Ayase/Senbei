@@ -278,13 +278,13 @@ pub(super) mod tests {
         }
     }
 
-    /// Inspection must describe a companion-declaring stub, not reproduce the
-    /// recovery entry point's refusal.
+    /// Inspection describes a companion-declaring stub *and* what happened when
+    /// its recovery was attempted.
     ///
     /// [`stub`] is a generated PE32+ loader whose entry record declares the
-    /// `._` suffix, so `read_unpacker_input` errors on it when the payload is
-    /// missing or does not pair. Inspection is detection only and must keep
-    /// the stub's recognition while reporting the pairing as inventory.
+    /// `._` suffix. The recovery entry point refuses it when the payload is
+    /// missing or does not pair; inspection runs that same attempt and reports
+    /// it as a finding about this input, never as a failure of the inspection.
     fn inspect_report(path: &std::path::Path) -> serde_json::Value {
         let report = crate::job::inspect_path(
             path,
@@ -295,35 +295,23 @@ pub(super) mod tests {
         serde_json::from_str(&report.to_json()).expect("valid report")
     }
 
-    fn assert_no_recovery_claim(input: &serde_json::Value) {
+    /// Nothing was produced and no route was accepted, whatever the attempt did.
+    fn assert_no_recovered_output(input: &serde_json::Value) {
         assert_eq!(input["status"], "recognized", "the stub is recognized");
-        let profile = &input["profile"];
-        assert_eq!(profile["recognition"], "recognized");
+        assert_eq!(input["profile"]["recognition"], "recognized");
         assert!(
-            profile["selected"].is_null(),
-            "inspection selects no route: {profile}"
+            input["profile"]["selected"].is_null(),
+            "no route was accepted: {input}"
         );
-        assert_eq!(profile["recovery"], "not_attempted");
-        assert_eq!(profile["static_validation"], "not_run");
         assert!(
             input["outputs"].as_array().unwrap().is_empty(),
             "inspection writes nothing"
         );
         assert!(input["recovered"].is_null());
-        for candidate in profile["candidates"].as_array().unwrap() {
-            assert_eq!(
-                candidate["outcome"], "not_attempted",
-                "inspection runs no route: {candidate}"
-            );
-        }
-        assert!(
-            input["errors"].as_array().unwrap().is_empty(),
-            "a companion relationship is inventory, not an error: {input}"
-        );
     }
 
     #[test]
-    fn inspect_of_a_companion_stub_without_its_payload_stays_detection() {
+    fn inspect_of_a_companion_stub_without_its_payload_reports_the_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("module.exe");
         std::fs::write(&input, stub()).unwrap();
@@ -333,13 +321,29 @@ pub(super) mod tests {
 
         let value = inspect_report(&input);
         let reported = &value["inputs"][0];
-        assert_no_recovery_claim(reported);
+        assert_no_recovered_output(reported);
         assert_eq!(reported["companion"]["state"], "absent");
         assert!(reported["companion"]["path"].is_null());
         assert_eq!(
             reported["profile"]["observed"]["external_companion"], false,
             "nothing was spliced, so no external-companion claim"
         );
+        // The refused attempt is reported, not hidden: recovery is blocked and
+        // the reason travels with it.
+        assert_eq!(reported["profile"]["recovery"], "blocked");
+        assert!(
+            !reported["profile"]["errors"].as_array().unwrap().is_empty(),
+            "the refusal reason must be in the profile: {reported}"
+        );
+        // Recognition survives: a missing payload describes this input, it does
+        // not unmake the stub.
+        assert_eq!(reported["profile"]["recognition"], "recognized");
+        assert!(
+            reported["research"].is_object(),
+            "research inspection reports the input structure: {reported}"
+        );
+        assert_eq!(reported["research"]["input_view"], "original");
+        assert_eq!(value["summary"]["errors"], 0);
     }
 
     #[test]
@@ -353,11 +357,16 @@ pub(super) mod tests {
 
         let value = inspect_report(&input);
         let reported = &value["inputs"][0];
-        assert_no_recovery_claim(reported);
+        assert_no_recovered_output(reported);
         assert_eq!(reported["companion"]["state"], "unmatched");
         assert!(reported["companion"]["path"].is_string());
         assert!(reported["companion"]["detail"].is_string());
         assert_eq!(reported["profile"]["observed"]["external_companion"], false);
+        // The unreadable-as-a-payload sibling is still identified on disk.
+        assert!(
+            reported["companion"]["source"].is_object(),
+            "the physical sibling has an identity: {reported}"
+        );
     }
 
     #[test]
@@ -375,14 +384,15 @@ pub(super) mod tests {
         assert_eq!(reported["status"], "recognized");
         assert_eq!(reported["companion"]["state"], "spliced");
         assert_eq!(reported["profile"]["observed"]["external_companion"], true);
-        // A real pairing is evidence; recovery still did not run.
-        assert_eq!(reported["profile"]["recovery"], "not_attempted");
-        assert!(reported["profile"]["selected"].is_null());
-        assert_eq!(reported["profile"]["static_validation"], "not_run");
+        assert!(reported["companion"]["source"].is_object());
+        // The input offsets describe the spliced view recovery was given.
+        assert_eq!(reported["research"]["input_view"], "spliced_companion");
+        assert!(reported["outputs"].as_array().unwrap().is_empty());
+        assert!(reported["recovered"].is_null());
     }
 
     #[test]
-    fn folder_inspect_of_companion_stubs_stays_detection() {
+    fn folder_inspect_of_companion_stubs_reports_each_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.exe");
         let unmatched = dir.path().join("unmatched.dll");
@@ -406,13 +416,13 @@ pub(super) mod tests {
         assert!(states.contains(&"absent"), "{states:?}");
         assert!(states.contains(&"unmatched"), "{states:?}");
         for input in inputs {
-            assert_no_recovery_claim(input);
+            assert_no_recovered_output(input);
         }
         assert_eq!(value["summary"]["errors"], 0);
     }
 
-    /// A genuine read error still fails the input, but never fabricates a
-    /// recovery attempt that inspection did not make.
+    /// A genuine read error fails the input, and never fabricates a recovery
+    /// attempt that inspection did not make.
     #[test]
     fn inspect_read_error_does_not_invent_a_failed_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,9 +438,53 @@ pub(super) mod tests {
         assert_eq!(input["status"], "error");
         assert!(!input["errors"].as_array().unwrap().is_empty());
         let profile = &input["profile"];
-        assert_eq!(profile["recovery"], "not_attempted");
         assert!(profile["selected"].is_null());
         assert_eq!(profile["static_validation"], "not_run");
         assert!(profile["candidates"].as_array().unwrap().is_empty());
+        assert_eq!(value["summary"]["errors"], 1);
+    }
+}
+
+#[cfg(test)]
+mod research_tests {
+    use crate::job::{CompanionProbe, companion_report, observed_companion_state, probe_companion};
+    use crate::report::CompanionState;
+
+    /// An unreadable `._` sibling is reported as unreadable, never as a
+    /// mismatch, and no identity is invented for bytes that were never read.
+    #[test]
+    fn a_companion_that_cannot_be_read_is_not_a_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("stub.exe");
+        std::fs::write(&input, b"MZ").unwrap();
+        // A directory where the payload should be: it exists but cannot be read.
+        std::fs::create_dir(temp.path().join("stub.exe._")).unwrap();
+
+        assert!(
+            matches!(probe_companion(&input), CompanionProbe::Unreadable(_)),
+            "an unreadable sibling has its own state"
+        );
+        let (state, source, reason) = observed_companion_state(&input, false);
+        assert_eq!(state, CompanionState::Unreadable);
+        assert!(source.is_none(), "no bytes were seen, so no identity");
+        let report = companion_report(&input, state, source, reason);
+        assert_eq!(report.state, CompanionState::Unreadable);
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("could not be read")),
+            "{report:?}"
+        );
+
+        // Absent stays absent, and a readable but non-pairing sibling is a
+        // mismatch whose identity the probe already computed.
+        let plain = temp.path().join("plain.exe");
+        std::fs::write(&plain, b"MZ").unwrap();
+        assert!(matches!(probe_companion(&plain), CompanionProbe::Absent));
+        std::fs::write(temp.path().join("plain.exe._"), b"payload").unwrap();
+        let (state, source, _) = observed_companion_state(&plain, false);
+        assert_eq!(state, CompanionState::Unmatched);
+        assert!(source.is_some(), "the bytes read for pairing identify it");
     }
 }

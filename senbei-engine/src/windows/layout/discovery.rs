@@ -217,18 +217,52 @@ pub fn section_name(data: &[u8], offset: u32) -> String {
 /// Return structurally plausible candidates; the pipeline must trial-decrypt
 /// their second stages before selecting a table.
 pub fn find_tbl_pe32_candidates(data: &[u8], info: &[u32; 8]) -> Vec<u32> {
+    find_tbl_pe32_candidates_window(data, info, 0, data.len() as u64)
+}
+
+/// [`find_tbl_pe32_candidates`] for a buffer that starts at working-image RVA
+/// `base` rather than at RVA 0 (a decoded payload prefix scratch).
+///
+/// `info[3]` and `info[6]` stay absolute; only the buffer origin changes, so a
+/// stage RVA is converted with `stage - base` before the in-buffer bounds
+/// check. `window_len` is the number of bytes from `base` to the end of the
+/// declared image, which may exceed `data.len()` for a bounded prefix scratch.
+/// All byte reads still require `data` to contain them; `window_len` only
+/// relaxes the plausibility checks for structures (the shell region and the
+/// stage range) that lie beyond the probe. With `base == 0` and
+/// `window_len == data.len()` this is exactly the original locator.
+pub fn find_tbl_pe32_candidates_window(
+    data: &[u8],
+    info: &[u32; 8],
+    base: u32,
+    window_len: u64,
+) -> Vec<u32> {
+    find_tbl_pe32_candidates_counted(data, info, base, window_len).0
+}
+
+/// [`find_tbl_pe32_candidates_window`] that also returns the number of
+/// 4-byte positions the scan examined. Research inspection reports that count
+/// as scan effort; it is never a candidate count.
+pub fn find_tbl_pe32_candidates_counted(
+    data: &[u8],
+    info: &[u32; 8],
+    base: u32,
+    window_len: u64,
+) -> (Vec<u32>, u32) {
     let mut tables = Vec::new();
-    let shell = info[6] as usize;
+    let mut positions_scanned = 0u32;
+    let shell = info[6].wrapping_sub(base) as usize;
     let hi = shell.saturating_add(0x3000).min(data.len());
     for off in (shell..hi.saturating_sub(8)).step_by(4) {
+        positions_scanned = positions_scanned.saturating_add(1);
         if get_u32(data, off as u32) != info[6] {
             continue;
         }
         let shell_size = get_u32(data, off as u32 + 4) as usize;
         if !(0x1001..0x100000).contains(&shell_size)
-            || shell
-                .checked_add(shell_size)
-                .is_none_or(|end| end > data.len())
+            || (shell as u64)
+                .checked_add(shell_size as u64)
+                .is_none_or(|end| end > window_len)
         {
             continue;
         }
@@ -241,25 +275,26 @@ pub fn find_tbl_pe32_candidates(data: &[u8], info: &[u32; 8]) -> Vec<u32> {
             };
             let header = get_u32(table, header_field) as usize;
             let header_size = get_u32(table, header_field + 4) as usize;
-            let stage = get_u32(table, shell_field as u32 + 0x10) as usize;
+            let stage = get_u32(table, shell_field as u32 + 0x10);
             let stage_size = get_u32(table, shell_field as u32 + 0x14) as usize;
+            let stage_rel = stage.wrapping_sub(base) as u64;
             if header > 0
                 && header_size > 0
                 && header
                     .checked_add(header_size)
                     .is_some_and(|end| end <= 0x1000)
-                && stage >= info[3] as usize
+                && stage >= info[3]
                 && stage_size >= 4
-                && stage
-                    .checked_add(stage_size)
-                    .is_some_and(|end| end <= data.len())
+                && stage_rel
+                    .checked_add(stage_size as u64)
+                    .is_some_and(|end| end <= window_len)
                 && !tables.contains(&(candidate as u32))
             {
                 tables.push(candidate as u32);
             }
         }
     }
-    tables
+    (tables, positions_scanned)
 }
 
 /// Locate an LFSR-encrypted bytecode block (decrypt_data6 form) in a region.
@@ -482,6 +517,25 @@ mod tests {
             senbei_crypto::primitives::write_u32(&mut data, table + field, value);
         }
         (data, info, table)
+    }
+
+    #[test]
+    fn counted_locator_matches_the_original_and_reports_real_scan_work() {
+        for compact in [false, true] {
+            let (data, info, table) = pe32_table_fixture(compact);
+            let plain = find_tbl_pe32_candidates(&data, &info);
+            let (counted, positions) =
+                find_tbl_pe32_candidates_counted(&data, &info, 0, data.len() as u64);
+            assert_eq!(counted, plain, "compact={compact}");
+            assert_eq!(plain, vec![table]);
+            // The scan runs from info[6] to info[6]+0x3000 in 4-byte steps (or
+            // to the end of the buffer), independent of the candidate count.
+            let shell = info[6] as usize;
+            let hi = (shell + 0x3000).min(data.len());
+            let expected = hi.saturating_sub(8).saturating_sub(shell).div_ceil(4) as u32;
+            assert_eq!(positions, expected);
+            assert!(positions > 1);
+        }
     }
 
     #[test]

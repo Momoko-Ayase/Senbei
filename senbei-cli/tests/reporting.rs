@@ -175,8 +175,10 @@ fn inspect_writes_no_output_no_log_and_no_temporary() {
     );
 }
 
+/// Inspection reports the real attempt but keeps nothing: no output file is
+/// advertised, and a non-target never gets a route selected for it.
 #[test]
-fn inspect_never_claims_recovery_or_validation() {
+fn inspect_keeps_nothing_and_claims_no_route_for_a_non_target() {
     let td = tempfile::tempdir().unwrap();
     write_plain(td.path(), "plain.exe");
     let output = run(&["inspect", td.path().to_str().unwrap(), "--json"]);
@@ -184,16 +186,17 @@ fn inspect_never_claims_recovery_or_validation() {
     for input in value["inputs"].as_array().unwrap() {
         assert!(
             input["profile"]["selected"].is_null(),
-            "inspect must not select a route: {input}"
+            "a non-target selects no route: {input}"
         );
-        assert_eq!(input["profile"]["recovery"], "not_attempted");
-        assert_eq!(input["profile"]["static_validation"], "not_run");
+        assert_eq!(input["profile"]["recognition"], "not_recognized");
+        assert_eq!(input["status"], "skipped");
         assert!(
             input["outputs"].as_array().unwrap().is_empty(),
             "inspect must not report outputs"
         );
         assert!(input["recovered"].is_null());
     }
+    assert_eq!(value["summary"]["errors"], 0);
 }
 
 #[test]
@@ -276,6 +279,32 @@ fn dry_run_json_describes_an_attempt_that_really_ran() {
     assert_eq!(reported["status"], "error");
 }
 
+/// Only inspection keeps the research payloads; an ordinary unpack must not
+/// serialize or clone them.
+#[test]
+fn unpack_and_dry_run_carry_no_research_payload() {
+    let td = tempfile::tempdir().unwrap();
+    let input = write_metadata(td.path(), 31);
+    let out = td.path().join("out");
+    let unpack = run(&[
+        input.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--json",
+    ]);
+    let dry_run = run(&["--dry-run", input.to_str().unwrap(), "--json"]);
+
+    for output in [unpack, dry_run] {
+        let value = parse_json(&output);
+        for reported in value["inputs"].as_array().unwrap() {
+            assert!(reported["research"].is_null(), "{reported}");
+            assert!(reported["android_research"].is_null(), "{reported}");
+            assert!(reported["metadata_research"].is_null(), "{reported}");
+            assert!(reported["source"].is_null(), "{reported}");
+        }
+    }
+}
+
 #[test]
 fn dry_run_refuses_an_output_directory() {
     let output = run(&["--dry-run", "--out", "out", "plain.exe"]);
@@ -337,13 +366,25 @@ fn inspect_help_is_documented() {
 }
 
 #[test]
-fn inspect_rejects_recovery_only_flags() {
-    for flag in ["--out", "--strict-integrity"] {
-        let output = run(&["inspect", "--json", flag, "x"]);
-        assert_eq!(output.status.code(), Some(2), "{flag}");
-    }
+fn inspect_rejects_writing_flags() {
+    let output = run(&["inspect", "--json", "--out", "x"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--out writes, inspect keeps nothing"
+    );
     let output = run(&["inspect", "--dry-run", "x"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+/// Inspection runs the real static check, so `--strict-integrity` is a real
+/// request about a real verdict rather than a contradiction.
+#[test]
+fn inspect_accepts_strict_integrity() {
+    let td = tempfile::tempdir().unwrap();
+    let input = write_plain(td.path(), "plain.exe");
+    let output = run(&["inspect", input.to_str().unwrap(), "--strict-integrity"]);
+    assert_ne!(output.status.code(), Some(2), "not a usage error");
 }
 
 // ---------------------------------------------------------------------------
@@ -459,13 +500,16 @@ fn inspect_reports_a_container_inventory_separately_from_its_entries() {
     assert_eq!(manifests[0]["package"], "com.example.app");
     assert_eq!(manifests[0]["version"], "42");
     assert_eq!(manifests[0]["named"], true);
-    // Only content-probe candidates are listed, and nothing was probed.
+    // Inventory is membership: the entries a restore would probe, listed apart
+    // from the entries that were actually probed (which have their own result).
     let candidates = input["container"]["candidate_entries"].as_array().unwrap();
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].as_str().unwrap().ends_with("libil2cpp.so"));
-    assert!(input["entries"].as_array().unwrap().is_empty());
+    let entries = input["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "the candidate was probed: {input}");
+    assert_eq!(entries[0]["status"], "not_target");
     assert!(input["outputs"].as_array().unwrap().is_empty());
-    // Inventory is membership, not inspected protected content.
+    // The container itself has no single profile; its entries do the talking.
     assert!(input["profile"].is_null());
     assert_eq!(input["status"], "skipped");
 }
@@ -514,6 +558,56 @@ fn inspect_reports_a_non_matching_companion_without_an_error() {
     assert!(input["outputs"].as_array().unwrap().is_empty());
 }
 
+/// Inspection runs the real static recovery, so the report carries the attempt
+/// and the structural evidence behind it — while still keeping nothing.
+#[test]
+fn inspect_reports_the_attempt_and_its_structural_evidence() {
+    let td = tempfile::tempdir().unwrap();
+    let input = td.path().join("app.exe");
+    std::fs::write(&input, fake_protected_pe()).unwrap();
+    let before = tree(td.path());
+
+    let output = run(&["inspect", input.to_str().unwrap(), "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a failing trial is a finding"
+    );
+    let value = parse_json(&output);
+    let reported = &value["inputs"][0];
+
+    // Recognition is evidence about the input.
+    assert_eq!(reported["status"], "recognized");
+    assert_eq!(reported["profile"]["recognition"], "recognized");
+    // The input identity is the physical file, and it was inspected as-is.
+    assert!(reported["source"]["sha256"].is_string());
+    assert_eq!(reported["source"]["size"], 0x2000);
+    assert_eq!(reported["research"]["input_view"], "original");
+    // The header structure the inspector decoded is there, not just a verdict:
+    // the recognized magic and the decoded header words it came from.
+    let protection = &reported["research"]["input"]["protection"];
+    assert_eq!(protection["magic_recognized"], true);
+    let words = protection["header_words"].as_array().unwrap();
+    assert!(!words.is_empty(), "decoded header words are reported");
+    assert!(
+        words.iter().any(|word| word["semantic"] == "magic"),
+        "each word names the field it decodes to: {protection}"
+    );
+    // The recovery really ran: a candidate was attempted and no route survived
+    // this synthetic image, so nothing is selected.
+    assert_ne!(reported["profile"]["recovery"], "not_attempted");
+    assert!(reported["profile"]["selected"].is_null());
+    // Nothing was kept.
+    assert!(reported["outputs"].as_array().unwrap().is_empty());
+    assert!(reported["recovered"].is_null());
+    assert_eq!(
+        tree(td.path()),
+        before,
+        "inspection must not create, change, or remove anything"
+    );
+    assert_eq!(value["summary"]["errors"], 0);
+}
+
 #[test]
 fn unpack_reports_the_companion_state_it_actually_used() {
     let td = tempfile::tempdir().unwrap();
@@ -550,4 +644,57 @@ fn a_relative_path_is_reported_verbatim() {
         .unwrap();
     let value = parse_json(&output);
     assert_eq!(value["inputs"][0]["path"], "plain.exe");
+}
+
+/// A resource ceiling on a real target is an incomplete analysis: the document
+/// says so and the process exits 1. It is never "recognized, therefore fine".
+#[test]
+fn inspect_of_an_over_limit_target_is_incomplete_and_exits_one() {
+    let td = tempfile::tempdir().unwrap();
+    let apk = td.path().join("base.apk");
+    // A protected-library candidate far larger than the 1 MiB entry ceiling.
+    let large = vec![0x7Fu8; 2 * 1024 * 1024];
+    write_zip(
+        &apk,
+        &[
+            ("AndroidManifest.xml", MANIFEST.as_bytes()),
+            ("lib/arm64-v8a/libil2cpp.so", &large),
+        ],
+    );
+
+    let output = run(&[
+        "inspect",
+        apk.to_str().unwrap(),
+        "--json",
+        "--max-entry-mib",
+        "1",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a truncated analysis is a failure: {output:?}"
+    );
+    let value = parse_json(&output);
+    assert_eq!(value["summary"]["errors"], 1);
+    let input = &value["inputs"][0];
+    assert_eq!(input["status"], "error");
+    assert_eq!(input["analysis_incomplete"], true);
+    assert!(
+        !input["errors"].as_array().unwrap().is_empty(),
+        "the reason is on the report: {input}"
+    );
+    assert!(input["outputs"].as_array().unwrap().is_empty());
+}
+
+/// An unsupported layout is a research finding, not an incomplete analysis.
+#[test]
+fn inspect_of_an_unsupported_target_stays_a_finding() {
+    let td = tempfile::tempdir().unwrap();
+    let input = write_plain(td.path(), "plain.exe");
+    let output = run(&["inspect", input.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value = parse_json(&output);
+    assert_eq!(value["summary"]["errors"], 0);
+    let reported = &value["inputs"][0];
+    assert_eq!(reported["analysis_incomplete"], false, "{reported}");
 }

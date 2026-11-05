@@ -4,6 +4,7 @@ use senbei_crypto::primitives::*;
 
 use super::super::error::*;
 use super::super::layout::{self, *};
+use super::super::research::{self, AddressSpace, ResearchStage};
 
 mod pe32;
 
@@ -89,19 +90,14 @@ impl<'a> Unpacker<'a> {
     // (file_data, decompressed, info, decrypt_size); left on Unpacker.
     // The DLL port will need a different driver state anyway.
     fn decrypt_data2(&mut self) {
-        let base_src = self.info[4].wrapping_add(4096);
-        let mut k = self.info[0].wrapping_add(!self.decrypt_size);
-        let words = self.decrypt_size >> 2;
-        for i in 0..words {
-            let off = i.wrapping_mul(4);
-            let cell = get_u32(self.file_data, base_src.wrapping_add(off));
-            write_u32(
-                &mut self.decompressed,
-                self.info[3].wrapping_add(off),
-                k ^ cell,
-            );
-            k = i.wrapping_mul(i) ^ (k.wrapping_add(cell).wrapping_add(i));
-        }
+        primitives::decode_payload_prefix(
+            self.file_data,
+            self.info[4].wrapping_add(4096),
+            &mut self.decompressed,
+            self.info[3],
+            self.info[0],
+            self.decrypt_size,
+        );
     }
 
     fn load_payload(&mut self) -> Option<u32> {
@@ -357,6 +353,14 @@ impl<'a> Unpacker<'a> {
         };
 
         u.decrypt_data();
+        research::emit_u32s(ResearchStage::Header, "info_words", u.info.to_vec());
+        research::emit_u32_at(
+            ResearchStage::Header,
+            "magic",
+            u.info[1],
+            AddressSpace::FileOffset,
+            0x1004,
+        );
         if verbose {
             println!("[1/9] Decrypting file header...");
             println!("  info[0] key        = 0x{:08X}", u.info[0]);
@@ -390,10 +394,34 @@ impl<'a> Unpacker<'a> {
             });
         }
         u.decompressed = vec![0u8; size_of_image as usize];
+        research::emit_u32_at(
+            ResearchStage::Payload,
+            "size_of_image",
+            size_of_image,
+            AddressSpace::FileOffset,
+            pe_off.wrapping_add(80) as u64,
+        );
+        research::emit_range(
+            ResearchStage::Payload,
+            "declared_payload",
+            AddressSpace::FileOffset,
+            u.info[4] as u64 + 0x1000,
+            u.info[5] as u64,
+        );
         if verbose {
             println!("[2/9] Decrypting payload...");
         }
         let pe32_table = u.load_payload();
+        research::emit_u32(ResearchStage::Payload, "prefix_length", u.decrypt_size);
+        if let Some(table) = pe32_table {
+            research::emit_u32_at(
+                ResearchStage::Pe32Shell,
+                "shell_table",
+                table,
+                AddressSpace::WorkingImageRva,
+                table as u64,
+            );
+        }
 
         // PE32 (32-bit) images use an entirely different config layout and
         // final-output transform than PE32+ (64-bit). Dispatch here, after the
@@ -463,6 +491,18 @@ impl<'a> Unpacker<'a> {
             .into_iter()
             .find(|&extra| descriptor_is_valid(extra))
             .ok_or(UnpackError::Stage1DescriptorNotFound { anchor })?;
+        research::emit_u32_at(
+            ResearchStage::ExeStage1,
+            "anchor",
+            anchor,
+            AddressSpace::WorkingImageRva,
+            anchor as u64,
+        );
+        research::emit_u32(
+            ResearchStage::ExeStage1,
+            "anchor_layout_extra",
+            anchor_extra,
+        );
 
         if verbose {
             println!("  anchor = 0x{anchor:08X}");
@@ -502,6 +542,18 @@ impl<'a> Unpacker<'a> {
         u.decrypt_data3(tgt, xor_acc ^ chk1 ^ v, 21);
         let stage1 = get_u32(&u.decompressed, tgt);
         let stage1_len = get_u32(&u.decompressed, tgt.wrapping_add(4));
+        research::emit_range(
+            ResearchStage::ExeStage1,
+            "stage1",
+            AddressSpace::WorkingImageRva,
+            stage1 as u64,
+            stage1_len as u64,
+        );
+        research::emit_u32s(
+            ResearchStage::ExeStage1,
+            "stage1_descriptor",
+            stage1_descriptor.to_vec(),
+        );
         if verbose {
             println!("[3/9] Locating config layout...");
             println!("  stage1 = 0x{:08X}", stage1);
@@ -587,6 +639,19 @@ impl<'a> Unpacker<'a> {
         let stage1b = stage1.wrapping_add(stage2_off);
         u.decrypt_data3(stage1b, key2, 19);
         let stage2 = get_u32(&u.decompressed, stage1b);
+        research::emit_u32(ResearchStage::ExeStage2, "stage2_offset", stage2_off);
+        research::emit_u32_at(
+            ResearchStage::ExeStage2,
+            "stage2",
+            stage2,
+            AddressSpace::WorkingImageRva,
+            stage2 as u64,
+        );
+        research::emit_u32(
+            ResearchStage::ExeStage2,
+            "checksum_table_offset",
+            chk_src_start,
+        );
         if verbose {
             println!("[4/9] Decrypting stage2...");
             println!("  stage2 = 0x{:08X}", stage2);
@@ -680,6 +745,11 @@ impl<'a> Unpacker<'a> {
             }
             walk2 = walk2.wrapping_add(32);
         }
+        research::emit_u32s(
+            ResearchStage::ExeStage2,
+            "key_offsets",
+            u.key_offsets.to_vec(),
+        );
         if verbose {
             println!(
                 "  key offsets = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
@@ -718,6 +788,14 @@ impl<'a> Unpacker<'a> {
             println!("  stage3 accum seed = 0x{accum_seed:08X}");
         }
         let stage3_key = xor_acc ^ chk2 ^ accum;
+        research::emit_range(
+            ResearchStage::ExeStage3,
+            "stage3_descriptor",
+            AddressSpace::WorkingImageRva,
+            stage3_field as u64,
+            stage3_dlen as u64,
+        );
+        research::emit_u32(ResearchStage::ExeStage3, "stage3_accum_seed", accum_seed);
         let stage3_source_end = (stage3_field as usize)
             .checked_add(stage3_slen as usize)
             .filter(|&end| end <= u.decompressed.len())
@@ -774,6 +852,11 @@ impl<'a> Unpacker<'a> {
                 }
             }
             if let Some(rounds) = selected {
+                research::emit_u32(
+                    ResearchStage::ExeStage3,
+                    "selected_accumulator_rounds",
+                    rounds,
+                );
                 if verbose {
                     println!("  selected stage3 accumulator rounds = {rounds}");
                 }
@@ -858,6 +941,20 @@ impl<'a> Unpacker<'a> {
                 (crdp_end.wrapping_add(15)) & !15u32
             });
         u.decrypt_data6(data_offset);
+        research::emit_u32_at(
+            ResearchStage::ExeStage4,
+            "bytecode",
+            data_offset,
+            AddressSpace::WorkingImageRva,
+            data_offset as u64,
+        );
+        research::emit_range(
+            ResearchStage::ExeStage4,
+            "stage4_descriptor",
+            AddressSpace::WorkingImageRva,
+            stage4_field as u64,
+            stage4_dlen as u64,
+        );
         let chk5 = u.calculate_checksum(stage1.wrapping_add(chk_src_start.wrapping_add(8)));
         // accum2 sits 4 bytes past the function-end `48 EB 01 B9` + any CC padding
         // (i.e., the 4 bytes immediately after the last instance of that pattern).
@@ -937,6 +1034,18 @@ impl<'a> Unpacker<'a> {
                 reason: first_failure.expect("at least one Stage5 candidate was tried"),
             });
         };
+        research::emit_u32(
+            ResearchStage::ExeStage5,
+            "selected_accumulator_rounds",
+            selected_rounds,
+        );
+        research::emit_range(
+            ResearchStage::ExeStage5,
+            "stage5_descriptor",
+            AddressSpace::WorkingImageRva,
+            stage5_field as u64,
+            stage5_dlen as u64,
+        );
         if verbose {
             println!("  selected stage5 accumulator rounds = {selected_rounds}");
         }
@@ -985,6 +1094,14 @@ impl<'a> Unpacker<'a> {
         // rather than the walk5 encrypted-pointer table. `new_layout` selects
         // that path.
         let new_layout = kind_pos_opt.is_none();
+        research::emit_bool(ResearchStage::ExeStage5, "new_layout", new_layout);
+        research::emit_u32_at(
+            ResearchStage::ExeStage5,
+            "stage5_marker",
+            s5_marker,
+            AddressSpace::WorkingImageRva,
+            s5_marker as u64,
+        );
         let kind_pos = kind_pos_opt.unwrap_or_else(|| s5_marker.wrapping_add(88));
         let walk4_slot = kind_pos.wrapping_sub(0x20);
         let walk3_slot = kind_pos.wrapping_sub(0x18);
@@ -1021,6 +1138,20 @@ impl<'a> Unpacker<'a> {
             .ok_or(UnpackError::Stage5MarkerNotFound)?;
             walk4_slot = slots.compressed_info_ptr;
             bc2_off = slots.file_lfsr;
+            research::emit_u32_at(
+                ResearchStage::ExeStage5,
+                "compressed_info_ptr",
+                walk4_slot,
+                AddressSpace::WorkingImageRva,
+                walk4_slot as u64,
+            );
+            research::emit_u32_at(
+                ResearchStage::ExeStage5,
+                "file_lfsr",
+                bc2_off,
+                AddressSpace::WorkingImageRva,
+                bc2_off as u64,
+            );
         }
         let at5 = walk3_slot;
         let mut walk3 = get_u32(&u.decompressed, at5);
@@ -1089,8 +1220,16 @@ impl<'a> Unpacker<'a> {
         // block (fileDecryptorAddress = fileChecksumAddresses + 0x58). Walk
         // 16-byte entries until the size dword (offset +4) is zero, decrypting
         // each.
+        let file_cs = get_u32(&u.decompressed, bc2_off.wrapping_sub(0x58));
+        research::emit_u32_at(
+            ResearchStage::ExeStage5,
+            "file_checksums",
+            file_cs,
+            AddressSpace::WorkingImageRva,
+            file_cs as u64,
+        );
         {
-            let mut fcs = get_u32(&u.decompressed, bc2_off.wrapping_sub(0x58));
+            let mut fcs = file_cs;
             while get_u32(&u.decompressed, fcs.wrapping_add(4)) != 0 {
                 u.decrypt_data5(fcs, 16);
                 fcs = fcs.wrapping_add(16);
@@ -1148,6 +1287,51 @@ impl<'a> Unpacker<'a> {
             if get_u32(&u.decompressed, walk4.wrapping_sub(16).wrapping_add(4)) == 0 {
                 break;
             }
+        }
+        {
+            let compressed = blocks
+                .iter()
+                .filter(|block| block.len != block.plain_len)
+                .count();
+            let compressed_bytes: u64 = blocks
+                .iter()
+                .filter(|block| block.len != block.plain_len)
+                .map(|block| u64::from(block.len))
+                .sum();
+            let output_bytes: u64 = blocks
+                .iter()
+                .map(|block| u64::from(block.len.max(block.plain_len)))
+                .sum();
+            research::emit_u32(
+                ResearchStage::Sections,
+                "block_count",
+                u32::try_from(blocks.len()).unwrap_or(u32::MAX),
+            );
+            research::emit_u32(
+                ResearchStage::Sections,
+                "compressed_block_count",
+                u32::try_from(compressed).unwrap_or(u32::MAX),
+            );
+            research::emit_u64(
+                ResearchStage::Sections,
+                "compressed_bytes",
+                compressed_bytes,
+            );
+            research::emit_u64(ResearchStage::Sections, "output_bytes", output_bytes);
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "aes_schedule",
+                u.key_offsets[2],
+                AddressSpace::WorkingImageRva,
+                u.key_offsets[2] as u64,
+            );
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "huffman_table",
+                u.key_offsets[0],
+                AddressSpace::WorkingImageRva,
+                u.key_offsets[0] as u64,
+            );
         }
         // Pass 2: each block writes only its own [dst, dst+max(len,plain_len))
         // span and reads only immutable input + the (snapshotted) key tables,
@@ -1397,9 +1581,18 @@ impl<'a> Unpacker<'a> {
                 Some(s) => s,
                 None => layout::select_dd8_shift(&u.decompressed, text_va, text_size, u.info[3]),
             };
+            // The chosen selector value itself: the page-XOR shift, with 99
+            // meaning the selector chose to skip dd8 entirely.
+            research::emit_u32(ResearchStage::Sections, "text_dd8_shift", dd8_shift);
             if dd8_shift != 99 {
                 let mut page = text_va >> 12;
                 let end_page = text_va.wrapping_add(text_size) >> 12;
+                research::emit_u32(ResearchStage::Sections, "dd8_first_page", page);
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "dd8_page_count",
+                    end_page.saturating_sub(page),
+                );
                 while page < end_page {
                     u.decrypt_data8(page << 12, 4096, page << dd8_shift);
                     page = page.wrapping_add(1);
@@ -1430,6 +1623,7 @@ impl<'a> Unpacker<'a> {
                 .unwrap_or(64)
         };
         let dd_off = ep_off.wrapping_add(16);
+        research::emit_u32(ResearchStage::ExeStage5, "ep_layout_offset", ep_off);
         // The metadata block (EP + data directories) is read transiently: decrypt
         // it, copy EP and dirs into the PE header, then RESTORE the original
         // encrypted bytes. The packer leaves this region encrypted in its output,
@@ -1524,9 +1718,16 @@ impl<'a> Unpacker<'a> {
                         layout::select_dd8_shift(&u.decompressed, text_va, text_size, u.info[3])
                     }
                 };
+                research::emit_u32(ResearchStage::Sections, "text_dd8_shift", shift);
                 if shift != 99 {
                     let mut page = text_va >> 12;
                     let end_page = text_va.wrapping_add(text_size) >> 12;
+                    research::emit_u32(ResearchStage::Sections, "dd8_first_page", page);
+                    research::emit_u32(
+                        ResearchStage::Sections,
+                        "dd8_page_count",
+                        end_page.saturating_sub(page),
+                    );
                     while page < end_page {
                         u.decrypt_data8(page << 12, 4096, page << shift);
                         page = page.wrapping_add(1);
@@ -1538,6 +1739,13 @@ impl<'a> Unpacker<'a> {
             // by-name import's hint/name, and recover the IAT (DD[12]).
             let import_rva = get_u32(&u.decompressed, pe_off2.wrapping_add(0x90));
             let import_size = get_u32(&u.decompressed, pe_off2.wrapping_add(0x94));
+            research::emit_range(
+                ResearchStage::Imports,
+                "import_directory",
+                AddressSpace::WorkingImageRva,
+                import_rva as u64,
+                import_size as u64,
+            );
             if import_rva != 0 {
                 u.process_imports_idt(import_rva, import_size, pe_off2);
             }
@@ -1651,13 +1859,31 @@ impl<'a> Unpacker<'a> {
         // handled by `job::restore_tls_from_stub`.
         let tls_dd_off = pe_off2.wrapping_add(136 + 9 * 8);
         let tls_rva = get_u32(&u.decompressed, tls_dd_off);
+        research::emit_u32_at(
+            ResearchStage::Tls,
+            "directory_rva",
+            tls_rva,
+            AddressSpace::WorkingImageRva,
+            tls_rva as u64,
+        );
         if tls_rva != 0 && (tls_rva as usize + 40) <= u.decompressed.len() {
             let tls_all_zero = u.decompressed[tls_rva as usize..tls_rva as usize + 40]
                 .iter()
                 .all(|&b| b == 0);
             if tls_all_zero {
                 let image_base = get_u64(&u.decompressed, pe_off2.wrapping_add(48));
-                if new_layout || !u.restore_pe64_tls_from_stub(pe_off, tls_rva, image_base) {
+                let restored =
+                    !new_layout && u.restore_pe64_tls_from_stub(pe_off, tls_rva, image_base);
+                research::emit_text(
+                    ResearchStage::Tls,
+                    "directory_action",
+                    if restored {
+                        "restored_from_stub"
+                    } else {
+                        "cleared"
+                    },
+                );
+                if !restored {
                     write_u32(&mut u.decompressed, tls_dd_off, 0);
                     write_u32(&mut u.decompressed, tls_dd_off.wrapping_add(4), 0);
                 }
@@ -1713,6 +1939,12 @@ impl<'a> Unpacker<'a> {
             );
         }
 
+        research::emit_u64(
+            ResearchStage::Output,
+            "output_len",
+            u.decompressed.len() as u64,
+        );
+        research::emit_u32(ResearchStage::Finalize, "kind", if is_dll { 1 } else { 0 });
         Ok(u.decompressed)
     }
 

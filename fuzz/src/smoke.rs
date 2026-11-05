@@ -122,6 +122,13 @@ fn pe_calls(data: &[u8]) {
     let data = &data[..data.len().min(MAX_PE)];
     let _ = senbei_engine::detect(data);
     let _ = senbei_engine::check_integrity(data);
+    let limits = senbei_engine::windows::InspectionLimits {
+        prefix_scratch_bytes: 64 * 1024,
+        max_candidates: 16,
+        max_issues: 16,
+        ..Default::default()
+    };
+    let _ = senbei_engine::windows::inspect_research_with_limits(data, &limits);
     if let Ok(headers) = senbei_pe::parse(data) {
         let _ = senbei_pe::sections(data, headers);
         let _ = senbei_pe::characteristics(data, headers);

@@ -254,27 +254,6 @@ pub fn is_protected_so_file(path: &Path) -> bool {
     is_elf64_aarch64(&bytes) && is_protected_libil2cpp(&bytes)
 }
 
-/// [`probe_so_file_with_limits`] with the recognition profile it produced.
-///
-/// A resource-limit failure is reported as `Blocked` with the error retained,
-/// never as "not protected".
-pub(crate) fn probe_so_profiled(
-    path: &Path,
-    limits: &ResourceLimits,
-) -> Result<(senbei_engine::ProtectionProfile, Result<bool, String>)> {
-    let file = File::open(path).with_context(|| format!("open `{}`", path.display()))?;
-    let bytes = map_read_only(&file, path)?;
-    if !is_elf64_aarch64(&bytes) {
-        return Ok((
-            senbei_engine::ProtectionProfile::new(senbei_engine::ObservedTarget::android(None)),
-            Ok(false),
-        ));
-    }
-    let (profile, result) =
-        senbei_engine::android::probe_libil2cpp_profiled_with_limits(&bytes, limits);
-    Ok((profile, result.map_err(|error| error.to_string())))
-}
-
 pub(crate) fn probe_so_file_with_limits(
     path: &Path,
     limits: &senbei_engine::android::ResourceLimits,
@@ -311,6 +290,7 @@ pub(crate) fn restore_so_with_engine_limits(
     dest: &Path,
     verbose: bool,
     limits: &ResourceLimits,
+    research: bool,
 ) -> Result<context::RestoredLibrary> {
     let temporary = tempfile::tempdir().context("create stage-2 workspace")?;
     let stage2_dir = temporary.path().join("stage2");
@@ -319,6 +299,14 @@ pub(crate) fn restore_so_with_engine_limits(
         limits,
     )
     .context("extract stage-1/stage-2 payload")?;
+    // The report the extraction just produced. Serialized once, only for
+    // research runs; an ordinary run drops it with the rest of the workspace.
+    let extraction_report = research.then(|| {
+        report_value(
+            &extraction,
+            &[(input, "<input>"), (temporary.path(), "<workspace>")],
+        )
+    });
     // Every module 0x0C is collected. Two distinct images in one library are a
     // conflict for that library's application, not a last-writer-wins update.
     let mut modules = Vec::new();
@@ -357,8 +345,37 @@ pub(crate) fn restore_so_with_engine_limits(
             verbose,
         },
         limits,
-    )
-    .context("restore protected library")?;
+    );
+    // A restore that failed after extraction is still a research finding: the
+    // extraction's seeds, records and modules are already known, and the
+    // original failure travels with them so nothing is lost.
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            let restored = extraction_report
+                .map(|extraction| crate::report::AndroidResearchReport {
+                    extraction,
+                    restoration: None,
+                })
+                .map(ResearchCapture::Library);
+            return Err(capture(
+                anyhow::Error::new(error).context("restore protected library"),
+                restored,
+            ));
+        }
+    };
+    // The same restore's own report, serialized once for research output
+    // before the validation diagnostics are taken out of it below.
+    let restoration = research.then(|| {
+        report_value(
+            &report,
+            &[
+                (input, "<input>"),
+                (dest, "<output>"),
+                (temporary.path(), "<workspace>"),
+            ],
+        )
+    });
     // Keep only the validation verdict this call already produced. Nothing is
     // re-read or re-validated: the diagnostics describe the bytes just written.
     let validation = Some(ValidationDiagnostics {
@@ -372,6 +389,13 @@ pub(crate) fn restore_so_with_engine_limits(
         method_index_module,
         module_image,
         validation,
+        research: match (extraction_report, restoration) {
+            (Some(extraction), restoration) => Some(crate::report::AndroidResearchReport {
+                extraction,
+                restoration,
+            }),
+            _ => None,
+        },
     })
 }
 
@@ -400,8 +424,34 @@ pub fn restore_so_file_with_diagnostics(
     verbose: bool,
     limits: &ResourceLimits,
 ) -> Result<(Option<Vec<u8>>, Option<ValidationDiagnostics>)> {
-    let restored = context::EngineRestorer(*limits).restore(input, dest, verbose)?;
+    let restored = context::EngineRestorer::new(*limits, false).restore(input, dest, verbose)?;
     Ok((restored.embedded_metadata, restored.validation))
+}
+
+/// One single-file Android library restore.
+pub(crate) struct ResearchedLibrary {
+    pub embedded_metadata: Option<Vec<u8>>,
+    /// Structural diagnostics for the image this restore wrote.
+    pub validation: Option<ValidationDiagnostics>,
+    /// The engines' own reports, kept only when research was requested.
+    pub research: Option<crate::report::AndroidResearchReport>,
+}
+
+/// [`restore_so_file_with_diagnostics`], also keeping the engines' own reports
+/// for research output. Nothing else changes: the same single restore runs.
+pub(crate) fn restore_so_file_researched(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    limits: &ResourceLimits,
+    research: bool,
+) -> Result<ResearchedLibrary> {
+    let restored = context::EngineRestorer::new(*limits, research).restore(input, dest, verbose)?;
+    Ok(ResearchedLibrary {
+        embedded_metadata: restored.embedded_metadata,
+        validation: restored.validation,
+        research: restored.research,
+    })
 }
 
 /// Fresh run-scoped cache. Library hits reuse their module context; metadata hits
@@ -413,6 +463,13 @@ pub(crate) fn run_cache() -> context::AndroidRunCache {
 
 pub(crate) fn run_cache_with_limits(limits: &ResourceLimits) -> context::AndroidRunCache {
     context::AndroidRunCache::with_limits(limits)
+}
+
+/// The same cache, keeping the engines' reports for research output.
+pub(crate) fn run_cache_for_research(limits: &ResourceLimits) -> context::AndroidRunCache {
+    let mut cache = context::AndroidRunCache::with_limits(limits);
+    cache.research = true;
+    cache
 }
 
 /// Assign loose libraries and metadata to application contexts.
@@ -434,6 +491,9 @@ pub(crate) struct LooseLibraryOutcome {
     /// Structural diagnostics from the restore that produced this output.
     /// `None` for duplicates, failures, and restorers without a report.
     pub validation: Option<ValidationDiagnostics>,
+    /// The engines' own extraction and restoration reports, kept only for
+    /// research inspection. `None` for every ordinary run.
+    pub research: Option<crate::report::AndroidResearchReport>,
 }
 
 pub(crate) fn restore_loose_library(
@@ -452,7 +512,7 @@ pub(crate) fn restore_loose_library(
         app,
         verbose,
         cache,
-        &mut context::EngineRestorer(limits),
+        &mut context::EngineRestorer::new(limits, cache.research()),
     )
 }
 
@@ -474,6 +534,7 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
             status: EntryStatus::Duplicate,
             embedded: None,
             validation: None,
+            research: None,
         });
     }
     // A prior content-only success still needs context extraction. Restore it
@@ -499,6 +560,7 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
                         status: EntryStatus::Failed(error),
                         embedded: None,
                         validation: None,
+                        research: None,
                     });
                 }
                 embedded = Some(meta_dest);
@@ -517,15 +579,30 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
                 },
                 embedded,
                 // A duplicate restored only for its module context has no
-                // output of its own, so it reports no diagnostics.
-                validation: if prior { None } else { restored.validation },
+                // output of its own, so it reports no diagnostics, and the
+                // engine reports belong to the run that actually produced it.
+                validation: if prior {
+                    None
+                } else {
+                    restored.validation.clone()
+                },
+                research: if prior { None } else { restored.research },
             })
         }
-        Err(error) => Ok(LooseLibraryOutcome {
-            status: EntryStatus::Failed(error),
-            embedded: None,
-            validation: None,
-        }),
+        Err(error) => {
+            // A restore that failed after extraction keeps the extraction's
+            // own report; the error itself is unchanged.
+            let research = match error_research(&error) {
+                Some(ResearchCapture::Library(report)) => Some(report.clone()),
+                _ => None,
+            };
+            Ok(LooseLibraryOutcome {
+                status: EntryStatus::Failed(error),
+                embedded: None,
+                validation: None,
+                research,
+            })
+        }
     }
 }
 
@@ -538,6 +615,9 @@ pub(crate) struct LooseMetadataOutcome {
     pub provenance: Vec<String>,
     /// Route the transform actually took (seeded, structural, or method-index).
     pub layout: senbei_engine::LayoutKind,
+    /// Seeds tried, discovery, and the transform's own report. Only a research
+    /// run keeps this.
+    pub research: Option<serde_json::Value>,
 }
 
 pub(crate) fn restore_loose_metadata(
@@ -571,8 +651,9 @@ pub(crate) fn restore_loose_metadata(
     let module = module.as_deref();
     // Loose metadata retains one output per path, as before. Do not keep all
     // restored blobs in the folder cache just to avoid a repeated permutation.
-    let (out, report, layout) =
-        restore_metadata_bytes_with_module(&data, module).with_context(|| label.to_owned())?;
+    let (out, report, layout, research) =
+        restore_metadata_with_module(&data, module, cache.research())
+            .with_context(|| label.to_owned())?;
     if report.remapped > 0 {
         write_metadata_blob(dest, &out)?;
         if verbose {
@@ -584,6 +665,7 @@ pub(crate) fn restore_loose_metadata(
         remapped: report.remapped,
         provenance,
         layout,
+        research,
     })
 }
 
@@ -665,43 +747,47 @@ pub(crate) fn restore_package_cached(
         out_root,
         cache,
         verbose,
-        &mut context::EngineRestorer(limits),
+        &mut context::EngineRestorer::new(limits, cache.research()),
     )
 }
 
 /// One folder split-set: every library in the group, then every metadata blob.
 /// A library-only pass records modules without writing metadata, so a metadata
 /// blob in an earlier sibling cannot run before a library in a later one.
+/// `members` pairs each package with the relative path its outputs live under.
+///
+/// The relative path is computed by the caller (see `job::rel_in_tree`) and is
+/// always relative. This function never derives it: `Path::join` with an
+/// absolute path discards the output root, so a fallback here could write
+/// outside the caller's directory — unacceptable for a dry run or inspection,
+/// whose whole contract is that it keeps nothing outside its own workspace.
 pub(crate) fn restore_apk_group(
-    packages: &[PathBuf],
-    root: &Path,
+    members: &[(&Path, &Path)],
     out_root: &Path,
     cache: &mut context::AndroidRunCache,
     verbose: bool,
 ) -> Result<Vec<EntryOutcome>> {
     let limits = cache.limits;
     let mut outcomes = Vec::new();
-    for package in packages {
-        let rel = package.strip_prefix(root).unwrap_or(package);
+    for (package, rel) in members {
         outcomes.extend(restore_package_pass(
             package,
             rel,
             out_root,
             cache,
             verbose,
-            &mut context::EngineRestorer(limits),
+            &mut context::EngineRestorer::new(limits, cache.research()),
             PackagePass::Libraries,
         )?);
     }
-    for package in packages {
-        let rel = package.strip_prefix(root).unwrap_or(package);
+    for (package, rel) in members {
         outcomes.extend(restore_package_pass(
             package,
             rel,
             out_root,
             cache,
             verbose,
-            &mut context::EngineRestorer(limits),
+            &mut context::EngineRestorer::new(limits, cache.research()),
             PackagePass::Metadata,
         )?);
     }
@@ -722,6 +808,124 @@ pub fn content_identity(data: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(data);
     hex_digest(&digest.finalize())
+}
+
+/// A failure that still carries what the attempt had already observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResearchCapture {
+    /// Extraction ran and produced a report; the restoration after it failed.
+    Library(crate::report::AndroidResearchReport),
+    /// A metadata transform's seeds, discovery, and failure reason.
+    Metadata(serde_json::Value),
+}
+
+/// A transform error that still carries what the attempt observed.
+///
+/// Research inspection wants the seeds it tried and the reason each failed even
+/// when no output was produced. The error keeps its ordinary `anyhow` chain —
+/// callers that do not care about research see exactly the same message.
+#[derive(Debug)]
+pub(crate) struct LossyError {
+    inner: anyhow::Error,
+    capture: ResearchCapture,
+}
+
+impl LossyError {
+    pub(crate) fn new(inner: anyhow::Error, capture: ResearchCapture) -> Self {
+        Self { inner, capture }
+    }
+
+    fn capture(&self) -> &ResearchCapture {
+        &self.capture
+    }
+}
+
+impl std::fmt::Display for LossyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+impl std::error::Error for LossyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Keep the whole wrapped chain reachable: callers classify the original
+        // error (an unsupported version, a malformed blob) by walking it.
+        Some(self.inner.as_ref())
+    }
+}
+
+/// The research captured for a failure, if the error (or anything it wraps)
+/// carries one.
+pub(crate) fn error_research(error: &anyhow::Error) -> Option<&ResearchCapture> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LossyError>())
+        .map(LossyError::capture)
+}
+
+/// [`capture`] with the same rule, exposed to the module's tests so a failed
+/// restore can be exercised without a protected fixture.
+#[cfg(test)]
+pub(crate) fn capture_for_tests(
+    error: anyhow::Error,
+    research: Option<ResearchCapture>,
+) -> anyhow::Error {
+    capture(error, research)
+}
+
+/// Wrap `error` with the capture, when there is one.
+fn capture(error: anyhow::Error, capture: Option<ResearchCapture>) -> anyhow::Error {
+    match capture {
+        Some(capture) => LossyError::new(error, capture).into(),
+        None => error,
+    }
+}
+
+/// Serialize one engine report for research output.
+///
+/// The report is the engine's own, unchanged; only filesystem locations are
+/// rewritten to logical labels. A research report outlives the run, and a
+/// scratch path that no longer exists is noise — or worse, a misleading hint
+/// about where an output was "kept".
+fn report_value<T: serde::Serialize>(report: &T, labels: &[(&Path, &str)]) -> serde_json::Value {
+    let mut value = serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+    scrub_paths(&mut value, labels);
+    value
+}
+
+fn scrub_paths(value: &mut serde_json::Value, labels: &[(&Path, &str)]) {
+    // Longest location first: a nested path starts with its parent, and the
+    // more specific label is the one that describes it.
+    let mut rules: Vec<(String, &str)> = labels
+        .iter()
+        .map(|(path, label)| (path.display().to_string(), *label))
+        .filter(|(rendered, _)| !rendered.is_empty())
+        .collect();
+    rules.sort_by_key(|(rendered, _)| std::cmp::Reverse(rendered.len()));
+    scrub_value(value, &rules);
+}
+
+fn scrub_value(value: &mut serde_json::Value, rules: &[(String, &str)]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for (rendered, label) in rules {
+                if text.contains(rendered.as_str()) {
+                    *text = text.replace(rendered.as_str(), label);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_value(item, rules);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values_mut() {
+                scrub_value(field, rules);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Restore an il2cpp metadata blob. Paired v24.1 Android packages use the
@@ -745,20 +949,67 @@ pub(crate) fn restore_metadata_bytes_with_module(
     data: &[u8],
     method_index_module: Option<&[u8]>,
 ) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report, senbei_engine::LayoutKind)> {
+    let (out, report, layout, _) = restore_metadata_with_module(data, method_index_module, false)?;
+    Ok((out, report, layout))
+}
+
+/// [`restore_metadata_bytes_with_module`], optionally keeping the facts the
+/// transform observed on the way.
+///
+/// The research value is produced by the same pass that does the work: the
+/// seed candidates discovery found (or why it found none), the seeds actually
+/// tried, and the transform's own report. Nothing is re-run for it, and it
+/// survives a transform that fails — a failing trial is exactly what the
+/// caller wants to see.
+pub(crate) fn restore_metadata_with_module(
+    data: &[u8],
+    method_index_module: Option<&[u8]>,
+    research: bool,
+) -> anyhow::Result<(
+    Vec<u8>,
+    senbei_metadata::Report,
+    senbei_engine::LayoutKind,
+    Option<serde_json::Value>,
+)> {
     use senbei_engine::LayoutKind;
     let version = data
         .get(4..8)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .map(u32::from_le_bytes);
+    let mut facts = MetadataFacts {
+        version,
+        route: "method_indices",
+        module_0c_sha256: method_index_module.map(content_identity),
+        ..MetadataFacts::default()
+    };
+    // Keep what the attempt has seen so far, then wrap the failure with it.
+    let fail = |facts: &mut MetadataFacts, error: anyhow::Error| -> anyhow::Error {
+        facts.error = Some(format!("{error:#}"));
+        let kept = research.then(|| facts.clone().into_value());
+        capture(error, kept.map(ResearchCapture::Metadata))
+    };
+
     if version == Some(24) {
         // v24.1 method indices come only from this application's module 0x0C.
         // Falling through to the structural remap would report "unsupported
         // version" and could be mistaken for a clean skip. No module is a
         // failed binding, not an unsupported layout.
-        let module = method_index_module
-            .ok_or_else(|| anyhow::anyhow!("no module 0x0C for v24.1 metadata"))?;
+        let Some(module) = method_index_module else {
+            let error = anyhow::anyhow!("no module 0x0C for v24.1 metadata");
+            return Err(fail(&mut facts, error));
+        };
         let (out, report) = senbei_metadata::android::restore_method_indices_v24_1(data, module)
-            .map_err(anyhow::Error::new)?;
+            .map_err(anyhow::Error::new)
+            .map_err(|error| fail(&mut facts, error))?;
+        facts.version = Some(report.version);
+        facts.report = Some(serde_json::json!({
+            "version": report.version,
+            "methods": report.methods,
+            "active_methods": report.active_methods,
+            "changed_indices": report.changed_indices,
+            "exception_count": report.exception_count,
+            "seed": report.seed,
+        }));
         return Ok((
             out,
             senbei_metadata::Report {
@@ -768,12 +1019,31 @@ pub(crate) fn restore_metadata_bytes_with_module(
                 modules: 0,
             },
             LayoutKind::MetadataMethodIndices,
+            research.then(|| facts.into_value()),
         ));
     }
-    if let Ok(discovery) = senbei_metadata::android::discover_method_token_seeds(data)
-        && matches!(discovery.version, 29 | 31 | 39)
-    {
-        let mut seeds = discovery.seed_candidates.clone();
+
+    // Seed discovery is the only step that can say why a seeded restore was
+    // never tried, so its own outcome is recorded for research. Whether the
+    // seeded route runs at all is decided exactly as before.
+    let mut seeded_layout = false;
+    match senbei_metadata::android::discover_method_token_seeds(data) {
+        Ok(found) if matches!(found.version, 29 | 31 | 39) => {
+            seeded_layout = true;
+            facts.seed_candidates = found.seed_candidates.clone();
+            if research {
+                facts.discovery = serde_json::to_value(&found).ok();
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            if research {
+                facts.discovery_error = Some(format!("{error}"));
+            }
+        }
+    }
+    if seeded_layout {
+        let mut seeds = facts.seed_candidates.clone();
         if seeds.is_empty() {
             seeds.push(senbei_metadata::android::DEFAULT_METHOD_TOKEN_SEED);
         }
@@ -782,7 +1052,24 @@ pub(crate) fn restore_metadata_bytes_with_module(
         // build with an unseeded permutation falls through to the structural
         // remap rather than producing a silently wrong file.
         for seed in seeds {
+            facts.tried_seeds.push(seed);
             if let Ok((out, report)) = senbei_metadata::android::restore_method_tokens(data, seed) {
+                facts.route = "seeded";
+                facts.version = Some(report.version);
+                facts.report = Some(serde_json::json!({
+                    "version": report.version,
+                    "seed": report.seed,
+                    "encryption_status": report.encryption_status,
+                    "images": report.images,
+                    "images_with_methods": report.images_with_methods,
+                    "types": report.types,
+                    "methods": report.methods,
+                    "visited_methods": report.visited_methods,
+                    "already_correct_before": report.already_correct_before,
+                    "correct_after": report.correct_after,
+                    "changed_tokens": report.changed_tokens,
+                    "transformed_images": report.transformed_images,
+                }));
                 return Ok((
                     out,
                     senbei_metadata::Report {
@@ -792,12 +1079,66 @@ pub(crate) fn restore_metadata_bytes_with_module(
                         modules: report.images_with_methods,
                     },
                     LayoutKind::MetadataSeeded,
+                    research.then(|| facts.into_value()),
                 ));
             }
         }
     }
-    let (out, report) = senbei_metadata::deobfuscate(data).map_err(anyhow::Error::new)?;
-    Ok((out, report, LayoutKind::MetadataStructural))
+
+    facts.route = "structural";
+    let (out, report) = senbei_metadata::deobfuscate(data)
+        .map_err(anyhow::Error::new)
+        .map_err(|error| fail(&mut facts, error))?;
+    facts.version = Some(report.version);
+    facts.report = Some(serde_json::json!({
+        "version": report.version,
+        "methods": report.methods,
+        "remapped": report.remapped,
+        "modules": report.modules,
+    }));
+    Ok((
+        out,
+        report,
+        LayoutKind::MetadataStructural,
+        research.then(|| facts.into_value()),
+    ))
+}
+
+/// What one metadata transform observed, independent of whether it succeeded.
+#[derive(Debug, Clone, Default)]
+struct MetadataFacts {
+    route: &'static str,
+    version: Option<u32>,
+    /// Seeds the transform actually tried, in order.
+    tried_seeds: Vec<u32>,
+    /// Candidates seed discovery reported.
+    seed_candidates: Vec<u32>,
+    /// The discovery report, when it found a supported layout.
+    discovery: Option<serde_json::Value>,
+    /// Why seed discovery declined, when it did.
+    discovery_error: Option<String>,
+    /// The transform's own report.
+    report: Option<serde_json::Value>,
+    /// Identity of the module `0x0C` this transform bound to, when it had one.
+    module_0c_sha256: Option<String>,
+    /// Why the transform stopped, when it did.
+    error: Option<String>,
+}
+
+impl MetadataFacts {
+    fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "route": self.route,
+            "version": self.version,
+            "tried_seeds": self.tried_seeds,
+            "seed_candidates": self.seed_candidates,
+            "discovery": self.discovery,
+            "discovery_error": self.discovery_error,
+            "report": self.report,
+            "module_0c_sha256": self.module_0c_sha256,
+            "error": self.error,
+        })
+    }
 }
 
 /// What happened to one archive entry (or one loose Android target).
@@ -820,6 +1161,12 @@ pub struct EntryOutcome {
     /// Structural diagnostics from the restore of this entry. `None` for
     /// metadata entries, duplicates, and restorers without a report.
     pub validation: Option<ValidationDiagnostics>,
+    /// The engines' own reports for a library entry. Only a research run keeps
+    /// them, and only for an entry that actually restored.
+    pub research: Option<crate::report::AndroidResearchReport>,
+    /// Seeds tried, discovery, and the transform report for a metadata entry.
+    /// Only a research run keeps them, and they survive a failed transform.
+    pub metadata_research: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,17 +1244,34 @@ pub fn restore_package_with_limits(
     // package still skips those bytes; module context for metadata is rebuilt
     // inside this package (one package, or one manifest-scoped bundle, is one
     // application boundary).
+    restore_package_with_limits_and_research(package, rel, out_root, seen, verbose, &limits, false)
+}
+
+/// [`restore_package_with_limits`], optionally keeping the engines' reports for
+/// research output. One package is one application boundary either way.
+pub(crate) fn restore_package_with_limits_and_research(
+    package: &Path,
+    rel: &Path,
+    out_root: &Path,
+    seen: &mut HashSet<String>,
+    verbose: bool,
+    limits: &ResourceLimits,
+    research: bool,
+) -> Result<Vec<EntryOutcome>> {
+    let limits = *limits;
     let mut cache = context::AndroidRunCache::with_limits(&limits);
+    cache.research = research;
     for identity in seen.iter().cloned() {
         cache.insert_prior_success(identity);
     }
+    let research = cache.research();
     let outcomes = restore_package_with_restorer(
         package,
         rel,
         out_root,
         &mut cache,
         verbose,
-        &mut context::EngineRestorer(limits),
+        &mut context::EngineRestorer::new(limits, research),
     );
     // Publish successes even when the package returns `Err`. The caller's set
     // is only replaced after that, so a panic still leaves the old successes.
@@ -1188,6 +1552,8 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
         layout: None,
         metadata_version: None,
         validation: None,
+        research: None,
+        metadata_research: None,
     };
     if !is_so && !is_meta {
         return Ok(vec![outcome(
@@ -1238,6 +1604,7 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                         let mut restored_outcome =
                             outcome(EntryKind::So, EntryStatus::Restored, Vec::new());
                         restored_outcome.validation = restored.validation.clone();
+                        restored_outcome.research = restored.research.clone();
                         outcomes.push(restored_outcome);
                     }
                     if !prior && let Some(blob) = &restored.embedded_metadata {
@@ -1252,6 +1619,8 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                                 layout: None,
                                 metadata_version: None,
                                 validation: None,
+                                research: None,
+                                metadata_research: None,
                             }),
                             Err(error) => embedded_failed = Some(error),
                         }
@@ -1276,11 +1645,17 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                         }
                     }
                 }
-                Err(error) => vec![outcome(
-                    EntryKind::So,
-                    EntryStatus::Failed(error),
-                    Vec::new(),
-                )],
+                Err(error) => {
+                    // A restore that failed after extraction keeps what the
+                    // extraction already reported, alongside the error.
+                    let research = match error_research(&error) {
+                        Some(ResearchCapture::Library(report)) => Some(report.clone()),
+                        _ => None,
+                    };
+                    let mut failed = outcome(EntryKind::So, EntryStatus::Failed(error), Vec::new());
+                    failed.research = research;
+                    vec![failed]
+                }
             },
         );
     }
@@ -1328,47 +1703,58 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
     // Metadata entry: write only when the restore actually changed protected
     // method fields — a clean blob needs no copy (same contract as loose files).
     // The binding was resolved before this write.
-    let (kind, status, layout) = match restore_metadata_bytes_with_module(&entry_data, module) {
-        Ok((out, report, layout)) if report.remapped > 0 => {
-            let kind = EntryKind::Metadata {
-                remapped: report.remapped,
-            };
-            match write_metadata_blob(dest, &out) {
-                Ok(()) => {
-                    state.cache.insert_metadata(
-                        identity,
-                        context_identity,
-                        context::CachedMetadata::Restored {
-                            remapped: report.remapped,
-                        },
-                    );
-                    (kind, EntryStatus::Restored, Some(layout))
+    let (kind, status, layout, metadata_research) =
+        match restore_metadata_with_module(&entry_data, module, state.cache.research()) {
+            Ok((out, report, layout, research)) if report.remapped > 0 => {
+                let kind = EntryKind::Metadata {
+                    remapped: report.remapped,
+                };
+                match write_metadata_blob(dest, &out) {
+                    Ok(()) => {
+                        state.cache.insert_metadata(
+                            identity,
+                            context_identity,
+                            context::CachedMetadata::Restored {
+                                remapped: report.remapped,
+                            },
+                        );
+                        (kind, EntryStatus::Restored, Some(layout), research)
+                    }
+                    Err(error) => (kind, EntryStatus::Failed(error), Some(layout), research),
                 }
-                Err(error) => (kind, EntryStatus::Failed(error), Some(layout)),
             }
-        }
-        // A blob that needed no change still reports the route that ran.
-        Ok((_, _report, layout)) => {
-            state.cache.insert_metadata(
-                identity,
-                context_identity,
-                context::CachedMetadata::Unchanged,
-            );
-            (
-                EntryKind::Metadata { remapped: 0 },
-                EntryStatus::Unchanged,
-                Some(layout),
-            )
-        }
-        Err(error) => (
-            EntryKind::Metadata { remapped: 0 },
-            EntryStatus::Failed(error),
-            None,
-        ),
-    };
+            // A blob that needed no change still reports the route that ran.
+            Ok((_, _report, layout, research)) => {
+                state.cache.insert_metadata(
+                    identity,
+                    context_identity,
+                    context::CachedMetadata::Unchanged,
+                );
+                (
+                    EntryKind::Metadata { remapped: 0 },
+                    EntryStatus::Unchanged,
+                    Some(layout),
+                    research,
+                )
+            }
+            Err(error) => {
+                // The seeds it tried and the reason it stopped survive the failure.
+                let research = error_research(&error).and_then(|capture| match capture {
+                    ResearchCapture::Metadata(value) => Some(value.clone()),
+                    ResearchCapture::Library(_) => None,
+                });
+                (
+                    EntryKind::Metadata { remapped: 0 },
+                    EntryStatus::Failed(error),
+                    None,
+                    research,
+                )
+            }
+        };
     let mut entry_outcome = outcome(kind, status, provenance_labels(&provenance));
     entry_outcome.layout = layout;
     entry_outcome.metadata_version = version;
+    entry_outcome.metadata_research = metadata_research;
     Ok(vec![entry_outcome])
 }
 

@@ -143,16 +143,13 @@ impl Options {
         // rejected rather than guessed at.
         if command == Command::Inspect {
             if dry_run {
-                return Err("'inspect' never recovers; drop --dry-run".to_owned());
+                return Err("'inspect' writes nothing; drop --dry-run".to_owned());
             }
             if out.is_some() {
                 return Err("'inspect' writes nothing; --out is not allowed".to_owned());
             }
-            if strict_integrity {
-                return Err(
-                    "'inspect' runs no static check; --strict-integrity is not allowed".to_owned(),
-                );
-            }
+            // `--strict-integrity` is meaningful: inspection runs the real
+            // static check and reports its verdict.
         }
         if machine {
             // Machine output owns stdout; interleaved progress would corrupt it.
@@ -205,12 +202,14 @@ fn execute(options: &mut Options) -> u8 {
     }
 }
 
-/// Detection completes even when an input is not a target; only an input that
-/// could not be read makes inspection fail.
+/// Inspection reports what the input is and what happened when it was tried;
+/// only an input that could not be read makes it fail.
 fn execute_inspect(options: &Options, path: &Path, scan_all: bool) -> u8 {
     match job::inspect_path(path, scan_all, &options.limits) {
         Ok(report) => {
-            let code = report_exit_code(&report, false);
+            // A recovery that ran and produced a suspect image is exactly what
+            // `--strict-integrity` asks about, so it applies here too.
+            let code = report_exit_code(&report, options.strict_integrity);
             if options.machine {
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
@@ -395,10 +394,13 @@ fn print_help() {
     );
     println!(
         "  inspect PATH\n\
-         \x20              detect only. Reports what each input is, whether it is\n\
-         \x20              recognized, and which recovery routes would be tried.\n\
-         \x20              Never recovers, never writes an output, never creates a log,\n\
-         \x20              and never claims a route succeeded or a check passed."
+         \x20              run the real static recovery for research, and report\n\
+         \x20              everything observed: recognition evidence, each route\n\
+         \x20              tried and why it was rejected, the route selected, the\n\
+         \x20              static check's verdict, and the engines' own structural\n\
+         \x20              evidence (protected-header fields, seeds, module records,\n\
+         \x20              restored-image facts). Nothing is kept: no output file,\n\
+         \x20              no log, no temporary tree, and the input is never run."
     );
     println!("  unpack PATH  detection and recovery; writes outputs (the default).");
     println!(
@@ -423,7 +425,9 @@ fn print_help() {
          \x20              exit non-zero when any output fails the static integrity\n\
          \x20              check (a suspect) or a file errors. Off by default: a\n\
          \x20              suspect is still written and the process exits 0 unless\n\
-         \x20              a file errors. Quiet levels are unchanged."
+         \x20              a file errors. Quiet levels are unchanged.\n\
+         \x20              With 'inspect', the check applies to the image actually\n\
+         \x20              recovered for research; no output file is retained."
     );
     let defaults = ResourceLimits::default();
     println!(
@@ -638,14 +642,20 @@ mod command_line {
     }
 
     #[test]
-    fn inspect_rejects_recovery_only_flags() {
+    fn inspect_rejects_writing_flags() {
         assert!(parse(&["inspect", "--out", "o", "app.exe"]).is_err());
         assert!(parse(&["inspect", "--dry-run", "app.exe"]).is_err());
-        assert!(parse(&["inspect", "--strict-integrity", "app.exe"]).is_err());
         assert_eq!(
             parse(&["inspect", "--json", "a"]).unwrap().command,
             Command::Inspect
         );
+    }
+
+    /// Inspection runs the real static check, so asking it to be strict about
+    /// that verdict is meaningful, not contradictory.
+    #[test]
+    fn inspect_accepts_strict_integrity() {
+        assert!(parse(&["inspect", "--strict-integrity", "app.exe"]).is_ok());
     }
 
     #[test]

@@ -12,9 +12,11 @@
 //!   only where a stage was measured (`None` otherwise); hashes are taken from
 //!   the bytes that were actually produced; a route is only marked selected if
 //!   a pipeline accepted it.
-//! * Inspection never claims recovery. An [`Mode::Inspect`] run reports
-//!   recognition and the planned routes, never `selected`, `recovered`, or a
-//!   static-validation verdict.
+//! * Research inspection retains no output files. An [`Mode::Inspect`] run may
+//!   perform full static recovery to discover parameters, but selected routes,
+//!   recovered identities and validation verdicts come only from actual work.
+//!   Parsed input facts, bounded probe candidates and recovery traces stay
+//!   separate so local plausibility is never mistaken for a recovery verdict.
 //!
 //! A container (`.apk`/`.apks`/`.xapk`) is reported as one input with
 //! [`Role::Container`]: its manifest inventory is listed separately from the
@@ -32,6 +34,8 @@ use senbei_engine::{
     RecoveryStatus, ValidationStatus,
 };
 
+mod text;
+
 /// Version of the serialized [`Report`] schema.
 pub const REPORT_FORMAT_VERSION: u32 = 1;
 
@@ -39,7 +43,7 @@ pub const REPORT_FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// Detection only: no recovery, no output, no log.
+    /// Research analysis, including static recovery; retain no output or log.
     Inspect,
     /// Restore and write outputs.
     Unpack,
@@ -65,8 +69,8 @@ pub enum InputStatus {
     Ok,
     /// Produced output that fails the static integrity check.
     Suspect,
-    /// Inspection recognized a protected target. Nothing was recovered, so
-    /// this is never counted as an output.
+    /// Inspection recognized a protected target. Its profile separately records
+    /// whether static recovery succeeded; no output file is retained.
     Recognized,
     /// Not a target, already handled, or a layout this build does not know.
     Skipped,
@@ -208,6 +212,37 @@ pub struct CompanionReport {
     pub state: CompanionState,
     pub path: Option<String>,
     pub detail: Option<String>,
+    /// Identity of the physical companion, distinct from the spliced view.
+    pub source: Option<Digest>,
+}
+
+/// Which bytes the research report's input offsets address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchInputView {
+    Original,
+    /// The loader's header page followed by its matching external payload.
+    SplicedCompanion,
+}
+
+/// Structural observations and actual static-recovery discoveries for a PE.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WindowsResearchReport {
+    pub input_view: ResearchInputView,
+    pub input: senbei_engine::windows::WindowsInspection,
+    /// The post-overlay image, inspected before its bytes were discarded.
+    pub restored: Option<senbei_engine::windows::WindowsInspection>,
+    pub trace: senbei_engine::windows::ResearchTrace,
+}
+
+/// Existing Android engine reports captured from the actual static pipeline.
+///
+/// The nested schemas belong to the extraction/restoration engines. Temporary
+/// output locations are replaced with logical labels by the I/O adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AndroidResearchReport {
+    pub extraction: serde_json::Value,
+    pub restoration: Option<serde_json::Value>,
 }
 
 /// One manifest parsed from a container.
@@ -271,11 +306,14 @@ pub struct EntryReport {
     /// Source label, e.g. `base.apk::lib/arm64-v8a/libil2cpp.so`.
     pub name: String,
     pub status: EntryStatus,
+    pub analysis_incomplete: bool,
     pub kind: Option<EntryKind>,
     /// Route selected for this entry, when one was.
     pub layout: Option<LayoutKind>,
     pub metadata_version: Option<u32>,
     pub remapped: Option<usize>,
+    pub android_research: Option<AndroidResearchReport>,
+    pub metadata_research: Option<serde_json::Value>,
     /// Libraries whose decoded module was paired with this metadata entry.
     pub provenance: Vec<String>,
     /// Where the restored bytes were written (absent in dry-run/inspect).
@@ -289,10 +327,13 @@ impl EntryReport {
         Self {
             name: name.into(),
             status,
+            analysis_incomplete: false,
             kind: None,
             layout: None,
             metadata_version: None,
             remapped: None,
+            android_research: None,
+            metadata_research: None,
             provenance: Vec::new(),
             output: None,
             warnings: Vec::new(),
@@ -307,6 +348,14 @@ pub struct InputReport {
     pub path: String,
     pub role: Role,
     pub status: InputStatus,
+    /// I/O, resource limits or infrastructure prevented the requested analysis.
+    /// A rejected recovery candidate alone does not set this flag.
+    pub analysis_incomplete: bool,
+    /// Identity of the physical input, never of a synthetic spliced view.
+    pub source: Option<Digest>,
+    pub research: Option<WindowsResearchReport>,
+    pub android_research: Option<AndroidResearchReport>,
+    pub metadata_research: Option<serde_json::Value>,
     /// Engine profile: recognition evidence, candidate routes, and — only when
     /// recovery actually ran — the selected route and static-validation verdict.
     pub profile: Option<ProtectionProfile>,
@@ -335,6 +384,11 @@ impl InputReport {
             path: path.display().to_string(),
             role,
             status: InputStatus::Skipped,
+            analysis_incomplete: false,
+            source: None,
+            research: None,
+            android_research: None,
+            metadata_research: None,
             profile: None,
             companion: None,
             container: None,
@@ -367,8 +421,8 @@ pub struct SummaryReport {
     pub inputs: usize,
     /// Inputs that produced output.
     pub recovered: usize,
-    /// Inputs whose protection was recognized. Only an `inspect` run fills
-    /// this: it is detection evidence, never a recovery claim.
+    /// Inputs whose protection was recognized during research inspection.
+    /// This count is independent of whether their static recovery succeeded.
     pub recognized: usize,
     /// Inputs that were not targets or were left untouched.
     pub skipped: usize,
@@ -431,8 +485,17 @@ impl Report {
     /// Human-readable rendering, one block per input, for non-`--json` runs.
     pub fn render_text(&self) -> String {
         let mut text = String::new();
+        if let Some(scan) = self.scan {
+            text.push_str(&format!(
+                "scan: {} probed non-targets · {} walk errors · {} probe errors\n",
+                scan.non_target_skipped, scan.walk_errors, scan.probe_errors
+            ));
+            if scan.walk_errors > 0 || scan.probe_errors > 0 {
+                text.push_str("warning: analysis is incomplete; some directory entries or selected files could not be examined\n");
+            }
+        }
         for input in &self.inputs {
-            text.push_str(&render_input(input));
+            text.push_str(&text::render_input(input));
         }
         if !self.errors.is_empty() {
             for error in &self.errors {
@@ -440,93 +503,6 @@ impl Report {
             }
         }
         text
-    }
-}
-
-fn render_input(input: &InputReport) -> String {
-    let mut text = format!("{}\n", input.path);
-    text.push_str(&format!("  role: {:?}\n", input.role));
-    if let Some(profile) = &input.profile {
-        text.push_str(&format!("  recognition: {:?}\n", profile.recognition));
-        if !profile.evidence.is_empty() {
-            text.push_str(&format!("  evidence: {:?}\n", profile.evidence));
-        }
-        for candidate in &profile.candidates {
-            let mut line = format!(
-                "  route {}: {:?}",
-                layout_name(candidate.layout),
-                candidate.outcome
-            );
-            if !candidate.errors.is_empty() {
-                line.push_str(&format!(" ({})", candidate.errors.join("; ")));
-            }
-            text.push_str(&line);
-            text.push('\n');
-        }
-        if let Some(selected) = profile.selected {
-            text.push_str(&format!("  selected: {:?}\n", layout_name(selected)));
-        }
-        text.push_str(&format!("  recovery: {:?}\n", profile.recovery));
-        text.push_str(&format!(
-            "  static validation: {:?}\n",
-            profile.static_validation
-        ));
-    }
-    if let Some(metadata) = &input.metadata {
-        text.push_str(&format!(
-            "  metadata: version {} ({:?}, capabilities {:?})\n",
-            metadata.raw_version, metadata.layout, metadata.capabilities
-        ));
-    }
-    if let Some(container) = &input.container {
-        text.push_str(&format!(
-            "  container: {} · {} entries · {} manifests\n",
-            container.kind,
-            container.entry_count,
-            container.manifests.len()
-        ));
-        for manifest in &container.manifests {
-            text.push_str(&format!(
-                "    manifest {} → {} {}\n",
-                manifest.source,
-                manifest.package.as_deref().unwrap_or("<unnamed>"),
-                manifest.version.as_deref().unwrap_or("")
-            ));
-        }
-        for entry in &container.candidate_entries {
-            text.push_str(&format!("    candidate {entry}\n"));
-        }
-    }
-    for entry in &input.entries {
-        text.push_str(&format!(
-            "  entry {}: {:?}{}\n",
-            entry.name,
-            entry.status,
-            entry
-                .output
-                .as_ref()
-                .map(|output| format!(" -> {}", output.path))
-                .unwrap_or_default()
-        ));
-    }
-    if let Some(recovered) = &input.recovered {
-        text.push_str(&format!(
-            "  recovered: {} bytes · {}\n",
-            recovered.size, recovered.sha256
-        ));
-    }
-    text.push_str(&format!("  status: {:?}\n", input.status));
-    text
-}
-
-fn layout_name(layout: LayoutKind) -> &'static str {
-    match layout {
-        LayoutKind::Dll => "dll",
-        LayoutKind::ExeStyle => "exe_style",
-        LayoutKind::AndroidStaged => "android_staged",
-        LayoutKind::MetadataStructural => "metadata_structural",
-        LayoutKind::MetadataSeeded => "metadata_seeded",
-        LayoutKind::MetadataMethodIndices => "metadata_method_indices",
     }
 }
 
@@ -556,16 +532,37 @@ impl Collector {
         self.mode
     }
 
-    /// Record the folder scan tallies for a folder run.
+    /// Record scan tallies and keep unexamined inputs visible to exit policies.
     pub fn set_scan(&mut self, scan: ScanReport) {
+        let previous = self
+            .scan
+            .map_or(0, |scan| scan.walk_errors.saturating_add(scan.probe_errors));
+        let failed = scan.walk_errors.saturating_add(scan.probe_errors);
+        self.summary.errors = self
+            .summary
+            .errors
+            .saturating_sub(previous)
+            .saturating_add(failed);
         self.scan = Some(scan);
     }
 
     /// Record one finished input and fold its status into the summary.
     pub fn push(&mut self, mut input: InputReport) {
-        if self.mode == Mode::DryRun {
-            // Nothing produced by a dry run is retained, so no output file may
-            // be reported. The attempt itself keeps its real outcome.
+        if self.mode == Mode::Inspect
+            && (input.analysis_incomplete
+                || input.entries.iter().any(|entry| entry.analysis_incomplete))
+        {
+            input.analysis_incomplete = true;
+            input.status = InputStatus::Error;
+        }
+        if matches!(self.mode, Mode::DryRun | Mode::Inspect) {
+            // Research inspection and dry runs keep their actual recovery
+            // outcomes, but never advertise temporary artifacts as outputs.
+            let discarded = if self.mode == Mode::Inspect {
+                "research inspection: no output file was retained"
+            } else {
+                "dry run: the produced output was discarded"
+            };
             if !input.outputs.is_empty() {
                 // The produced byte count is a real result of the attempt even
                 // though the file itself is not kept. A hash is only carried
@@ -582,8 +579,7 @@ impl Collector {
                 for stage in &mut input.stages {
                     if stage.stage == Stage::OutputWrite {
                         stage.status = StageStatus::Skipped;
-                        stage.detail =
-                            Some("dry run: the produced output was discarded".to_owned());
+                        stage.detail = Some(discarded.to_owned());
                     }
                 }
                 if !input
@@ -593,7 +589,7 @@ impl Collector {
                 {
                     input.stages.push(
                         StageReport::new(Stage::OutputWrite, StageStatus::Skipped)
-                            .detail("dry run: the produced output was discarded"),
+                            .detail(discarded),
                     );
                 }
                 input.outputs.clear();
@@ -609,7 +605,22 @@ impl Collector {
                 self.summary.recovered += 1;
                 self.summary.suspect += 1;
             }
-            InputStatus::Recognized => self.summary.recognized += 1,
+            InputStatus::Recognized => {
+                self.summary.recognized += 1;
+                if self.mode == Mode::Inspect
+                    && let Some(profile) = &input.profile
+                {
+                    if profile.recovery == RecoveryStatus::Succeeded {
+                        self.summary.recovered += 1;
+                    }
+                    if matches!(
+                        profile.static_validation,
+                        ValidationStatus::Warnings | ValidationStatus::Failed
+                    ) {
+                        self.summary.suspect += 1;
+                    }
+                }
+            }
             InputStatus::Skipped => self.summary.skipped += 1,
             InputStatus::Error => self.summary.errors += 1,
         }
@@ -813,6 +824,95 @@ mod tests {
         assert_eq!(report.summary.errors, 1);
         assert_eq!(report.summary.skipped, 1);
         assert_eq!(report.summary.recovered, 0);
+    }
+
+    #[test]
+    fn research_counts_actual_recovery_and_suspect_without_retaining_output_paths() {
+        let mut input = sample_input(InputStatus::Recognized);
+        let mut profile =
+            ProtectionProfile::new(senbei_engine::ObservedTarget::windows(None, None));
+        profile.recognition = RecognitionStatus::Recognized;
+        profile.recovery = RecoveryStatus::Succeeded;
+        profile.static_validation = ValidationStatus::Warnings;
+        input.profile = Some(profile);
+        input.outputs.push(OutputFile::from_bytes(
+            Path::new("temporary/image.exe"),
+            b"bytes",
+        ));
+        let mut collector = Collector::new(Mode::Inspect);
+        collector.push(input);
+        let report = collector.finish();
+        assert_eq!(report.summary.recognized, 1);
+        assert_eq!(report.summary.recovered, 1);
+        assert_eq!(report.summary.suspect, 1);
+        assert_eq!(report.summary.errors, 0);
+        assert!(report.inputs[0].outputs.is_empty());
+        assert!(!report.to_json().contains("temporary/image.exe"));
+        assert!(
+            report.inputs[0]
+                .stages
+                .iter()
+                .any(|stage| stage.stage == Stage::OutputWrite
+                    && stage.status == StageStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn research_recovery_failure_is_a_finding_not_a_read_failure() {
+        let mut input = sample_input(InputStatus::Recognized);
+        let mut profile =
+            ProtectionProfile::new(senbei_engine::ObservedTarget::windows(None, None));
+        profile.recognition = RecognitionStatus::Recognized;
+        profile.recovery = RecoveryStatus::Failed;
+        profile.push_error("no candidate validated");
+        input.profile = Some(profile);
+        let mut collector = Collector::new(Mode::Inspect);
+        collector.push(input);
+        let report = collector.finish();
+        assert_eq!(report.summary.recognized, 1);
+        assert_eq!(report.summary.recovered, 0);
+        assert_eq!(report.summary.errors, 0);
+        assert!(report.render_text().contains("no candidate validated"));
+    }
+
+    #[test]
+    fn incomplete_research_cannot_be_hidden_by_a_recognized_status() {
+        let mut input = sample_input(InputStatus::Recognized);
+        let mut entry = EntryReport::new("package::library.so", EntryStatus::Error);
+        entry.analysis_incomplete = true;
+        entry
+            .errors
+            .push("resource ceiling prevented restoration".to_owned());
+        input.entries.push(entry);
+        let mut collector = Collector::new(Mode::Inspect);
+        collector.push(input);
+        let report = collector.finish();
+        assert_eq!(report.summary.errors, 1);
+        assert_eq!(report.inputs[0].status, InputStatus::Error);
+        assert!(report.inputs[0].analysis_incomplete);
+        assert!(report.render_text().contains("analysis incomplete"));
+    }
+
+    #[test]
+    fn scan_failures_fail_report_only_modes_and_do_not_erase_input_errors() {
+        for mode in [Mode::Inspect, Mode::DryRun] {
+            let mut collector = Collector::new(mode);
+            collector.push(sample_input(InputStatus::Error));
+            collector.set_scan(ScanReport {
+                walk_errors: 2,
+                probe_errors: 3,
+                non_target_skipped: 4,
+            });
+            assert_eq!(collector.summary.errors, 6);
+            collector.set_scan(ScanReport {
+                walk_errors: 1,
+                ..ScanReport::default()
+            });
+            let report = collector.finish();
+            assert_eq!(report.summary.errors, 2);
+            assert!(report.render_text().contains("analysis is incomplete"));
+            assert!(report.render_text().contains("1 walk errors"));
+        }
     }
 
     #[test]

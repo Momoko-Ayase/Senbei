@@ -3,9 +3,11 @@
 pub mod dll;
 mod error;
 pub mod exe;
+mod inspect;
 pub mod integrity;
 mod layout;
 pub(crate) mod parallel;
+pub mod research;
 
 use senbei_crypto::primitives;
 use serde::Serialize;
@@ -15,6 +17,7 @@ use crate::profile::{
     ProtectionProfile, RecognitionStatus, RecoveryStatus, TargetFormat,
 };
 use integrity::IntegritySeverity as ProfileSeverity;
+use research::emit_text;
 
 pub(crate) use crate::panic_capture::{PanicCapture, current_panic_capture, with_panic_capture};
 
@@ -22,8 +25,20 @@ pub use crate::thread_cap;
 pub use dll::{unpack_dll, unpack_dll_v};
 pub use error::*;
 pub use exe::{unpack as unpack_exe, unpack_v as unpack_exe_v};
+pub use inspect::{
+    CandidateField, CandidateStatus, DeclaredPayload, DirectoryInspection, DirectoryMapping,
+    DiscoveryReport, FileRegion, FileRegionKind, FlagField, HeaderWord, HeaderWordSemantic,
+    InspectionIssue, InspectionLimits, InspectionSeverity, InspectionWork, NamedFlag, PayloadCheck,
+    PeInspection, PrefixProbe, ProbeOutcome, ProtectionInspection, SectionAnomaly,
+    SectionAnomalyKind, SectionBacking, SectionInspection, SectionPermissions, ShellCandidate,
+    ShellCandidateKind, WindowsInspection,
+};
 pub use integrity::{
     IntegrityFinding, IntegrityReport, IntegritySeverity, check as check_integrity,
+};
+pub use research::{
+    AddressSpace, ResearchEvent, ResearchStage, ResearchTrace, TraceAddress, TraceValue,
+    with_research_trace, with_research_trace_limited,
 };
 
 /// Maximum plausible PE `SizeOfImage` we are willing to allocate a zero buffer
@@ -219,6 +234,25 @@ pub fn inspect_profile(input: &[u8]) -> ProtectionProfile {
     inspect_detected(input, detected)
 }
 
+/// Rich, read-only research inspection of a Windows input.
+///
+/// Reports the PE container, the decoded protection header, the declared
+/// payload with in-bounds results, and a bounded scratch-only probe for real
+/// shell structures. It never allocates `SizeOfImage`, runs a recovery stage,
+/// or executes the input; facts that only later stages expose are reported as
+/// unavailable by the probe. Malformed input still returns a partial result.
+#[must_use]
+pub fn inspect_research(input: &[u8]) -> WindowsInspection {
+    inspect_research_with_limits(input, &InspectionLimits::default())
+}
+
+/// [`inspect_research`] with explicit work limits (scratch budget, candidate
+/// cap, issue cap). Tests and fuzzing use this to prove the bounds.
+#[must_use]
+pub fn inspect_research_with_limits(input: &[u8], limits: &InspectionLimits) -> WindowsInspection {
+    inspect::inspect(input, limits)
+}
+
 fn inspect_detected(input: &[u8], detected: Option<Detected>) -> ProtectionProfile {
     let mut profile = ProtectionProfile::new(ObservedTarget::windows(
         pe_target_format(input),
@@ -326,6 +360,7 @@ fn run_exe_attempt(
     input: &[u8],
     verbose: bool,
 ) -> Result<Vec<u8>, UnpackError> {
+    emit_text(ResearchStage::Header, "route", "exe_style");
     match exe::unpack_v(input, verbose) {
         Ok(out) => {
             let report = integrity::check(&out);
@@ -339,9 +374,11 @@ fn run_exe_attempt(
             profile.selected = Some(LayoutKind::ExeStyle);
             profile.recovery = RecoveryStatus::Succeeded;
             profile.record_static_validation(&report);
+            emit_text(ResearchStage::Finalize, "candidate_outcome", "accepted");
             Ok(out)
         }
         Err(error) => {
+            emit_text(ResearchStage::Finalize, "candidate_outcome", "failed");
             profile.record_attempt(
                 LayoutKind::ExeStyle,
                 AttemptOutcome::Failed,
@@ -369,19 +406,25 @@ where
     D: FnOnce() -> Result<Vec<u8>, UnpackError>,
     E: FnOnce() -> Result<Vec<u8>, UnpackError>,
 {
+    emit_text(ResearchStage::Header, "route", "dll");
     match accept_dll_layout(dll_layout()) {
         Ok((output, report)) => {
+            emit_text(ResearchStage::Finalize, "candidate_outcome", "accepted");
             record_accepted(profile, LayoutKind::Dll, report);
             Ok(output)
         }
         Err(dll) => {
+            emit_text(ResearchStage::Finalize, "candidate_outcome", "rejected");
             record_rejected(profile, LayoutKind::Dll, &dll);
+            emit_text(ResearchStage::Header, "route", "exe_style");
             match accept_dll_layout(exe_layout()) {
                 Ok((output, report)) => {
+                    emit_text(ResearchStage::Finalize, "candidate_outcome", "accepted");
                     record_accepted(profile, LayoutKind::ExeStyle, report);
                     Ok(output)
                 }
                 Err(exe) => {
+                    emit_text(ResearchStage::Finalize, "candidate_outcome", "rejected");
                     record_rejected(profile, LayoutKind::ExeStyle, &exe);
                     profile.recovery = RecoveryStatus::Failed;
                     let error = UnpackError::PipelineFallbackFailed {
@@ -1023,6 +1066,79 @@ mod dll_layout_selection {
         data[4096..4100].copy_from_slice(&key0.to_le_bytes());
         data[4100..4104].copy_from_slice(&cell.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn research_trace_records_route_and_outcome_for_profiled_routing() {
+        let dll_image = valid_native_dll();
+        let exe_image = valid_native_dll();
+        let (trace, result) = with_research_trace(|| {
+            let mut profile = ProtectionProfile::new(ObservedTarget::windows(
+                Some(TargetFormat::Pe32Plus),
+                Some(Kind::NativeDll),
+            ));
+            profile.recognition = RecognitionStatus::Recognized;
+            profile.candidates = planned_routes(Kind::NativeDll);
+            let result = select_dll_layout_profiled(
+                &mut profile,
+                || Ok(dll_image.clone()),
+                || Ok(exe_image.clone()),
+            );
+            (profile, result)
+        });
+        let (profile, result) = result;
+        assert!(result.is_ok());
+        assert_eq!(profile.selected, Some(LayoutKind::Dll));
+        let routes: Vec<&str> = trace
+            .events
+            .iter()
+            .filter(|event| event.name == "route")
+            .map(|event| match &event.value {
+                TraceValue::Text(text) => text.as_str(),
+                other => panic!("route must be text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(routes, ["dll"]);
+        let outcomes: Vec<&str> = trace
+            .events
+            .iter()
+            .filter(|event| event.name == "candidate_outcome")
+            .map(|event| match &event.value {
+                TraceValue::Text(text) => text.as_str(),
+                other => panic!("outcome must be text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(outcomes, ["accepted"]);
+        assert!(
+            trace
+                .events
+                .iter()
+                .all(|event| event.stage == ResearchStage::Header
+                    || event.stage == ResearchStage::Finalize)
+        );
+    }
+
+    #[test]
+    fn research_trace_is_absent_after_a_panicking_scope() {
+        let (trace, ()) = with_research_trace(|| {
+            let caught = crate::catch_unwind_quiet(|| {
+                with_research_trace(|| panic!("scoped panic"));
+            });
+            assert!(caught.is_err());
+            // The inner scope's sink is gone; the outer one is active again, so
+            // this event belongs to the outer trace.
+            assert!(crate::windows::research::trace_enabled());
+            emit_text(ResearchStage::Finalize, "outer", "still traced");
+        });
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .map(|event| event.name)
+                .collect::<Vec<_>>(),
+            ["outer"]
+        );
+        assert!(!crate::windows::research::trace_enabled());
     }
 
     #[test]

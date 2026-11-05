@@ -16,8 +16,10 @@ pub use profile::{
 pub use threading::{thread_cap, with_thread_cap};
 
 pub use windows::{
-    Detected, IntegrityFinding, IntegrityReport, IntegritySeverity, Kind, UnpackError,
-    check_integrity, detect, inspect_profile, unpack_auto, unpack_auto_profiled,
-    unpack_auto_profiled_v, unpack_auto_v, unpack_dll, unpack_dll_v, unpack_exe,
-    unpack_exe_profiled, unpack_exe_profiled_v, unpack_exe_v,
+    AddressSpace, Detected, InspectionLimits, IntegrityFinding, IntegrityReport, IntegritySeverity,
+    Kind, ResearchEvent, ResearchStage, ResearchTrace, TraceAddress, TraceValue, UnpackError,
+    WindowsInspection, check_integrity, detect, inspect_profile, inspect_research,
+    inspect_research_with_limits, unpack_auto, unpack_auto_profiled, unpack_auto_profiled_v,
+    unpack_auto_v, unpack_dll, unpack_dll_v, unpack_exe, unpack_exe_profiled,
+    unpack_exe_profiled_v, unpack_exe_v, with_research_trace, with_research_trace_limited,
 };

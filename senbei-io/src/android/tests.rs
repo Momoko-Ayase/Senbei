@@ -36,6 +36,7 @@ impl LibraryRestorer for ScriptedRestorer {
             // A scripted restore has no engine report behind it, so it claims
             // no validation verdict at all.
             validation: None,
+            research: None,
         })
     }
 
@@ -1348,4 +1349,243 @@ fn scripted_restore_claims_no_validation_verdict() {
         outcome.validation.is_none(),
         "a restorer without a report must not claim a clean verdict"
     );
+}
+
+/// Research keeps what the transform actually did: the route, the seeds tried,
+/// and the engine's own counters. Ordinary runs keep none of it.
+#[test]
+fn metadata_research_reports_the_route_that_ran() {
+    let data = metadata_fixture();
+
+    let (_, _, layout, research) = restore_metadata_with_module(&data, None, true).unwrap();
+    let research = research.expect("research mode keeps the transform's facts");
+    assert_eq!(research["version"], 31);
+    // The fixture has no seeded permutation to find, so the measured route is
+    // the structural remap — and the research names the route that actually ran.
+    assert_eq!(research["route"], "structural");
+    assert!(research["tried_seeds"].as_array().is_some());
+    assert!(research["report"].is_object(), "{research}");
+    assert!(research["error"].is_null());
+    assert_eq!(
+        research["module_0c_sha256"],
+        serde_json::Value::Null,
+        "no module was offered for this blob"
+    );
+    // The layout the transform reported is the one the research names.
+    let (_, _, quiet_layout, quiet) = restore_metadata_with_module(&data, None, false).unwrap();
+    assert!(quiet.is_none(), "an ordinary run keeps no research value");
+    assert_eq!(quiet_layout, layout);
+}
+
+/// A failed transform still reports the seeds it tried and why it stopped.
+#[test]
+fn metadata_research_survives_a_failed_transform() {
+    // A v24.1 header with no module 0x0C: the binding itself fails, before any
+    // transform could run.
+    let mut data = metadata_fixture();
+    data[4..8].copy_from_slice(&24u32.to_le_bytes());
+
+    let error = restore_metadata_with_module(&data, None, true).unwrap_err();
+    let capture = error_research(&error).expect("the failure carries its research");
+    let ResearchCapture::Metadata(value) = capture else {
+        panic!("a metadata failure carries metadata research");
+    };
+    assert_eq!(value["route"], "method_indices");
+    assert_eq!(value["version"], 24);
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("0x0C")),
+        "the reason is kept: {value}"
+    );
+    // An ordinary run fails the same way, just without the research value.
+    let quiet = restore_metadata_with_module(&data, None, false).unwrap_err();
+    assert!(error_research(&quiet).is_none());
+}
+
+/// A library restore that fails after extraction keeps the extraction's own
+/// report, so the research output says how far it got.
+#[test]
+fn a_failed_library_restore_keeps_what_extraction_reported() {
+    let report = crate::report::AndroidResearchReport {
+        extraction: serde_json::json!({"stage1": {"payload_key": 0x1234}, "streams": []}),
+        restoration: None,
+    };
+    let error = crate::android::capture_for_tests(
+        anyhow::anyhow!("baseline restore failed"),
+        Some(ResearchCapture::Library(report.clone())),
+    );
+    let capture = error_research(&error).expect("the failure carries its research");
+    let ResearchCapture::Library(kept) = capture else {
+        panic!("a library failure carries library research");
+    };
+    assert_eq!(kept.extraction, report.extraction);
+    assert!(
+        kept.restoration.is_none(),
+        "no restoration report exists for a restore that failed"
+    );
+    // The original failure is still the error's message.
+    assert!(format!("{error:#}").contains("baseline restore failed"));
+}
+
+/// A split set is restored with output paths computed by the caller. An
+/// absolute relative path would make `Path::join` discard the output root and
+/// escape it — precisely what a dry run/inspection must never do.
+#[test]
+fn a_split_set_never_writes_outside_the_output_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.arm64_v8a.apk");
+    let base = root.join("base.apk");
+    let module_data = pair(3).1;
+    write_package(
+        &config,
+        &[
+            (
+                "AndroidManifest.xml",
+                manifest("com.example.split", "7").as_bytes(),
+            ),
+            ("lib/arm64-v8a/libil2cpp.so", &library_bytes(b"split-so")),
+        ],
+    );
+    write_package(
+        &base,
+        &[
+            (
+                "AndroidManifest.xml",
+                manifest("com.example.split", "7").as_bytes(),
+            ),
+            ("assets/global-metadata.dat", &pair(3).0),
+        ],
+    );
+    assert_eq!(
+        loose_apk_groups(&[base.clone(), config.clone()]).len(),
+        1,
+        "same package and version form one split set"
+    );
+
+    let out = temp.path().join("workspace");
+    let rels: Vec<PathBuf> = [&base, &config]
+        .iter()
+        .map(|package| package.strip_prefix(&root).unwrap().to_path_buf())
+        .collect();
+    let members: Vec<(&Path, &Path)> = [&base, &config]
+        .iter()
+        .map(|package| package.as_path())
+        .zip(rels.iter().map(|rel| rel.as_path()))
+        .collect();
+    let mut cache = run_cache_for_research(&senbei_engine::android::ResourceLimits::default());
+    let results = restore_apk_group(&members, &out, &mut cache, false);
+    assert!(results.is_ok(), "synthetic split set restores: {results:?}");
+
+    for rel in &rels {
+        assert!(!rel.is_absolute(), "relative paths stay relative: {rel:?}");
+        assert!(
+            out.join(rel).starts_with(&out),
+            "every output stays under the workspace"
+        );
+    }
+    let written: Vec<PathBuf> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path != &root && path != &out)
+        .collect();
+    assert!(
+        written.is_empty(),
+        "nothing appears beside the workspace: {written:?}"
+    );
+    let _ = module_data;
+}
+
+/// A caller cannot hand the group restore an absolute "relative" path by
+/// accident through this API: it takes explicit pairs, and the folder driver
+/// builds them with the same helper the rest of the run uses. This pins the
+/// shape so a future refactor cannot reintroduce the `strip_prefix(..).unwrap_or`
+/// fallback that made `Path::join` discard the output root.
+#[test]
+fn the_group_restore_never_derives_its_own_relative_path() {
+    let source = include_str!("mod.rs");
+    let signature = source
+        .split("pub(crate) fn restore_apk_group(")
+        .nth(1)
+        .unwrap();
+    let head = signature
+        .split(") -> Result<Vec<EntryOutcome>>")
+        .next()
+        .unwrap();
+    assert!(
+        head.contains("members: &[(&Path, &Path)]"),
+        "the group restore receives caller-computed relative paths: {head}"
+    );
+    assert!(
+        !source.contains("strip_prefix(root).unwrap_or(package)"),
+        "the absolute-path fallback must not come back"
+    );
+}
+
+/// A restorer that fails with a resource ceiling, as the production one does
+/// when an entry exceeds `--max-entry-mib`.
+struct LimitedRestorer;
+
+impl LibraryRestorer for LimitedRestorer {
+    fn restore(
+        &mut self,
+        _input: &Path,
+        _dest: &Path,
+        _verbose: bool,
+    ) -> anyhow::Result<RestoredLibrary> {
+        Err(anyhow::Error::new(
+            senbei_engine::android::LimitExceeded::Entry {
+                requested: 4 * 1024 * 1024,
+                limit: 1024 * 1024,
+            },
+        ))
+    }
+
+    fn protected_override(&mut self, input: &Path) -> Option<Vec<u8>> {
+        std::fs::read(input).ok()
+    }
+}
+
+/// A known target whose restore stopped on a resource ceiling is an error the
+/// report can name — it is not "recognized, therefore complete". The status and
+/// the cause come from the typed error, never from its message text.
+#[test]
+fn a_known_library_that_hits_a_ceiling_is_reported_incomplete() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("lib/arm64-v8a")).unwrap();
+    let so = app.join("lib/arm64-v8a/libil2cpp.so");
+    std::fs::write(&so, library_bytes(b"over-limit")).unwrap();
+
+    let mut cache = run_cache();
+    let scoped = loose_scopes(std::slice::from_ref(&so), &[]);
+    let mut restorer = LimitedRestorer;
+    let outcome = restore_loose_library_with(
+        &so,
+        &root.join("out.so"),
+        "libil2cpp.so",
+        &scoped[0].key,
+        false,
+        &mut cache,
+        &mut restorer,
+    )
+    .unwrap();
+
+    let EntryStatus::Failed(error) = &outcome.status else {
+        panic!("the ceiling must fail the restore: {:?}", outcome.status);
+    };
+    assert!(
+        crate::job::analysis_incomplete(error),
+        "a LimitExceeded failure is infrastructure, not a rejected layout"
+    );
+    let report = crate::job::android_library_input(
+        &so,
+        crate::report::InputStatus::Error,
+        &root.join("out.so"),
+        std::time::Instant::now(),
+    );
+    assert_eq!(report.status, crate::report::InputStatus::Error);
 }

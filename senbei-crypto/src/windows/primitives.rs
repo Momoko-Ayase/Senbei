@@ -899,6 +899,39 @@ pub fn decrypt_data1(file_data: &[u8], info: &mut [u32; 8]) {
     }
 }
 
+/// Prefix decoder shared by the payload loader and research inspection.
+///
+/// Decodes `size` bytes from `input` at `source` into `dst` at `dst_offset`
+/// with the file-key recurrence used by the protected payload's first zone.
+/// `dst` is not resized and must already cover
+/// `dst_offset..dst_offset + size`; the caller owns every bound and every
+/// allocation decision. Only complete words are decoded; an unaligned tail
+/// is left untouched, matching the payload loader's original loop.
+///
+/// Writing into a caller-supplied slice (rather than allocating a whole
+/// `SizeOfImage` image) is what lets inspection decode a bounded prefix with
+/// exactly the same arithmetic the recovery pipeline uses.
+pub fn decode_payload_prefix(
+    input: &[u8],
+    source: u32,
+    dst: &mut [u8],
+    dst_offset: u32,
+    key0: u32,
+    size: u32,
+) {
+    // Whole words only, matching the original `decrypt_size >> 2` loop: an
+    // unaligned size decodes its floor of words and leaves the tail alone.
+    // No debug assertion — a malformed header must not panic in any build.
+    let mut key = key0.wrapping_add(!size);
+    let words = size >> 2;
+    for i in 0..words {
+        let off = i.wrapping_mul(4);
+        let cell = get_u32(input, source.wrapping_add(off));
+        write_u32(dst, dst_offset.wrapping_add(off), key ^ cell);
+        key = i.wrapping_mul(i) ^ (key.wrapping_add(cell).wrapping_add(i));
+    }
+}
+
 /// decrypt_data6: LFSR XOR decryption of a bytecode block at `pos` in `d`.
 /// The block length is read from `d[pos + 95]`.
 pub fn decrypt_data6(d: &mut [u8], pos: u32) {
@@ -1129,5 +1162,72 @@ mod tests {
                 buffer_len: 590_896,
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod prefix_decoder_tests {
+    use super::*;
+
+    /// The shared decoder must reproduce the original inline recurrence byte
+    /// for byte. This is the regression guard for factoring `decrypt_data2`.
+    #[test]
+    fn shared_prefix_decoder_matches_inline_recurrence() {
+        for (key0, size, dst_offset) in [
+            (0u32, 64u32, 0u32),
+            (0x24F9_9AD4, 0x100, 0x1000),
+            (u32::MAX, 0x3FFC, 0xBF8000),
+        ] {
+            let words = (size / 4) as usize;
+            let input: Vec<u8> = (0..words * 4).map(|i| (i * 37 + 11) as u8).collect();
+            let total = dst_offset as u64 + size as u64;
+            assert!(total <= 0x1000_0000);
+            let mut got = vec![0u8; total as usize];
+
+            let mut k = key0.wrapping_add(!size);
+            for i in 0..size / 4 {
+                let off = i.wrapping_mul(4);
+                let cell = get_u32(&input, off);
+                write_u32(&mut got, dst_offset.wrapping_add(off), k ^ cell);
+                k = i.wrapping_mul(i) ^ (k.wrapping_add(cell).wrapping_add(i));
+            }
+
+            let mut want = vec![0u8; total as usize];
+            decode_payload_prefix(&input, 0, &mut want, dst_offset, key0, size);
+            assert_eq!(
+                got, want,
+                "key0={key0:#X} size={size:#X} dst={dst_offset:#X}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_prefix_decoder_can_write_a_bounded_prefix() {
+        let input: Vec<u8> = (0..0x40).map(|i| i as u8).collect();
+        let mut dst = vec![0u8; 0x20];
+        decode_payload_prefix(&input, 0, &mut dst, 0, 0x1234, 0x20);
+        assert!(dst.iter().any(|&b| b != 0));
+    }
+
+    /// An unaligned size must decode the same floor of words as the original
+    /// `decrypt_size >> 2` loop and leave the remainder untouched — in every
+    /// build, with no debug assertion.
+    #[test]
+    fn shared_prefix_decoder_floors_an_unaligned_size() {
+        for size in [0u32, 1, 2, 3, 5, 7, 0x11] {
+            let input: Vec<u8> = (0..0x40).map(|i| (i * 13 + 5) as u8).collect();
+            let mut dst = vec![0xAAu8; 0x40];
+            decode_payload_prefix(&input, 0, &mut dst, 0, 0xFEED_FACE, size);
+
+            let mut want = vec![0xAAu8; 0x40];
+            let mut key = 0xFEED_FACEu32.wrapping_add(!size);
+            for i in 0..size / 4 {
+                let off = i.wrapping_mul(4);
+                let cell = get_u32(&input, off);
+                write_u32(&mut want, off, key ^ cell);
+                key = i.wrapping_mul(i) ^ (key.wrapping_add(cell).wrapping_add(i));
+            }
+            assert_eq!(dst, want, "size={size}");
+        }
     }
 }

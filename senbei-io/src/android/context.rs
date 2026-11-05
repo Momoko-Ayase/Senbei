@@ -78,6 +78,10 @@ pub(crate) enum ContextAmbiguity {
 pub(crate) struct AndroidRunCache {
     pub(super) limits: senbei_engine::android::ResourceLimits,
     pub(super) archive: super::archive_limits::ArchiveBudget,
+    /// Capture the engine's own extraction/restoration reports for research
+    /// inspection. Off for every ordinary run: the reports are large and are
+    /// discarded after each restore.
+    pub(super) research: bool,
     apps: HashMap<AppKey, ApplicationModules>,
     /// Successfully restored protected libraries, keyed by encrypted content.
     libraries: HashMap<String, CachedLibrary>,
@@ -119,6 +123,11 @@ impl AndroidRunCache {
             archive: super::archive_limits::ArchiveBudget::from_limits(limits),
             ..Self::default()
         }
+    }
+
+    /// Whether this run keeps the engines' own reports for research output.
+    pub(crate) fn research(&self) -> bool {
+        self.research
     }
 
     pub(crate) fn modules_mut(&mut self, key: &AppKey) -> &mut ApplicationModules {
@@ -495,6 +504,9 @@ pub(crate) struct RestoredLibrary {
     /// test double, or an engine without a validation pass) — never that the
     /// output validated. `Some(empty)` is a completed, clean validation.
     pub validation: Option<super::ValidationDiagnostics>,
+    /// The extraction and restoration reports this restore actually produced,
+    /// kept only when the run asked for research output. `None` otherwise.
+    pub research: Option<crate::report::AndroidResearchReport>,
 }
 
 /// Injectable library restore. Tests supply a fake so application-context
@@ -513,10 +525,27 @@ pub(crate) trait LibraryRestorer {
 
 /// Production restorer: stage-2 extract, ELF rebuild, embedded metadata unwrap.
 #[derive(Default)]
-pub(crate) struct EngineRestorer(pub(super) senbei_engine::android::ResourceLimits);
+pub(crate) struct EngineRestorer {
+    pub(super) limits: senbei_engine::android::ResourceLimits,
+    /// Keep the engines' reports instead of dropping them after each restore.
+    pub(super) research: bool,
+}
+
+impl EngineRestorer {
+    /// A restorer for `limits`, keeping the engines' reports only for research.
+    pub(crate) fn new(limits: senbei_engine::android::ResourceLimits, research: bool) -> Self {
+        Self { limits, research }
+    }
+}
 
 impl LibraryRestorer for EngineRestorer {
     fn restore(&mut self, input: &Path, dest: &Path, verbose: bool) -> Result<RestoredLibrary> {
-        crate::android::restore_so_with_engine_limits(input, dest, verbose, &self.0)
+        crate::android::restore_so_with_engine_limits(
+            input,
+            dest,
+            verbose,
+            &self.limits,
+            self.research,
+        )
     }
 }

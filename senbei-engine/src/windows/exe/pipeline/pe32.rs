@@ -1,5 +1,16 @@
 use super::super::super::layout;
+use super::super::super::research::{self, AddressSpace, ResearchStage};
 use super::*;
+
+/// Name of the dd8 formula the PE32 selector actually chose. `None` is the
+/// selector's skip verdict, not "did not run".
+fn dd8_selection_label(selection: Option<bool>) -> &'static str {
+    match selection {
+        Some(true) => "0x8000*(page+1)",
+        Some(false) => "page+1",
+        None => "skip",
+    }
+}
 
 fn stage_key_rounds(data: &[u8], table: u32, slots: usize) -> Result<u32, UnpackError> {
     let offset = table as usize;
@@ -189,6 +200,14 @@ impl<'a> Unpacker<'a> {
         // ---- Validated shell table ----
         let compact = get_u32(&self.decompressed, tbl.wrapping_add(0x78)) == info[6];
         let stage_field = if compact { 0x88 } else { 0x98 };
+        research::emit_bool(ResearchStage::Pe32Shell, "compact_layout", compact);
+        research::emit_u32_at(
+            ResearchStage::Pe32Shell,
+            "table",
+            tbl,
+            AddressSpace::WorkingImageRva,
+            tbl as u64,
+        );
         if verbose {
             println!("[3/9] Locating config layout (PE32)...");
             println!("  tbl = 0x{:X}, compact = {}", tbl, compact);
@@ -201,6 +220,19 @@ impl<'a> Unpacker<'a> {
         let ss_shift = ss_size.wrapping_sub(if compact { 0xAEC } else { 0xBC0 });
         let third_pair_off = (if compact { 0xAB4u32 } else { 0xB8C }).wrapping_add(ss_shift);
         let header_checksum = self.decrypt_pe32_second_stage(tbl, pe_off)?;
+        research::emit_range(
+            ResearchStage::Pe32Stages,
+            "second_stage",
+            AddressSpace::WorkingImageRva,
+            ss as u64,
+            ss_size as u64,
+        );
+        research::emit_u32(ResearchStage::Pe32Stages, "second_stage_shift", ss_shift);
+        research::emit_u32(
+            ResearchStage::Pe32Stages,
+            "header_checksum",
+            header_checksum,
+        );
         if verbose {
             println!(
                 "  ss = 0x{:08X}, size = 0x{:X}, shift = 0x{:X}",
@@ -257,6 +289,20 @@ impl<'a> Unpacker<'a> {
             }
         }
         let info_table = info_table.ok_or(UnpackError::Pe32ThirdStageFailed)?;
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "third_stage",
+            ts,
+            AddressSpace::WorkingImageRva,
+            ts as u64,
+        );
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "info_table",
+            info_table,
+            AddressSpace::WorkingImageRva,
+            info_table as u64,
+        );
         if verbose {
             println!("[4/9] Decrypting stages (PE32)...");
             println!(
@@ -306,6 +352,11 @@ impl<'a> Unpacker<'a> {
             ka = ka.wrapping_add(32);
         }
 
+        research::emit_u32s(
+            ResearchStage::Pe32Stages,
+            "key_offsets",
+            self.key_offsets.to_vec(),
+        );
         // ---- Checksum addresses ----
         let second_stage_cs_addr = tbl.wrapping_add(stage_field + 0x18);
         let forth_stage_cs_addr = ss.wrapping_add(cs_base_off);
@@ -403,6 +454,13 @@ impl<'a> Unpacker<'a> {
         })
         .ok_or(UnpackError::Pe32CustomDecryptorNotFound)?;
         let custom_dec_addr = seven_start_actual.wrapping_add(custom_dec_off);
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "custom_decryptor",
+            custom_dec_addr,
+            AddressSpace::WorkingImageRva,
+            custom_dec_addr as u64,
+        );
         self.decrypt_data6(custom_dec_addr);
         let custom_ops = generate(&self.decompressed, custom_dec_addr).ok_or(
             UnpackError::BytecodeGenerationFailed(BytecodeStage::Pe32CustomDecryptor),
@@ -503,6 +561,11 @@ impl<'a> Unpacker<'a> {
         if !eighth_ok {
             return Err(UnpackError::Pe32EighthKeyNotFound);
         }
+        research::emit_u32(
+            ResearchStage::Pe32Stages,
+            "eighth_key_rounds",
+            eighth_key_rounds,
+        );
         let eighth_start = get_u32(&self.decompressed, eighth_addr);
         if verbose {
             println!(
@@ -704,7 +767,28 @@ impl<'a> Unpacker<'a> {
             }
             chosen.ok_or(UnpackError::Pe32FileLfsrNotFound)?
         };
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "cluster_base",
+            eighth_start.wrapping_add(off_import_table.wrapping_sub(0x18)),
+            AddressSpace::WorkingImageRva,
+            eighth_start.wrapping_add(off_import_table.wrapping_sub(0x18)) as u64,
+        );
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "file_checksums",
+            get_u32(&self.decompressed, eighth_start.wrapping_add(off_file_cs)),
+            AddressSpace::WorkingImageRva,
+            eighth_start.wrapping_add(off_file_cs) as u64,
+        );
         let file_dec_addr = eighth_start.wrapping_add(lfsr_off);
+        research::emit_u32_at(
+            ResearchStage::Pe32Stages,
+            "file_lfsr",
+            file_dec_addr,
+            AddressSpace::WorkingImageRva,
+            file_dec_addr as u64,
+        );
         self.decrypt_data6(file_dec_addr);
         let file_ops = generate(&self.decompressed, file_dec_addr).ok_or(
             UnpackError::BytecodeGenerationFailed(BytecodeStage::Pe32FileDecryptor),
@@ -764,6 +848,48 @@ impl<'a> Unpacker<'a> {
                 dst: dst2,
                 dsz: d_sz2,
             });
+        }
+        {
+            let compressed = blocks.iter().filter(|block| block.ssz != block.dsz).count();
+            let compressed_bytes: u64 = blocks
+                .iter()
+                .filter(|block| block.ssz != block.dsz)
+                .map(|block| u64::from(block.ssz))
+                .sum();
+            let output_bytes: u64 = blocks
+                .iter()
+                .map(|block| u64::from(block.ssz.max(block.dsz)))
+                .sum();
+            research::emit_u32(
+                ResearchStage::Sections,
+                "block_count",
+                u32::try_from(blocks.len()).unwrap_or(u32::MAX),
+            );
+            research::emit_u32(
+                ResearchStage::Sections,
+                "compressed_block_count",
+                u32::try_from(compressed).unwrap_or(u32::MAX),
+            );
+            research::emit_u64(
+                ResearchStage::Sections,
+                "compressed_bytes",
+                compressed_bytes,
+            );
+            research::emit_u64(ResearchStage::Sections, "output_bytes", output_bytes);
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "aes_schedule",
+                self.key_offsets[2],
+                AddressSpace::WorkingImageRva,
+                self.key_offsets[2] as u64,
+            );
+            research::emit_u32_at(
+                ResearchStage::Sections,
+                "huffman_table",
+                self.key_offsets[0],
+                AddressSpace::WorkingImageRva,
+                self.key_offsets[0] as u64,
+            );
         }
         // Pass 2: independent per-block work over disjoint dst spans (see
         // `parallel_for` for how the spans are carved safely).
@@ -889,15 +1015,40 @@ impl<'a> Unpacker<'a> {
         // encrypted (native DLLs leave it plaintext); applying dd8 there would
         // scramble valid code, so skip it entirely in that case.
         if text_size > 0 && text_off > 0 {
-            if let Some(big) =
-                layout::select_dd8_formula_pe32(&self.decompressed, text_off, text_size)
-            {
+            let selection =
+                layout::select_dd8_formula_pe32(&self.decompressed, text_off, text_size);
+            // The selector's own verdict: the chosen formula, or that it chose
+            // to skip dd8. Not a "did anything run" flag.
+            research::emit_text(
+                ResearchStage::Sections,
+                "text_dd8_selection",
+                dd8_selection_label(selection),
+            );
+            if let Some(big) = selection {
                 if verbose {
                     println!(
                         "[7/9] Decrypting .text (PE32 dd8, formula={})...",
                         if big { "0x8000*(page+1)" } else { "page+1" }
                     );
                 }
+                research::emit_text(
+                    ResearchStage::Sections,
+                    "dd8_formula",
+                    if big { "0x8000*(page+1)" } else { "page+1" },
+                );
+                // Reproducible parameters of the selected formula: the page
+                // multiplier, the first page index, and the page count.
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "dd8_formula_multiplier",
+                    if big { 0x8000 } else { 1 },
+                );
+                research::emit_u32(ResearchStage::Sections, "dd8_first_page", text_off >> 12);
+                research::emit_u32(
+                    ResearchStage::Sections,
+                    "dd8_page_count",
+                    text_size / 0x1000,
+                );
                 let num_pages = text_size / 0x1000;
                 for page in 0..num_pages {
                     let pk = if big {
@@ -958,6 +1109,13 @@ impl<'a> Unpacker<'a> {
         // ---- TLS directory reconstruction (PE32: index 9 = pe+0xC0) ----
         let tls_dir_rva = get_u32(&self.decompressed, exe_pe.wrapping_add(0xC0));
         let tls_dir_sz = get_u32(&self.decompressed, exe_pe.wrapping_add(0xC4));
+        research::emit_u32_at(
+            ResearchStage::Tls,
+            "directory_rva",
+            tls_dir_rva,
+            AddressSpace::WorkingImageRva,
+            tls_dir_rva as u64,
+        );
         if tls_dir_rva > 0
             && tls_dir_sz >= 24
             && (tls_dir_rva as usize + 24) <= self.decompressed.len()
@@ -972,7 +1130,17 @@ impl<'a> Unpacker<'a> {
                 // the image loadable, but drops the initialized TLS template,
                 // `_tls_index` and the TLS callback array, so any module that
                 // actually uses `thread_local` faults once it runs.
-                if !self.restore_pe32_tls_from_stub(pe_off, tls_dir_rva, image_base) {
+                let tls_restored = self.restore_pe32_tls_from_stub(pe_off, tls_dir_rva, image_base);
+                research::emit_text(
+                    ResearchStage::Tls,
+                    "directory_action",
+                    if tls_restored {
+                        "restored_from_stub"
+                    } else {
+                        "synthesized_or_cleared"
+                    },
+                );
+                if !tls_restored {
                     let mut tls_sec_va: u32 = 0;
                     let mut data_sec_va: u32 = 0;
                     let mut data_sec_sz: u32 = 0;
@@ -1093,6 +1261,13 @@ impl<'a> Unpacker<'a> {
         let import_table_addr = eighth_start.wrapping_add(off_import_table);
         let mut import_table_ptr = get_u32(&self.decompressed, import_table_addr);
         let mut idt_size = get_u32(&self.decompressed, import_table_addr.wrapping_add(4));
+        research::emit_range(
+            ResearchStage::Imports,
+            "eighth_stage_import_table",
+            AddressSpace::WorkingImageRva,
+            import_table_ptr as u64,
+            idt_size as u64,
+        );
 
         let metadata_import_rva = get_u32(&metadata_dirs, 8);
         let metadata_import_size = get_u32(&metadata_dirs, 12);
@@ -1197,8 +1372,16 @@ impl<'a> Unpacker<'a> {
         if !is_dll && !layout::pe32_imports_already_match_idata_layout(&mut out, pe_off) {
             layout::move_pe32_imports_to_kmiat(&mut out, pe_off);
         }
+        research::emit_range(
+            ResearchStage::Imports,
+            "selected_import_table",
+            AddressSpace::WorkingImageRva,
+            import_table_ptr as u64,
+            idt_size as u64,
+        );
         let compact = layout::compact_memory_image_to_pe(&out, pe_off)
             .ok_or(UnpackError::Pe32OutputLayoutInvalid)?;
+        research::emit_u64(ResearchStage::Output, "output_len", compact.len() as u64);
         Ok(compact)
     }
 }
@@ -1255,6 +1438,13 @@ mod tests {
     fn pe32_standard_metadata_preserves_both_layouts() {
         check_metadata(false, false);
         check_metadata(false, true);
+    }
+
+    #[test]
+    fn dd8_selection_label_reports_the_chosen_formula_or_skip() {
+        assert_eq!(dd8_selection_label(Some(true)), "0x8000*(page+1)");
+        assert_eq!(dd8_selection_label(Some(false)), "page+1");
+        assert_eq!(dd8_selection_label(None), "skip");
     }
 
     #[test]
