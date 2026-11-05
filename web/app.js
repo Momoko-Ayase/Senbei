@@ -1,4 +1,18 @@
-import init, { detect, deobfuscate_metadata } from './pkg/senbei_wasm.js';
+import init, { detect, inspect_profile_json } from './pkg/senbei_wasm.js';
+import {
+  DEFAULT_INPUT_LIMIT_BYTES,
+  MAX_INPUT_LIMIT_MIB,
+  MIN_INPUT_LIMIT_MIB,
+  buildReport,
+  describeFindings,
+  describeObserved,
+  describeStages,
+  formatBytes,
+  parseLimitMiB,
+  planReadBudget,
+  reportFileName,
+  serializeReport,
+} from './report.js';
 
 const dropzone = document.getElementById('dropzone');
 const picker = document.getElementById('picker');
@@ -6,6 +20,9 @@ const fileList = document.getElementById('files');
 const actions = document.getElementById('actions');
 const unpackBtn = document.getElementById('unpack-btn');
 const clearBtn = document.getElementById('clear-btn');
+const exportBtn = document.getElementById('export-btn');
+const limitInput = document.getElementById('limit-mib');
+const limitHint = document.getElementById('limit-hint');
 const legalOverlay = document.getElementById('legal-overlay');
 const legalAccept = document.getElementById('legal-accept');
 const legalLink = document.getElementById('legal-link');
@@ -34,10 +51,16 @@ legalLink.addEventListener('click', (e) => {
 /** name -> {
  *   file: File,
  *   kind: string|undefined,   // detect() result; undefined for `._` files
- *   state: 'staged'|'working'|'ok'|'err',
+ *   state: 'staged'|'working'|'ok'|'err'|'blocked',
  *   bytes: Uint8Array|null,   // unpacked output (state 'ok')
  *   note: string,             // status line (kind, suspect issues, error)
  *   suspect: boolean,
+ *   findings: Array<{severity,message}>,  // integrity defects
+ *   profile: object|null,     // post-recovery profile (or the failure profile)
+ *   preRecoveryProfile: object|null,      // inspect_profile_json() result
+ *   retried: boolean,         // forced-EXE retry ran
+ *   companionUsed: boolean,   // output was spliced from a `._` payload
+ *   error: string|null,
  * } */
 const files = new Map();
 
@@ -96,6 +119,52 @@ dropzone.addEventListener('drop', (e) => {
   stageFiles(e.dataTransfer.files);
 });
 
+// --- Input budget ---------------------------------------------------------
+//
+// Every read is guarded from `File.size` BEFORE `arrayBuffer()` runs, so an
+// oversized input never becomes a large allocation in the first place. The
+// limit is a practical guard, not a memory measurement: see the warning text.
+
+let limitBytes = DEFAULT_INPUT_LIMIT_BYTES;
+
+limitInput.min = String(MIN_INPUT_LIMIT_MIB);
+limitInput.max = String(MAX_INPUT_LIMIT_MIB);
+
+/** Static explanation shown when no staged input needs attention. */
+const LIMIT_BASE_HINT =
+  `Modules above the limit are skipped before their bytes are read. ` +
+  'Unpacking keeps the input, the recovered image, and pipeline buffers in ' +
+  'memory together, so it needs several times the file size.';
+
+function applyLimit() {
+  limitBytes = parseLimitMiB(limitInput.value, limitBytes);
+  render();
+}
+
+limitInput.addEventListener('change', () => {
+  limitInput.value = String(Math.round(limitBytes / (1024 * 1024)));
+  applyLimit();
+});
+limitInput.addEventListener('input', () => {
+  // Only react to a value that is actually usable, so typing never flips the
+  // budget on a partial number.
+  if (parseLimitMiB(limitInput.value, null) !== null) applyLimit();
+});
+
+/** Latest budget plan for the staged set (recomputed by render()). */
+let budgetPlan = null;
+
+/** Entries measured for the budget: base module + its `._` companion. */
+function stagedSizes() {
+  return [...files].map(([name, entry]) => ({ name, size: entry.file.size }));
+}
+
+/** True when `name` must be skipped under the current budget. */
+function isBlocked(name) {
+  if (!budgetPlan) return false;
+  return budgetPlan.blocked.includes(name);
+}
+
 async function stageFiles(list) {
   // Snapshot synchronously: `picker.files` and `dataTransfer.files` are LIVE
   // lists — clearing the picker or returning from the drop event empties
@@ -122,11 +191,35 @@ async function stageFiles(list) {
       bytes: null,
       note: '',
       suspect: false,
+      findings: [],
+      profile: null,
+      preRecoveryProfile: readPreRecoveryProfile(file.name.endsWith('._') ? undefined : head),
+      retried: false,
+      companionUsed: false,
+      error: null,
     }); // same name re-dropped: replace
     // A re-dropped file restarts as staged; drop any stale row/output.
     if (old) removeRow(file.name, true);
   }
   render();
+}
+
+/**
+ * Pre-recovery profile from the header slice.
+ *
+ * This is pure presentation: it reports the observed target (`PE32+ · native
+ * DLL · header magic`) and never turns a metadata magic match into a
+ * protection claim. Returns `null` for companions and for anything the core
+ * cannot describe.
+ */
+function readPreRecoveryProfile(head) {
+  if (!head) return null;
+  try {
+    const parsed = JSON.parse(inspect_profile_json(head));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Insert `.unpack` before the final extension: `app.exe` -> `app.unpack.exe`. */
@@ -135,21 +228,51 @@ function outName(name) {
   return dot > 0 ? `${name.slice(0, dot)}.unpack${name.slice(dot)}` : `${name}.unpack`;
 }
 
+/**
+ * Staged status line: the observed header facts, which is what the profile can
+ * say before any recovery runs. The kind label is only a fallback, because
+ * `describeObserved` already names the format and kind.
+ */
+function stagedStatus(entry) {
+  const label = KIND_LABEL[entry.kind] ?? entry.kind;
+  if (entry.kind === 'metadata') {
+    // The kind label names the file type; `observed` carries the version and
+    // the format-only disclaimer.
+    const observed = describeObserved(entry.preRecoveryProfile);
+    return observed ? `${label} — ${observed}` : label;
+  }
+  // A PE profile already names the format and kind, so dropping the kind from
+  // it avoids "protected native DLL — PE32+ · native DLL".
+  const observed = describeObserved(entry.preRecoveryProfile, { includeKind: false });
+  return observed ? `${label} — ${observed}` : label;
+}
+
 function statusText(name, entry) {
   if (name.endsWith('._')) {
     return `companion — needs ${name.slice(0, -2)}`;
   }
   switch (entry.state) {
     case 'staged':
-      return entry.kind === undefined
-        ? 'not recognized — will be skipped'
-        : KIND_LABEL[entry.kind] ?? entry.kind;
+      if (entry.kind === undefined) return 'not recognized — will be skipped';
+      if (isBlocked(name)) return 'above the input limit — will be skipped';
+      return stagedStatus(entry);
     case 'working':
-      return 'unpacking…';
+      return entry.kind === 'metadata' ? 'de-obfuscating…' : 'unpacking…';
     case 'ok':
     case 'err':
+    case 'blocked':
       return entry.note;
   }
+}
+
+/**
+ * Details block: profile stages and severity-labelled findings.
+ *
+ * The row's status line already carries the failure text, so the details list
+ * it only when it adds something the summary does not.
+ */
+function detailLines(entry) {
+  return [...describeStages(entry.profile), ...describeFindings(entry.findings)];
 }
 
 function buildRow(name) {
@@ -185,6 +308,14 @@ function buildRow(name) {
   dl.hidden = true;
   row.appendChild(dl);
 
+  const report = document.createElement('button');
+  report.type = 'button';
+  report.className = 'report';
+  report.textContent = '{}';
+  report.title = `Export a JSON report for ${name}`;
+  report.addEventListener('click', () => exportOne(name));
+  row.appendChild(report);
+
   const rm = document.createElement('button');
   rm.type = 'button';
   rm.className = 'remove';
@@ -200,6 +331,12 @@ function buildRow(name) {
   row.appendChild(rm);
 
   li.appendChild(row);
+
+  const details = document.createElement('ul');
+  details.className = 'details';
+  details.hidden = true;
+  li.appendChild(details);
+
   return li;
 }
 
@@ -219,6 +356,27 @@ function updateRow(li, name, entry) {
 
   li.querySelector('.status').textContent = statusText(name, entry);
 
+  const details = li.querySelector('.details');
+  const lines = detailLines(entry);
+  details.hidden = lines.length === 0;
+  if (lines.length > 0) {
+    // Rebuild only when the text actually changed: writing identical children
+    // every render would restart the row's entrance animation.
+    const key = lines.join('\n');
+    if (details.dataset.key !== key) {
+      details.replaceChildren(
+        ...lines.map((line) => {
+          const item = document.createElement('li');
+          item.textContent = line;
+          if (line.startsWith('fatal:')) item.className = 'fatal';
+          else if (line.startsWith('warning:')) item.className = 'warning';
+          return item;
+        }),
+      );
+      details.dataset.key = key;
+    }
+  }
+
   const dl = li.querySelector('.dl');
   const downloadable = entry.state === 'ok' && entry.bytes;
   dl.hidden = !downloadable;
@@ -230,8 +388,8 @@ function updateRow(li, name, entry) {
       );
       dl._bytesFor = entry.bytes;
     }
-    dl.download = outName(name);
-    dl.title = `Download ${outName(name)}`;
+    dl.download = entry.outputName ?? outName(name);
+    dl.title = `Download ${dl.download}`;
   }
 }
 
@@ -264,6 +422,19 @@ function removeRow(name, instant) {
 }
 
 function render() {
+  budgetPlan = planReadBudget(stagedSizes(), limitBytes);
+
+  // Raising the limit must un-block rows the previous limit skipped: a
+  // `blocked` row is a budget verdict, not a result, so it returns to
+  // `staged` once it fits again and the user can press Unpack.
+  for (const [name, entry] of files) {
+    if (entry.state === 'blocked' && !isBlocked(name)) {
+      entry.state = 'staged';
+      entry.error = null;
+      entry.note = '';
+    }
+  }
+
   // Create/update rows in Map order; companions whose base is staged merge
   // into the base row (no row of their own).
   const wanted = [];
@@ -284,7 +455,7 @@ function render() {
   // running animations (entrance, shimmer) are never restarted by a render.
   // Rows mid-leave-animation (no longer in rowEls) are skipped and keep
   // their spot — reordering siblings around them would make them snap
-  // instead of sliding with the collapse.
+  // instead of slide with the collapse.
   let cursor = fileList.firstChild;
   for (const name of wanted) {
     let li = rowEls.get(name);
@@ -312,6 +483,16 @@ function render() {
   );
   unpackBtn.disabled = !unpackable;
   actions.hidden = files.size === 0;
+
+  // The hint reflects the current staged set: the budget's own guidance when
+  // it has something to say, otherwise the standing explanation.
+  if (budgetPlan && budgetPlan.guidance.length > 0) {
+    limitHint.textContent = budgetPlan.guidance.join(' ');
+    limitHint.classList.toggle('warn', budgetPlan.blocked.length > 0);
+  } else {
+    limitHint.textContent = LIMIT_BASE_HINT;
+    limitHint.classList.remove('warn');
+  }
 }
 
 clearBtn.addEventListener('click', () => {
@@ -320,11 +501,14 @@ clearBtn.addEventListener('click', () => {
 });
 
 /**
- * Run one unpack in a disposable Web Worker (fresh wasm instance per call —
- * see worker.js). Buffers are transferred, so the inputs are neutered on the
- * main thread afterwards; callers re-read from the File for a retry.
+ * Run one job in a disposable Web Worker (fresh wasm instance per call — see
+ * worker.js). Buffers are transferred, so the inputs are neutered on the main
+ * thread afterwards; callers re-read from the File for a retry.
+ *
+ * `job` is read eagerly, but `read()` only runs after the caller has checked
+ * the budget: no `arrayBuffer()` call happens here.
  */
-function runUnpack(inputBytes, compBytes, forceExe) {
+function runJob(job) {
   return new Promise((resolve) => {
     const w = new Worker('worker.js', { type: 'module' });
     w.onmessage = (e) => {
@@ -333,45 +517,108 @@ function runUnpack(inputBytes, compBytes, forceExe) {
     };
     w.onerror = (e) => {
       w.terminate();
-      resolve({ ok: false, trap: true, message: e.message || 'worker error' });
+      // A worker that fails to load (404, syntax error) reports no trap: the
+      // retry below must not rerun an identical broken job.
+      resolve({ ok: false, trap: false, message: e.message || 'worker error', profile: null });
     };
-    const transfer = [inputBytes.buffer, ...(compBytes ? [compBytes.buffer] : [])];
-    w.postMessage({ input: inputBytes, companion: compBytes ?? null, forceExe }, transfer);
+    const transfer = [job.input.buffer, ...(job.companion ? [job.companion.buffer] : [])];
+    w.postMessage(job, transfer);
   });
+}
+
+/** Read a File only after the budget check has allowed it. */
+async function readFile(file) {
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+/**
+ * Apply one worker reply to a row, keeping the failure profile and error.
+ *
+ * The profile is stored even when the job failed: it names the route that ran
+ * and why it was rejected, which is what the exported report needs.
+ */
+function applyReply(entry, r) {
+  entry.profile = r.profile ?? entry.profile;
+  if (!r.ok) {
+    entry.state = 'err';
+    entry.error = r.message ?? r.error ?? 'unpack failed';
+    entry.findings = [];
+    entry.note = r.trap
+      ? 'unpack failed (internal trap) — this Crackproof layout may be unsupported'
+      : entry.error;
+    return false;
+  }
+  entry.findings = (r.issues ?? []).map((message, index) => ({
+    severity: r.severities?.[index] === 'fatal' ? 'fatal' : 'warning',
+    message,
+  }));
+  entry.suspect = r.suspect === true;
+  entry.companionUsed = r.companion === true;
+  entry.error = null;
+  return true;
 }
 
 async function unpackModule(name, entry) {
   const compEntry = files.get(`${name}._`);
-  const read = (f) => f.arrayBuffer().then((b) => new Uint8Array(b));
 
-  let input = await read(entry.file);
-  let comp = compEntry ? await read(compEntry.file) : undefined;
-  let r = await runUnpack(input, comp, false);
+  let input = await readFile(entry.file);
+  let comp = compEntry ? await readFile(compEntry.file) : undefined;
+  let r = await runJob({ mode: 'unpack', input, companion: comp ?? null, forceExe: false });
+  let retried = false;
 
   const isExe = entry.kind === 'native-exe' || entry.kind === 'managed-exe';
   if (!r.ok && r.trap && !isExe) {
     // The DLL-routing probe trapped (panics can't be caught in wasm). Retry
     // once with the forced-EXE pipeline in a fresh worker — this mirrors the
     // CLI's dll-first/exe-fallback outcome for EXE-shell-layout DLLs.
-    input = await read(entry.file);
-    comp = compEntry ? await read(compEntry.file) : undefined;
-    r = await runUnpack(input, comp, true);
+    input = await readFile(entry.file);
+    comp = compEntry ? await readFile(compEntry.file) : undefined;
+    r = await runJob({ mode: 'unpack', input, companion: comp ?? null, forceExe: true });
+    retried = true;
   }
+  entry.retried = retried;
 
-  if (!r.ok) {
+  if (!applyReply(entry, r)) return;
+  entry.state = 'ok';
+  entry.bytes = r.bytes;
+  entry.outputBytes = r.bytes.byteLength;
+  entry.outputName = outName(name);
+  const parts = [];
+  if (r.companion || comp) parts.push('spliced from ._ companion');
+  parts.push(`kind: ${r.kind}`);
+  if (retried) parts.push('forced-EXE retry');
+  if (entry.suspect) {
+    // The per-finding text lives in the details list; the status line only
+    // has to say how serious it is.
+    const fatal = entry.findings.filter((finding) => finding.severity === 'fatal').length;
+    const warnings = entry.findings.length - fatal;
+    const counts = [
+      fatal > 0 ? `${fatal} fatal` : null,
+      warnings > 0 ? `${warnings} warning${warnings === 1 ? '' : 's'}` : null,
+    ].filter(Boolean).join(', ');
+    parts.push(`${r.fatal ? 'FAILED static check' : 'suspect'} (${counts})`);
+  }
+  entry.note = parts.join(' — ');
+}
+
+async function unpackMetadata(name, entry) {
+  const input = await readFile(entry.file);
+  const r = await runJob({ mode: 'metadata', input });
+  if (!applyReply(entry, r)) return;
+  const report = r.metadata ?? {};
+  if (report.remapped === 0) {
     entry.state = 'err';
-    entry.note = r.trap
-      ? 'unpack failed (internal trap) — this Crackproof layout may be unsupported'
-      : r.message;
+    entry.error =
+      `metadata already clean (v${report.version}, ${report.methods} methods) — nothing to do`;
+    entry.note = entry.error;
     return;
   }
   entry.state = 'ok';
   entry.bytes = r.bytes;
-  entry.suspect = r.suspect;
+  entry.outputBytes = r.bytes.byteLength;
+  entry.outputName = outName(name);
   entry.note =
-    (r.companion ? 'spliced from ._ companion; ' : '') +
-    `kind: ${r.kind}` +
-    (r.suspect ? ` — SUSPECT: ${r.issues.join('; ')}` : '');
+    `${report.remapped}/${report.methods} method tokens remapped across ${report.modules} modules`;
 }
 
 unpackBtn.addEventListener('click', async () => {
@@ -383,7 +630,8 @@ unpackBtn.addEventListener('click', async () => {
 
       if (entry.kind === undefined) {
         entry.state = 'err';
-        entry.note = 'not recognized as Crackproof-protected — skipped';
+        entry.error = 'not recognized as Crackproof-protected — skipped';
+        entry.note = entry.error;
         render();
         continue;
       }
@@ -392,26 +640,31 @@ unpackBtn.addEventListener('click', async () => {
       // status line already says to use the CLI.
       if (entry.kind.startsWith('android-')) continue;
 
+      // Budget gate. Runs before any read of the module body: `entry.file`
+      // has not been touched for bytes yet. A blocked module keeps its
+      // companion paired; only its own read is skipped.
+      if (isBlocked(name)) {
+        entry.state = 'blocked';
+        entry.error =
+          `${name} is above the ${formatBytes(limitBytes)} input limit — raise the limit to unpack it`;
+        entry.note = entry.error;
+        render();
+        continue;
+      }
+
       entry.state = 'working';
       render();
+      entry.inputBytes = entry.file.size + (files.get(`${name}._`)?.file.size ?? 0);
       try {
         if (entry.kind === 'metadata') {
-          const bytes = new Uint8Array(await entry.file.arrayBuffer());
-          const r = deobfuscate_metadata(bytes);
-          if (r.remapped === 0) {
-            entry.state = 'err';
-            entry.note = `metadata already clean (v${r.version}, ${r.methods} methods) — nothing to do`;
-          } else {
-            entry.state = 'ok';
-            entry.bytes = r.bytes;
-            entry.note = `${r.remapped}/${r.methods} method tokens remapped across ${r.modules} modules`;
-          }
+          await unpackMetadata(name, entry);
         } else {
           await unpackModule(name, entry);
         }
       } catch (e) {
         entry.state = 'err';
-        entry.note = e instanceof Error ? e.message : String(e);
+        entry.error = e instanceof Error ? e.message : String(e);
+        entry.note = entry.error;
       }
       render();
     }
@@ -420,3 +673,51 @@ unpackBtn.addEventListener('click', async () => {
     render();
   }
 });
+
+// --- JSON export ----------------------------------------------------------
+
+function downloadJson(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  // Revoke on the next task: revoking synchronously can cancel the download
+  // in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function generatedAt() {
+  return new Date().toISOString();
+}
+
+/**
+ * Per-row export: one file's report in the same envelope as the all-files
+ * export, so a consumer parses one shape. The row's companion is included as
+ * `companion_used` only — the companion has no report of its own.
+ */
+function exportOne(name) {
+  const entry = files.get(name);
+  if (!entry) return;
+  const at = generatedAt();
+  downloadJson(
+    reportFileName(name, at),
+    serializeReport(buildReport(new Map([[name, entry]]), {
+      generatedAt: at,
+      limitBytes,
+      includeNotes: true,
+    })),
+  );
+}
+
+exportBtn.addEventListener('click', () => {
+  const at = generatedAt();
+  downloadJson(
+    reportFileName(null, at),
+    serializeReport(buildReport(files, { generatedAt: at, limitBytes, includeNotes: true })),
+  );
+});
+
+// Paint the initial state so the limit hint and the action row are consistent
+// before anything is staged.
+render();

@@ -94,6 +94,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - run: npm test --prefix web
       - run: cargo install wasm-pack --locked
       # `-- --locked` forwards to cargo: senbei-wasm/Cargo.lock is committed on
       # purpose, so the wasm build must be pinned by it rather than silently
@@ -114,6 +115,7 @@ jobs:
           path: |
             web/index.html
             web/app.js
+            web/report.js
             web/worker.js
             web/style.css
             web/pkg/

@@ -71,7 +71,7 @@ jobs:
       - name: Stage static site
         run: |
           mkdir dist
-          cp web/index.html web/app.js web/worker.js web/style.css dist/
+          cp web/index.html web/app.js web/report.js web/worker.js web/style.css dist/
           cp -r web/pkg dist/pkg
       - uses: cloudflare/wrangler-action@v3
         with:

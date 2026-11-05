@@ -224,6 +224,8 @@ code {
 .file.ok { background: var(--ok); }
 .file.ok.suspect { background: #6b5a1e; }
 .file.err { background: var(--err); }
+/* Over the input limit: nothing was read, so this is not a failure. */
+.file.blocked { background: #3c3520; border-color: var(--warn); }
 
 .file .row {
   position: relative;
@@ -239,7 +241,7 @@ code {
 }
 
 .file.working .name { color: #fff; }
-.file.ok .name, .file.err .name { color: #fff; }
+.file.ok .name, .file.err .name, .file.blocked .name { color: #fff; }
 
 .badge.companion {
   flex: none;
@@ -269,6 +271,7 @@ code {
 .file.ok .status { color: #cfe9d5; }
 .file.ok.suspect .status { color: #f0e3b2; }
 .file.err .status { color: #f0c8c8; }
+.file.blocked .status { color: #f2e2b0; }
 .file.working .status { color: #dbe7ff; }
 
 .file .dl {
@@ -309,6 +312,7 @@ code {
 
 .file.ok .remove,
 .file.err .remove,
+.file.blocked .remove,
 .file.working .remove {
   border-color: rgba(255, 255, 255, 0.3);
   color: rgba(255, 255, 255, 0.75);
@@ -324,6 +328,104 @@ code {
   display: flex;
   gap: 0.6rem;
   animation: fadeIn 0.25s ease-out;
+}
+
+/* --- input limit --- */
+
+.limits {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin: 0 0 1rem;
+  font-size: 0.9rem;
+  color: var(--dim);
+}
+
+.limits label { flex: none; }
+
+#limit-mib {
+  width: 7rem;
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+#limit-mib:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.limits .hint {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.limits .hint.warn { color: var(--warn); }
+
+/* --- per-row report detail --- */
+
+.file .details {
+  list-style: none;
+  margin: 0;
+  padding: 0 0.85rem 0.55rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+.file .details li {
+  overflow-wrap: anywhere;
+  padding-left: 0.9rem;
+  position: relative;
+}
+
+.file .details li::before {
+  content: '·';
+  position: absolute;
+  left: 0.2rem;
+  opacity: 0.7;
+}
+
+.file.ok .details, .file.err .details, .file.working .details { color: #d8dde5; }
+.file .details li.fatal { color: var(--err-bright); }
+.file .details li.warning { color: var(--warn); }
+.file.ok .details li.fatal { color: #ffb3b3; }
+
+.file .report {
+  flex: none;
+  padding: 0.1rem 0.45rem;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.8rem;
+  font-weight: 400;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--dim);
+}
+
+.file .report:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  box-shadow: none;
+  transform: none;
+}
+
+.file.ok .report,
+.file.err .report,
+.file.blocked .report,
+.file.working .report {
+  border-color: rgba(255, 255, 255, 0.3);
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.file.ok .report:hover,
+.file.err .report:hover,
+.file.blocked .report:hover {
+  color: #fff;
+  border-color: #fff;
 }
 
 footer {

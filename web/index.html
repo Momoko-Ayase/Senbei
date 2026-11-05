@@ -63,10 +63,18 @@
     <input type="file" id="picker" multiple hidden>
   </div>
 
+  <div class="limits">
+    <label for="limit-mib">Input limit per module (MiB)</label>
+    <input id="limit-mib" type="number" min="8" max="4096" step="8" value="256"
+           inputmode="numeric" aria-describedby="limit-hint">
+    <p id="limit-hint" class="hint"></p>
+  </div>
+
   <ul id="files"></ul>
 
   <div class="actions" id="actions" hidden>
     <button id="unpack-btn" type="button">Unpack</button>
+    <button id="export-btn" type="button" class="secondary">Export JSON</button>
     <button id="clear-btn" type="button" class="secondary">Clear</button>
   </div>
 

@@ -507,6 +507,7 @@ dependencies = [
  "senbei-engine",
  "senbei-io",
  "senbei-metadata",
+ "serde_json",
  "wasm-bindgen",
 ]
 
