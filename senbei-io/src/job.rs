@@ -7,6 +7,7 @@ use crate::report::{
     CompanionReport, CompanionState, ContainerReport, Digest, EntryKind, EntryReport, EntryStatus,
     InputReport, InputStatus, OutputFile, Role, Stage, StageReport, StageStatus,
 };
+use crate::ui::{Palette, Tone};
 pub use crate::windows::{
     UnpackedImage, unpack_bytes, unpack_bytes_force_exe, unpack_bytes_force_exe_profiled,
     unpack_bytes_force_exe_profiled_v, unpack_bytes_profiled, unpack_bytes_profiled_v, unpack_one,
@@ -33,14 +34,28 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// The summary line shared by CLI output and the log file.
+    /// The plain summary line shared by CLI output and the log file.
     pub fn line(&self) -> String {
+        self.line_with_palette(crate::ui::Palette::plain())
+    }
+
+    /// Console rendering without adding presentation escapes to log data.
+    pub fn line_with_palette(&self, palette: crate::ui::Palette) -> String {
+        use crate::ui::{Tone, count};
+
         let mut line = format!(
             "{} unpacked · {} skipped · {} errors · {} suspect · {} metadata",
-            self.unpacked, self.skipped, self.errors, self.suspect, self.metadata
+            count(palette, self.unpacked, Tone::Success),
+            count(palette, self.skipped, Tone::Muted),
+            count(palette, self.errors, Tone::Error),
+            count(palette, self.suspect, Tone::Warning),
+            count(palette, self.metadata, Tone::Success)
         );
         if self.packages > 0 {
-            line.push_str(&format!(" · {} packages", self.packages));
+            line.push_str(&format!(
+                " · {} packages",
+                palette.paint(Tone::Value, self.packages)
+            ));
         }
         line
     }
@@ -215,7 +230,8 @@ fn run_folder_inner(
     let scan_failed = scan_stats.walk_errors + scan_stats.probe_errors;
     if scan_failed > 0 && quiet == 0 {
         eprintln!(
-            "warning: {} file(s) could not be read during the scan and may be missed targets",
+            "{}: {} file(s) could not be read during the scan and may be missed targets",
+            Palette::stderr().paint(Tone::Warning, "warning"),
             scan_failed
         );
     }
@@ -415,7 +431,12 @@ fn run_folder_inner(
                         if let Some(validation) = &report_validation {
                             if !suppress_file_lines {
                                 for message in &validation.messages {
-                                    eprintln!("- {}  {}", rel.display(), message);
+                                    eprintln!(
+                                        "{} {}  {}",
+                                        Palette::stderr().paint(Tone::Warning, "-"),
+                                        rel.display(),
+                                        message
+                                    );
                                 }
                             }
                             if let Some(log) = &log {
@@ -719,7 +740,8 @@ fn run_folder_inner(
                     s.skipped += 1;
                     if !suppress_file_lines {
                         eprintln!(
-                            "- {}  unsupported metadata version {v}, left untouched",
+                            "{} {}  unsupported metadata version {v}, left untouched",
+                            Palette::stderr().paint(Tone::Warning, "-"),
                             rel.display()
                         );
                     }
@@ -895,8 +917,11 @@ fn run_file_inner(
                 }
                 if quiet == 0 {
                     println!(
-                        "✓ metadata v{} -> {:?} ({} method fields remapped)",
-                        report.version, dest, report.remapped
+                        "{} metadata v{} -> {} ({} method fields remapped)",
+                        Palette::stdout().paint(Tone::Success, "✓"),
+                        Palette::stdout().paint(Tone::Value, report.version),
+                        Palette::stdout().paint(Tone::Value, format!("{dest:?}")),
+                        Palette::stdout().paint(Tone::Value, report.remapped)
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
@@ -915,8 +940,10 @@ fn run_file_inner(
                 }
                 if quiet == 0 {
                     println!(
-                        "metadata v{}: already de-obfuscated, nothing to do",
-                        report.version
+                        "metadata v{}: {}",
+                        Palette::stdout().paint(Tone::Value, report.version),
+                        Palette::stdout()
+                            .paint(Tone::Muted, "already de-obfuscated, nothing to do")
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
@@ -933,7 +960,7 @@ fn run_file_inner(
                 }
                 // Level 1 quiet: banner/summary/duration only (match folder mode).
                 if quiet == 0 {
-                    eprintln!("error: {e:#}");
+                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
                     let unsupported = unsupported_version(&e);
@@ -973,7 +1000,13 @@ fn run_file_inner(
                     log.step(&format!("OK {:?} -> {:?} (Android SO)", input, dest));
                 }
                 if quiet == 0 {
-                    println!("✓ So  {}  ->  {}", input.display(), dest.display());
+                    let palette = Palette::stdout();
+                    println!(
+                        "{}  {}  ->  {}",
+                        palette.paint(Tone::Success, "✓ So"),
+                        palette.paint(Tone::Label, input.display()),
+                        palette.paint(Tone::Value, dest.display())
+                    );
                 }
                 match write_embedded_metadata(embedded, &dest) {
                     Ok(Some(meta_dest)) => {
@@ -983,9 +1016,10 @@ fn run_file_inner(
                         }
                         if quiet == 0 {
                             println!(
-                                "✓ metadata  {} (embedded)  ->  {}",
-                                input.display(),
-                                meta_dest.display()
+                                "{} metadata  {} (embedded)  ->  {}",
+                                Palette::stdout().paint(Tone::Success, "✓"),
+                                Palette::stdout().paint(Tone::Label, input.display()),
+                                Palette::stdout().paint(Tone::Value, meta_dest.display())
                             );
                         }
                     }
@@ -996,7 +1030,10 @@ fn run_file_inner(
                             log.step(&format!("ERR {:?}: embedded metadata: {e:#}", input));
                         }
                         if quiet == 0 {
-                            eprintln!("error: embedded metadata: {e:#}");
+                            eprintln!(
+                                "{}: embedded metadata: {e:#}",
+                                Palette::stderr().paint(Tone::Error, "error")
+                            );
                         }
                     }
                 }
@@ -1013,7 +1050,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("error: {e:#}");
+                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
                     let mut reported = android_library_input_with_error(
@@ -1067,7 +1104,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("error: {e:#}");
+                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
                 }
                 if let Some(reporter) = reporter {
                     reporter.push(failed_input(input, &e, t0));
@@ -1097,7 +1134,12 @@ fn run_file_inner(
                     log.step(&format!("OK {:?} -> {:?} ({kind:?})", input, dest));
                 }
                 if quiet == 0 {
-                    println!("✓ {:?} -> {:?}", kind, dest);
+                    let palette = Palette::stdout();
+                    println!(
+                        "{} -> {}",
+                        palette.paint(Tone::Success, format!("✓ {kind:?}")),
+                        palette.paint(Tone::Value, format!("{dest:?}"))
+                    );
                 }
                 if !report.ok() {
                     s.suspect = 1;
@@ -1110,7 +1152,11 @@ fn run_file_inner(
                     }
                     if quiet == 0 {
                         eprintln!(
-                            "! integrity check failed (likely to crash at runtime): {}",
+                            "{}: {}",
+                            Palette::stderr().paint(
+                                Tone::Warning,
+                                "! integrity check failed (likely to crash at runtime)"
+                            ),
                             report.issues.join("; ")
                         );
                     }
@@ -1127,7 +1173,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("error: {e:#}");
+                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
                 }
                 if let Some(reporter) = reporter {
                     let mut reported = match profile {
@@ -1275,7 +1321,10 @@ fn deobfuscate_metadata_researched(
         }
         write_atomic(dest, &out)?;
         if verbose {
-            println!("Write to {}", dest.display());
+            println!(
+                "Write to {}",
+                Palette::stdout().paint(Tone::Value, dest.display())
+            );
         }
     }
     Ok((report, layout, metadata_research))
@@ -1706,7 +1755,10 @@ fn unpack_one_researched(
         return (profile, observed, Err(error.into()));
     }
     if verbose {
-        println!("Write to {}", dest.display());
+        println!(
+            "Write to {}",
+            Palette::stdout().paint(Tone::Value, dest.display())
+        );
     }
     (profile, observed, Ok((image.kind, image.integrity)))
 }

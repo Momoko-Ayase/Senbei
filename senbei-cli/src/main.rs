@@ -1,5 +1,8 @@
 use senbei_engine::android::ResourceLimits;
-use senbei_io::{job, pause, scan};
+use senbei_io::{
+    job, pause, scan,
+    ui::{self, ColorMode, Palette, Tone},
+};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -8,14 +11,22 @@ fn main() -> std::process::ExitCode {
         Ok(Outcome::Run(options)) => options,
         Ok(Outcome::Handled(code)) => return code,
         Err(message) => {
-            eprintln!("error: {message}");
+            eprintln!(
+                "{}: {message}",
+                Palette::stderr().paint(Tone::Error, "error")
+            );
             return std::process::ExitCode::from(2);
         }
     };
-    let code = match options.threads {
+    let color = if options.machine {
+        ColorMode::Never
+    } else {
+        options.color
+    };
+    let code = ui::with_color_mode(color, || match options.threads {
         Some(count) => senbei_engine::with_thread_cap(count, || execute(&mut options)),
         None => execute(&mut options),
-    };
+    });
     if !options.machine {
         pause::maybe_pause(options.no_pause);
     }
@@ -42,6 +53,7 @@ struct Options {
     scan_all: bool,
     strict_integrity: bool,
     threads: Option<NonZeroUsize>,
+    color: ColorMode,
     limits: ResourceLimits,
     /// Machine-readable output on stdout and nothing else.
     machine: bool,
@@ -68,6 +80,7 @@ impl Options {
         let mut scan_all = false;
         let mut strict_integrity = false;
         let mut threads = None;
+        let mut color = ColorMode::Auto;
         let mut machine = false;
         let mut dry_run = false;
         let mut limits = ResourceLimits::default();
@@ -91,6 +104,10 @@ impl Options {
                 "--json" => machine = true,
                 "--dry-run" => dry_run = true,
                 "--threads" => threads = Some(parse_thread_cap(args.next().as_deref())?),
+                "--color" => color = parse_color(args.next().as_deref())?,
+                flag if flag.starts_with("--color=") => {
+                    color = parse_color(flag.strip_prefix("--color="))?
+                }
                 flag
                 @ ("--max-entry-mib" | "--max-total-mib" | "--max-entries" | "--max-depth") => {
                     set_resource_limit(&mut limits, flag, args.next().as_deref())?;
@@ -176,10 +193,20 @@ impl Options {
             scan_all,
             strict_integrity,
             threads,
+            color,
             limits,
             machine,
             dry_run,
         }))
+    }
+}
+
+fn parse_color(value: Option<&str>) -> Result<ColorMode, String> {
+    match value {
+        Some("auto") => Ok(ColorMode::Auto),
+        Some("always") => Ok(ColorMode::Always),
+        Some("never") => Ok(ColorMode::Never),
+        _ => Err("--color requires auto, always, or never".to_owned()),
     }
 }
 
@@ -213,7 +240,7 @@ fn execute_inspect(options: &Options, path: &Path, scan_all: bool) -> u8 {
             if options.machine {
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                print!("{}", report.render_text());
+                print!("{}", report.render_text_with_palette(Palette::stdout()));
             }
             code
         }
@@ -222,7 +249,10 @@ fn execute_inspect(options: &Options, path: &Path, scan_all: bool) -> u8 {
                 let report = job::error_report(job::Mode::Inspect, &format!("{error:#}"));
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                eprintln!("error: {error:#}");
+                eprintln!(
+                    "{}: {error:#}",
+                    Palette::stderr().paint(Tone::Error, "error")
+                );
             }
             1
         }
@@ -236,8 +266,8 @@ fn execute_dry_run(options: &Options, path: &Path, scan_all: bool) -> u8 {
             if options.machine {
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                print!("{}", report.render_text());
-                println!("{}", report.summary_line());
+                print!("{}", report.render_text_with_palette(Palette::stdout()));
+                println!("{}", report.summary_line_with_palette(Palette::stdout()));
             }
             code
         }
@@ -246,7 +276,10 @@ fn execute_dry_run(options: &Options, path: &Path, scan_all: bool) -> u8 {
                 let report = job::error_report(job::Mode::DryRun, &format!("{error:#}"));
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                eprintln!("error: {error:#}");
+                eprintln!(
+                    "{}: {error:#}",
+                    Palette::stderr().paint(Tone::Error, "error")
+                );
             }
             1
         }
@@ -255,7 +288,13 @@ fn execute_dry_run(options: &Options, path: &Path, scan_all: bool) -> u8 {
 
 fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
     if options.quiet < 2 && !options.machine {
-        println!("Senbei {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            Palette::stdout().paint(
+                Tone::Heading,
+                format!("Senbei {}", env!("CARGO_PKG_VERSION"))
+            )
+        );
     }
     let out_path = options.out.as_deref().map(Path::new);
     // A machine run goes through the same drivers with an observer attached;
@@ -310,8 +349,12 @@ fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
             if options.machine {
                 println!("{}", collector.finish().to_json());
             } else if options.quiet < 2 {
-                println!("{}", summary.line());
-                println!("done in {} ms", summary.duration_ms);
+                println!("{}", summary.line_with_palette(Palette::stdout()));
+                println!(
+                    "{}",
+                    Palette::stdout()
+                        .paint(Tone::Muted, format!("done in {} ms", summary.duration_ms))
+                );
             }
             exit_code(&summary, options.strict_integrity)
         }
@@ -321,7 +364,10 @@ fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
                 failed.push_error(format!("{error:#}"));
                 println!("{}", failed.finish().to_json());
             } else if options.quiet < 2 {
-                eprintln!("error: {error:#}");
+                eprintln!(
+                    "{}: {error:#}",
+                    Palette::stderr().paint(Tone::Error, "error")
+                );
             }
             1
         }
@@ -383,7 +429,7 @@ fn set_resource_limit(
 
 fn print_help() {
     println!(
-        "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--threads N] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
+        "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--threads N] [--color auto|always|never] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
     );
     println!(
         "  <file|folder>\n\
@@ -415,6 +461,12 @@ fn print_help() {
     println!(
         "  --threads N  positive worker cap for this run. Overrides SENBEI_THREADS;\n\
          \x20              1 selects the sequential path. The environment is unchanged."
+    );
+    println!(
+        "  --color MODE auto (default), always, or never; --color=MODE also works.\n\
+         \x20              Auto colors terminal stdout/stderr separately, unless\n\
+         \x20              NO_COLOR is nonempty or TERM=dumb. Explicit always/never\n\
+         \x20              override these variables. JSON and saved logs stay plain."
     );
     println!(
         "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\

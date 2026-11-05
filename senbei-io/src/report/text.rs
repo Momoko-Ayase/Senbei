@@ -1,12 +1,53 @@
 //! Human-readable research reports. JSON retains the same underlying evidence.
 
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use senbei_engine::windows::{ResearchTrace, TraceValue, WindowsInspection};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{AndroidResearchReport, InputReport};
+use crate::ui::{Painted, Palette, Tone};
+
+struct Text {
+    contents: String,
+    palette: Palette,
+}
+
+impl Text {
+    fn new(palette: Palette) -> Self {
+        Self {
+            contents: String::new(),
+            palette,
+        }
+    }
+}
+
+impl Write for Text {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.contents.write_str(value)
+    }
+}
+
+fn status(palette: Palette, value: &impl Serialize) -> Painted<String> {
+    status_text(palette, label(value))
+}
+
+fn status_text(palette: Palette, value: String) -> Painted<String> {
+    let normalized = value.replace('_', " ");
+    let tone = match normalized.as_str() {
+        "ok" | "clean" | "succeeded" | "restored" | "unchanged" | "accepted" | "matched"
+        | "validated" => Tone::Success,
+        "error" | "failed" | "unreadable" | "rejected" => Tone::Error,
+        "warning" | "warnings" | "suspect" | "blocked" | "unmatched" | "budget limited" => {
+            Tone::Warning
+        }
+        "skipped" | "not run" | "not attempted" | "unavailable" | "absent" | "duplicate"
+        | "not recognized" => Tone::Muted,
+        _ => Tone::Value,
+    };
+    palette.paint(tone, value)
+}
 
 fn label(value: &impl Serialize) -> String {
     match serde_json::to_value(value) {
@@ -16,24 +57,40 @@ fn label(value: &impl Serialize) -> String {
     }
 }
 
-fn hex<T: Into<u64>>(value: Option<T>) -> String {
-    value
-        .map(|value| format!("0x{:X}", value.into()))
-        .unwrap_or_else(|| "unavailable".to_owned())
+fn hex<T: Into<u64>>(palette: Palette, value: Option<T>) -> Painted<String> {
+    let tone = if value.is_some() {
+        Tone::Value
+    } else {
+        Tone::Muted
+    };
+    palette.paint(
+        tone,
+        value
+            .map(|value| format!("0x{:X}", value.into()))
+            .unwrap_or_else(|| "unavailable".to_owned()),
+    )
 }
 
-fn diagnostic(text: &mut String, indent: &str, kind: &str, message: &str) {
+fn diagnostic(text: &mut Text, indent: &str, kind: &str, message: &str) {
+    let tone = match kind {
+        "error" => Tone::Error,
+        "warning" | "parse issue" | "reason" => Tone::Warning,
+        _ => Tone::Muted,
+    };
+    let palette = text.palette;
     for line in message.lines() {
-        let _ = writeln!(text, "{indent}{kind}: {line}");
+        let _ = writeln!(text, "{indent}{}: {line}", palette.paint(tone, kind));
     }
 }
 
-pub(super) fn render_input(input: &InputReport) -> String {
-    let mut text = format!("{}\n", input.path);
+pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
+    let mut text = Text::new(palette);
+    let _ = writeln!(text, "{}", palette.paint(Tone::Heading, &input.path));
     if input.analysis_incomplete {
         let _ = writeln!(
             text,
-            "  analysis incomplete: I/O, resource limits or infrastructure prevented the requested work"
+            "  {}: I/O, resource limits or infrastructure prevented the requested work",
+            palette.paint(Tone::Error, "analysis incomplete")
         );
     }
     if let Some(source) = &input.source {
@@ -42,7 +99,11 @@ pub(super) fn render_input(input: &InputReport) -> String {
             "  source: {} bytes (0x{:X})",
             source.size, source.size
         );
-        let _ = writeln!(text, "  SHA-256: {}", source.sha256);
+        let _ = writeln!(
+            text,
+            "  SHA-256: {}",
+            palette.paint(Tone::Muted, &source.sha256)
+        );
     }
     if let Some(profile) = &input.profile {
         let target = &profile.observed;
@@ -64,7 +125,7 @@ pub(super) fn render_input(input: &InputReport) -> String {
         let _ = writeln!(
             text,
             "  protection recognition: {}",
-            label(&profile.recognition)
+            status(palette, &profile.recognition)
         );
         if !profile.evidence.is_empty() {
             let evidence = profile
@@ -79,8 +140,8 @@ pub(super) fn render_input(input: &InputReport) -> String {
             let _ = writeln!(
                 text,
                 "  route {}: {}",
-                label(&candidate.layout),
-                label(&candidate.outcome)
+                palette.paint(Tone::Label, label(&candidate.layout)),
+                status(palette, &candidate.outcome)
             );
             for message in &candidate.warnings {
                 diagnostic(&mut text, "    ", "warning", message);
@@ -90,20 +151,28 @@ pub(super) fn render_input(input: &InputReport) -> String {
             }
         }
         if let Some(selected) = profile.selected {
-            let _ = writeln!(text, "  selected route: {}", label(&selected));
+            let _ = writeln!(
+                text,
+                "  selected route: {}",
+                palette.paint(Tone::Success, label(&selected))
+            );
         }
-        let _ = writeln!(text, "  static recovery: {}", label(&profile.recovery));
+        let _ = writeln!(
+            text,
+            "  static recovery: {}",
+            status(palette, &profile.recovery)
+        );
         let _ = writeln!(
             text,
             "  output static validation: {}",
-            label(&profile.static_validation)
+            status(palette, &profile.static_validation)
         );
     }
     if let Some(companion) = &input.companion {
         let _ = writeln!(
             text,
             "  companion: {}{}",
-            label(&companion.state),
+            status(palette, &companion.state),
             companion
                 .path
                 .as_ref()
@@ -140,18 +209,18 @@ pub(super) fn render_input(input: &InputReport) -> String {
                 let _ = writeln!(
                     text,
                     "  protected → recovered: entry RVA {} → {} · SizeOfImage {} → {} · sections {} → {}",
-                    hex(before.entry_point_rva),
-                    hex(after.entry_point_rva),
-                    hex(before.size_of_image),
-                    hex(after.size_of_image),
+                    hex(palette, before.entry_point_rva),
+                    hex(palette, after.entry_point_rva),
+                    hex(palette, before.size_of_image),
+                    hex(palette, after.size_of_image),
                     before.sections.len(),
                     after.sections.len()
                 );
                 let _ = writeln!(
                     text,
                     "    DLL characteristics {} → {}",
-                    hex(before.dll_characteristics),
-                    hex(after.dll_characteristics)
+                    hex(palette, before.dll_characteristics),
+                    hex(palette, after.dll_characteristics)
                 );
             }
             render_windows(&mut text, "recovered image (not retained)", restored);
@@ -206,15 +275,19 @@ pub(super) fn render_input(input: &InputReport) -> String {
         render_android(&mut text, "  ", research);
     }
     if let Some(research) = &input.metadata_research {
-        let _ = writeln!(text, "  metadata transform evidence:");
+        let _ = writeln!(
+            text,
+            "  {}:",
+            palette.paint(Tone::Heading, "metadata transform evidence")
+        );
         render_tree(&mut text, "    ", research);
     }
     for entry in &input.entries {
         let _ = writeln!(
             text,
             "  entry {}: {}{}",
-            entry.name,
-            label(&entry.status),
+            palette.paint(Tone::Label, &entry.name),
+            status(palette, &entry.status),
             entry
                 .output
                 .as_ref()
@@ -224,7 +297,8 @@ pub(super) fn render_input(input: &InputReport) -> String {
         if entry.analysis_incomplete {
             let _ = writeln!(
                 text,
-                "    analysis incomplete: requested entry analysis could not finish"
+                "    {}: requested entry analysis could not finish",
+                palette.paint(Tone::Error, "analysis incomplete")
             );
         }
         if let Some(layout) = entry.layout {
@@ -249,7 +323,11 @@ pub(super) fn render_input(input: &InputReport) -> String {
             render_android(&mut text, "    ", research);
         }
         if let Some(research) = &entry.metadata_research {
-            let _ = writeln!(text, "    metadata transform evidence:");
+            let _ = writeln!(
+                text,
+                "    {}:",
+                palette.paint(Tone::Heading, "metadata transform evidence")
+            );
             render_tree(&mut text, "      ", research);
         }
     }
@@ -260,8 +338,8 @@ pub(super) fn render_input(input: &InputReport) -> String {
         let _ = writeln!(
             text,
             "  stage {}: {}{}",
-            label(&stage.stage),
-            label(&stage.status),
+            palette.paint(Tone::Label, label(&stage.stage)),
+            status(palette, &stage.status),
             stage
                 .duration_ms
                 .map(|elapsed| format!(" · {elapsed} ms"))
@@ -298,14 +376,20 @@ pub(super) fn render_input(input: &InputReport) -> String {
     let _ = writeln!(
         text,
         "  inspection status: {} · {} ms",
-        label(&input.status),
+        status(palette, &input.status),
         input.duration_ms
     );
-    text
+    text.contents
 }
 
-fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspection) {
-    let _ = writeln!(text, "  {heading}: {} bytes", inspection.input_len);
+fn render_windows(text: &mut Text, heading: &str, inspection: &WindowsInspection) {
+    let palette = text.palette;
+    let _ = writeln!(
+        text,
+        "  {}: {} bytes",
+        palette.paint(Tone::Heading, heading),
+        inspection.input_len
+    );
     if let Some(pe) = &inspection.pe {
         let machine = match pe.machine {
             Some(0x14c) => "x86",
@@ -316,8 +400,8 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    PE header: {} · {machine} ({})",
-            hex(pe.pe_offset),
-            hex(pe.machine)
+            hex(palette, pe.pe_offset),
+            hex(palette, pe.machine)
         );
         let _ = writeln!(
             text,
@@ -334,15 +418,15 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    image base: {} · SizeOfImage: {} · SizeOfHeaders: {}",
-            hex(pe.image_base),
-            hex(pe.size_of_image),
-            hex(pe.size_of_headers)
+            hex(palette, pe.image_base),
+            hex(palette, pe.size_of_image),
+            hex(palette, pe.size_of_headers)
         );
         let _ = writeln!(
             text,
             "    entry point: RVA {} · file offset {} · file-backed: {}",
-            hex(pe.entry_point_rva),
-            hex(pe.entry_point_file_offset),
+            hex(palette, pe.entry_point_rva),
+            hex(palette, pe.entry_point_file_offset),
             pe.entry_point_available
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unavailable".to_owned())
@@ -350,14 +434,14 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    alignments: section {} · file {}",
-            hex(pe.section_alignment),
-            hex(pe.file_alignment)
+            hex(palette, pe.section_alignment),
+            hex(palette, pe.file_alignment)
         );
         let _ = writeln!(
             text,
             "    declared flags: COFF {} · DLL {} (runtime behavior not tested)",
-            hex(pe.characteristics),
-            hex(pe.dll_characteristics)
+            hex(palette, pe.characteristics),
+            hex(palette, pe.dll_characteristics)
         );
         for flag in &pe.named_flags {
             let _ = writeln!(
@@ -368,19 +452,28 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
                 flag.bit
             );
         }
-        let _ = writeln!(text, "    sections ({}):", pe.sections.len());
         let _ = writeln!(
             text,
-            "      # name       RVA          virtual size raw offset   raw size     R W X"
+            "    {} ({}):",
+            palette.paint(Tone::Label, "sections"),
+            pe.sections.len()
+        );
+        let _ = writeln!(
+            text,
+            "{}",
+            palette.paint(
+                Tone::Label,
+                "      # name       RVA          virtual size raw offset   raw size     R W X"
+            )
         );
         for section in &pe.sections {
             let p = &section.permissions;
             let name = section.name.escape_debug().to_string();
             let _ = writeln!(
                 text,
-                "      {:>2} {:<10} 0x{:08X} 0x{:08X}   0x{:08X} 0x{:08X}   {} {} {}",
+                "      {:>2} {} 0x{:08X} 0x{:08X}   0x{:08X} 0x{:08X}   {} {} {}",
                 section.index,
-                name,
+                palette.paint(Tone::Label, format!("{name:<10}")),
                 section.virtual_address,
                 section.virtual_size,
                 section.raw_offset,
@@ -407,17 +500,22 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
                 let _ = writeln!(text, "         observation: {}", label(anomaly));
             }
         }
-        let _ = writeln!(text, "    data directories ({}):", pe.directories.len());
+        let _ = writeln!(
+            text,
+            "    {} ({}):",
+            palette.paint(Tone::Label, "data directories"),
+            pe.directories.len()
+        );
         for directory in &pe.directories {
             let _ = writeln!(
                 text,
-                "      {:>2} {:<18} {} 0x{:08X} · size 0x{:X} · file {} · {}",
+                "      {:>2} {} {} 0x{:08X} · size 0x{:X} · file {} · {}",
                 directory.index,
-                directory.name,
+                palette.paint(Tone::Label, format!("{:<18}", directory.name)),
                 label(&directory.address_space),
                 directory.address,
                 directory.size,
-                hex(directory.file_offset),
+                hex(palette, directory.file_offset),
                 label(&directory.mapping)
             );
             if let Some(note) = directory.note {
@@ -461,7 +559,7 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    header-table decode: magic {} · supported KONN: {}",
-            hex(protection.magic),
+            hex(palette, protection.magic),
             protection.magic_recognized
         );
         for word in &protection.header_words {
@@ -513,7 +611,7 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    payload probe: {} · scratch requested 0x{:X} · constructed 0x{:X} · ceiling 0x{:X}",
-            label(&probe.status),
+            status(palette, &probe.status),
             probe.requested_length,
             probe.decoded_length,
             probe.limit_bytes
@@ -539,7 +637,7 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    shell discovery: {} · {} positions scanned · {} candidates reported",
-            label(&discovery.status),
+            status(palette, &discovery.status),
             discovery.positions_scanned,
             discovery.candidates.len()
         );
@@ -550,18 +648,18 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
             let _ = writeln!(
                 text,
                 "      {}: {} · decoded offset {} · image RVA {} · source file {}",
-                label(&candidate.kind),
-                label(&candidate.status),
-                hex(candidate.payload_offset),
-                hex(candidate.image_rva),
-                hex(candidate.source_file_offset)
+                palette.paint(Tone::Label, label(&candidate.kind)),
+                status(palette, &candidate.status),
+                hex(palette, candidate.payload_offset),
+                hex(palette, candidate.image_rva),
+                hex(palette, candidate.source_file_offset)
             );
             let _ = writeln!(text, "        {}", candidate.reason);
             for field in &candidate.fields {
                 let _ = writeln!(
                     text,
                     "        {} = 0x{:X}{}",
-                    field.name,
+                    palette.paint(Tone::Label, field.name),
                     field.value,
                     field
                         .space
@@ -576,7 +674,7 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
         let _ = writeln!(
             text,
             "    {} [{}]: {}",
-            label(&issue.severity),
+            status(palette, &issue.severity),
             issue.area,
             issue.message
         );
@@ -584,22 +682,28 @@ fn render_windows(text: &mut String, heading: &str, inspection: &WindowsInspecti
     if inspection.work.budget_limited {
         let _ = writeln!(
             text,
-            "    inspection work was budget-limited; omitted probes are not negative evidence"
+            "    {}",
+            palette.paint(
+                Tone::Warning,
+                "inspection work was budget-limited; omitted probes are not negative evidence"
+            )
         );
     }
 }
 
-fn render_trace(text: &mut String, trace: &ResearchTrace) {
+fn render_trace(text: &mut Text, trace: &ResearchTrace) {
+    let palette = text.palette;
     let _ = writeln!(
         text,
-        "  actual static-pipeline discoveries ({} events):",
+        "  {} ({} events):",
+        palette.paint(Tone::Heading, "actual static-pipeline discoveries"),
         trace.events.len()
     );
     let mut previous = String::new();
     for event in &trace.events {
         let stage = label(&event.stage);
         if previous != stage {
-            let _ = writeln!(text, "    {stage}:");
+            let _ = writeln!(text, "    {}:", palette.paint(Tone::Label, &stage));
             previous = stage;
         }
         let value = match &event.value {
@@ -621,7 +725,13 @@ fn render_trace(text: &mut String, trace: &ResearchTrace) {
             .as_ref()
             .map(|address| format!(" @ {} 0x{:X}", label(&address.space), address.offset))
             .unwrap_or_default();
-        let _ = writeln!(text, "      {}: {value}{provenance}", event.name);
+        let _ = writeln!(
+            text,
+            "      {}: {}{}",
+            palette.paint(Tone::Label, event.name),
+            status_text(palette, value),
+            palette.paint(Tone::Muted, provenance)
+        );
         if let Some(note) = event.note {
             let _ = writeln!(text, "        {note}");
         }
@@ -629,28 +739,44 @@ fn render_trace(text: &mut String, trace: &ResearchTrace) {
     if trace.truncated {
         let _ = writeln!(
             text,
-            "    trace truncated at {} events; {} events omitted",
-            trace.limit, trace.dropped
+            "    {}",
+            palette.paint(
+                Tone::Warning,
+                format!(
+                    "trace truncated at {} events; {} events omitted",
+                    trace.limit, trace.dropped
+                )
+            )
         );
     }
 }
 
-fn render_android(text: &mut String, indent: &str, research: &AndroidResearchReport) {
-    let _ = writeln!(text, "{indent}Android extraction evidence:");
+fn render_android(text: &mut Text, indent: &str, research: &AndroidResearchReport) {
+    let palette = text.palette;
+    let _ = writeln!(
+        text,
+        "{indent}{}:",
+        palette.paint(Tone::Heading, "Android extraction evidence")
+    );
     render_tree(text, &format!("{indent}  "), &research.extraction);
     if let Some(restoration) = &research.restoration {
-        let _ = writeln!(text, "{indent}Android restoration evidence:");
+        let _ = writeln!(
+            text,
+            "{indent}{}:",
+            palette.paint(Tone::Heading, "Android restoration evidence")
+        );
         render_tree(text, &format!("{indent}  "), restoration);
     }
 }
 
-fn render_tree(text: &mut String, indent: &str, value: &Value) {
+fn render_tree(text: &mut Text, indent: &str, value: &Value) {
+    let palette = text.palette;
     match value {
         Value::Object(fields) => {
             for (name, value) in fields {
                 match value {
                     Value::Array(_) | Value::Object(_) => {
-                        let _ = writeln!(text, "{indent}{name}:");
+                        let _ = writeln!(text, "{indent}{}:", palette.paint(Tone::Label, name));
                         render_tree(text, &format!("{indent}  "), value);
                     }
                     Value::Number(number) => {
@@ -658,13 +784,28 @@ fn render_tree(text: &mut String, indent: &str, value: &Value) {
                             .as_u64()
                             .map(|value| format!("{value} (0x{value:X})"))
                             .unwrap_or_else(|| number.to_string());
-                        let _ = writeln!(text, "{indent}{name}: {numeric}");
+                        let _ = writeln!(
+                            text,
+                            "{indent}{}: {}",
+                            palette.paint(Tone::Label, name),
+                            palette.paint(Tone::Value, numeric)
+                        );
                     }
                     Value::String(value) => {
-                        let _ = writeln!(text, "{indent}{name}: {}", value.escape_debug());
+                        let _ = writeln!(
+                            text,
+                            "{indent}{}: {}",
+                            palette.paint(Tone::Label, name),
+                            status_text(palette, value.escape_debug().to_string())
+                        );
                     }
                     _ => {
-                        let _ = writeln!(text, "{indent}{name}: {value}");
+                        let _ = writeln!(
+                            text,
+                            "{indent}{}: {}",
+                            palette.paint(Tone::Label, name),
+                            palette.paint(Tone::Value, value)
+                        );
                     }
                 }
             }
@@ -690,6 +831,73 @@ mod tests {
     use senbei_engine::{Kind, ObservedTarget, ProtectionProfile, TargetFormat};
     use std::path::Path;
 
+    fn strip_styles(text: &str) -> String {
+        let mut plain = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                assert_eq!(chars.next(), Some('['));
+                for code in chars.by_ref() {
+                    if code == 'm' {
+                        break;
+                    }
+                    assert!(code.is_ascii_digit() || code == ';');
+                }
+            } else {
+                plain.push(ch);
+            }
+        }
+        plain
+    }
+
+    #[test]
+    fn colors_distinguish_findings_from_actual_recovery_verdicts() {
+        let palette = Palette::colored();
+        for (value, tone) in [
+            ("recognized", Tone::Value),
+            ("structural_candidate", Tone::Value),
+            ("succeeded", Tone::Success),
+            ("clean", Tone::Success),
+            ("suspect", Tone::Warning),
+            ("failed", Tone::Error),
+            ("not_attempted", Tone::Muted),
+        ] {
+            assert_eq!(
+                status(palette, &value).to_string(),
+                palette.paint(tone, value.replace('_', " ")).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn trace_and_tree_strings_keep_literal_underscores() {
+        use senbei_engine::windows::{ResearchEvent, ResearchStage};
+        let trace = ResearchTrace {
+            events: vec![ResearchEvent {
+                stage: ResearchStage::Header,
+                name: "route",
+                value: TraceValue::Text("exe_style".to_owned()),
+                address: None,
+                note: None,
+            }],
+            truncated: false,
+            dropped: 0,
+            limit: 1,
+        };
+        for palette in [Palette::plain(), Palette::colored()] {
+            let mut text = Text::new(palette);
+            render_trace(&mut text, &trace);
+            render_tree(
+                &mut text,
+                "",
+                &serde_json::json!({"path": "app_data/module_0c.bin"}),
+            );
+            let plain = strip_styles(&text.contents);
+            assert!(plain.contains("route: exe_style"));
+            assert!(plain.contains("path: app_data/module_0c.bin"));
+        }
+    }
+
     #[test]
     fn text_keeps_target_source_context_and_diagnostics() {
         let mut input = InputReport::new(Path::new("module.exe"), Role::Content);
@@ -713,7 +921,10 @@ mod tests {
             StageReport::new(Stage::Recovery, StageStatus::Failed)
                 .detail("parameters were unavailable"),
         );
-        let text = render_input(&input);
+        let text = render_input(&input, Palette::plain());
+        let colored = render_input(&input, Palette::colored());
+        assert!(colored.contains('\x1b'));
+        assert_eq!(strip_styles(&colored), text);
         for fact in [
             "SHA-256:",
             "pe32",
@@ -746,8 +957,19 @@ mod tests {
             dropped: 2,
             limit: 1,
         };
-        let mut text = String::new();
+        let mut text = Text::new(Palette::plain());
         render_trace(&mut text, &trace);
+        let text = text.contents;
+        let mut colored = Text::new(Palette::colored());
+        render_trace(&mut colored, &trace);
+        assert_eq!(strip_styles(&colored.contents), text);
+        assert!(
+            colored.contents.contains(
+                &Palette::colored()
+                    .paint(Tone::Value, "0x00001234 (4660)")
+                    .to_string()
+            )
+        );
         for fact in [
             "0x00001234",
             "file offset 0x1000",
@@ -769,7 +991,10 @@ mod tests {
         });
         input.metadata_research =
             Some(serde_json::json!({"tried_seeds": [0x5678], "route": "seeded"}));
-        let text = render_input(&input);
+        let text = render_input(&input, Palette::plain());
+        let colored = render_input(&input, Palette::colored());
+        assert!(colored.contains('\x1b'));
+        assert_eq!(strip_styles(&colored), text);
         for fact in [
             "header_seed: 4660 (0x1234)",
             "module_registry:",

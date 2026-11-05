@@ -469,38 +469,64 @@ impl Report {
         })
     }
 
-    /// One-line summary in the same shape as [`crate::job::Summary::line`].
+    /// Plain summary in the same shape as [`crate::job::Summary::line`].
     pub fn summary_line(&self) -> String {
+        self.summary_line_with_palette(crate::ui::Palette::plain())
+    }
+
+    /// Console summary with colors for actual nonzero outcomes.
+    pub fn summary_line_with_palette(&self, palette: crate::ui::Palette) -> String {
+        use crate::ui::{Tone, count};
+
         let s = &self.summary;
         let mut line = format!(
             "{} unpacked · {} skipped · {} errors · {} suspect · {} metadata",
-            s.recovered, s.skipped, s.errors, s.suspect, s.metadata
+            count(palette, s.recovered, Tone::Success),
+            count(palette, s.skipped, Tone::Muted),
+            count(palette, s.errors, Tone::Error),
+            count(palette, s.suspect, Tone::Warning),
+            count(palette, s.metadata, Tone::Success)
         );
         if s.packages > 0 {
-            line.push_str(&format!(" · {} packages", s.packages));
+            line.push_str(&format!(
+                " · {} packages",
+                palette.paint(Tone::Value, s.packages)
+            ));
         }
         line
     }
 
-    /// Human-readable rendering, one block per input, for non-`--json` runs.
+    /// Plain human-readable rendering, independent of the destination terminal.
     pub fn render_text(&self) -> String {
+        self.render_text_with_palette(crate::ui::Palette::plain())
+    }
+
+    /// Human-readable rendering with an explicit console palette. Report data
+    /// and JSON remain unstyled; callers select the destination's color policy.
+    pub fn render_text_with_palette(&self, palette: crate::ui::Palette) -> String {
+        use crate::ui::Tone;
+
         let mut text = String::new();
         if let Some(scan) = self.scan {
             text.push_str(&format!(
-                "scan: {} probed non-targets · {} walk errors · {} probe errors\n",
-                scan.non_target_skipped, scan.walk_errors, scan.probe_errors
+                "{}: {} probed non-targets · {} walk errors · {} probe errors\n",
+                palette.paint(Tone::Heading, "scan"),
+                scan.non_target_skipped,
+                scan.walk_errors,
+                scan.probe_errors
             ));
             if scan.walk_errors > 0 || scan.probe_errors > 0 {
-                text.push_str("warning: analysis is incomplete; some directory entries or selected files could not be examined\n");
+                text.push_str(&format!("{}: analysis is incomplete; some directory entries or selected files could not be examined\n", palette.paint(Tone::Warning, "warning")));
             }
         }
         for input in &self.inputs {
-            text.push_str(&text::render_input(input));
+            text.push_str(&text::render_input(input, palette));
         }
-        if !self.errors.is_empty() {
-            for error in &self.errors {
-                text.push_str(&format!("error: {error}\n"));
-            }
+        for error in &self.errors {
+            text.push_str(&format!(
+                "{}: {error}\n",
+                palette.paint(Tone::Error, "error")
+            ));
         }
         text
     }
@@ -813,6 +839,30 @@ mod tests {
         assert_eq!(value["summary"]["errors"], 0);
         assert_eq!(value["tool"]["name"], "senbei");
         assert!(value["inputs"][0]["recovered"]["sha256"].is_string());
+    }
+
+    #[test]
+    fn console_colors_never_enter_report_data_or_plain_rendering() {
+        use crate::ui::{Palette, Tone};
+
+        let mut collector = Collector::new(Mode::Inspect);
+        collector.push(sample_input(InputStatus::Error));
+        collector.set_scan(ScanReport {
+            walk_errors: 1,
+            ..ScanReport::default()
+        });
+        collector.push_error("input could not be examined");
+        let report = collector.finish();
+        let json = report.to_json();
+        let plain = report.render_text();
+        let colored = report.render_text_with_palette(Palette::colored());
+        assert!(colored.contains(&Palette::colored().paint(Tone::Heading, "scan").to_string()));
+        assert!(colored.contains(&Palette::colored().paint(Tone::Error, "error").to_string()));
+        assert!(!plain.contains('\x1b'));
+        assert!(!json.contains('\x1b'));
+        assert!(!json.contains("\\u001b"));
+        assert_eq!(report.to_json(), json);
+        assert_eq!(report.render_text_with_palette(Palette::plain()), plain);
     }
 
     #[test]
