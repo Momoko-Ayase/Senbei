@@ -318,7 +318,9 @@ fn metadata_outcome(data: &[u8]) -> (Option<u32>, ProtectionProfile, MetadataTra
             profile.push_warning("metadata is already de-obfuscated; no tokens were rewritten");
         }
         Err(error) => {
-            profile.recognition = RecognitionStatus::Recognized;
+            // A version/magic match plus a failed transform cannot establish
+            // that protected method fields were present in this input.
+            profile.recognition = RecognitionStatus::Blocked;
             profile.candidates = vec![LayoutAttempt {
                 layout: route,
                 outcome: AttemptOutcome::Failed,
@@ -331,6 +333,28 @@ fn metadata_outcome(data: &[u8]) -> (Option<u32>, ProtectionProfile, MetadataTra
     }
     profile.static_validation = ValidationStatus::NotRun;
     (version, profile, result)
+}
+
+#[cfg(test)]
+mod metadata_profile_tests {
+    use super::*;
+    use senbei_engine::{RecognitionStatus, RecoveryStatus, ValidationStatus};
+
+    #[test]
+    fn failed_metadata_transform_has_no_protection_verdict() {
+        for version in [31u32, 999] {
+            let mut input = 0xFAB1_1BAFu32.to_le_bytes().to_vec();
+            input.extend_from_slice(&version.to_le_bytes());
+            let (observed, profile, result) = metadata_outcome(&input);
+            assert!(result.is_err());
+            assert_eq!(observed, Some(version));
+            assert_eq!(profile.recognition, RecognitionStatus::Blocked);
+            assert!(profile.evidence.is_empty());
+            assert_eq!(profile.recovery, RecoveryStatus::Failed);
+            assert_eq!(profile.static_validation, ValidationStatus::NotRun);
+            assert!(profile.selected.is_none());
+        }
+    }
 }
 
 /// Outcome of [`deobfuscate_metadata_reported`].

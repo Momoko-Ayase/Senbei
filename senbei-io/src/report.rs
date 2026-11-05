@@ -741,7 +741,9 @@ pub(crate) fn metadata_failed_profile(
     let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::metadata(
         identity.map(|identity| identity.raw_version),
     ));
-    profile.recognition = RecognitionStatus::Recognized;
+    // An attempted transform that did not validate establishes no protection
+    // verdict, even when the metadata header identifies a known version.
+    profile.recognition = RecognitionStatus::Blocked;
     profile.candidates = vec![senbei_engine::LayoutAttempt {
         layout: route,
         outcome: AttemptOutcome::Failed,
@@ -763,6 +765,25 @@ mod tests {
         input.status = status;
         input.recovered = Some(Digest::of(b"bytes"));
         input
+    }
+
+    #[test]
+    fn a_failed_metadata_transform_cannot_claim_protection() {
+        for version in [31u32, 999] {
+            let mut header = 0xFAB1_1BAFu32.to_le_bytes().to_vec();
+            header.extend_from_slice(&version.to_le_bytes());
+            let profile = metadata_failed_profile(
+                senbei_metadata::identify(&header),
+                LayoutKind::MetadataStructural,
+                "transform did not validate",
+            );
+            assert_eq!(profile.observed.metadata_version, Some(version));
+            assert_eq!(profile.recognition, RecognitionStatus::Blocked);
+            assert!(profile.evidence.is_empty());
+            assert_eq!(profile.recovery, RecoveryStatus::Failed);
+            assert_eq!(profile.static_validation, ValidationStatus::NotRun);
+            assert!(profile.selected.is_none());
+        }
     }
 
     #[test]
