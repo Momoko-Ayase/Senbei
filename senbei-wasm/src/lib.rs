@@ -264,6 +264,8 @@ pub fn deobfuscate_metadata_reported(data: &[u8]) -> MetadataReport {
     MetadataReport::from_outcome(version, profile, result)
 }
 
+type MetadataTransform = Result<(Vec<u8>, senbei_metadata::Report), senbei_metadata::Error>;
+
 /// Build the metadata profile the same way the I/O report does, so the browser
 /// export and the CLI JSON report describe one transform identically.
 ///
@@ -273,13 +275,7 @@ pub fn deobfuscate_metadata_reported(data: &[u8]) -> MetadataReport {
 ///   nothing was transformed, so there is no protection evidence;
 /// * the PE static check does not apply to metadata output, so
 ///   `static_validation` stays `not_run` in every case.
-fn metadata_outcome(
-    data: &[u8],
-) -> (
-    Option<u32>,
-    ProtectionProfile,
-    Result<(Vec<u8>, senbei_metadata::Report), senbei_metadata::Error>,
-) {
+fn metadata_outcome(data: &[u8]) -> (Option<u32>, ProtectionProfile, MetadataTransform) {
     use senbei_engine::{
         AttemptOutcome, LayoutAttempt, LayoutKind, ObservedTarget, ProtectionEvidence,
         RecognitionStatus, RecoveryStatus, ValidationStatus,
