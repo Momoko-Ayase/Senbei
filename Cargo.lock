@@ -424,9 +424,12 @@ dependencies = [
 name = "senbei-cli"
 version = "1.3.4"
 dependencies = [
+ "anyhow",
  "senbei-engine",
  "senbei-io",
  "senbei-metadata",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
 ]

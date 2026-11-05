@@ -16,7 +16,10 @@ senbei-io.workspace = true
 senbei-engine.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 senbei-io.workspace = true
 senbei-metadata.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
