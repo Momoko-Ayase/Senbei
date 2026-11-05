@@ -27,29 +27,32 @@
 //! metadata (its tokens already equal `local_index + 1`), so it is safe to run on
 //! any il2cpp game — `remapped == 0` then reports that nothing changed.
 
+pub use crate::common::is_metadata;
+
 use crate::common::MAGIC;
+use crate::layout::{HEADER, MetadataVersion, V31};
 
 /// Metadata format version this de-obfuscator understands. The struct strides
 /// and header field offsets below are specific to it; other versions are left
 /// untouched rather than risk corrupting a layout we have not verified.
 /// (Observed on real games shipping version 31 / Unity 2022.3.)
-const SUPPORTED_VERSION: u32 = 31;
+const SUPPORTED_VERSION: u32 = MetadataVersion::V31.raw();
 
 // --- Il2CppGlobalMetadataHeader field byte-offsets (each is an i32 offset/size
-//     pair). Shared layout across recent versions. ---
-const HDR_METHODS: usize = 0x30; // methodsOffset / methodsSize
-const HDR_TYPES: usize = 0xA0; // typeDefinitionsOffset / size
-const HDR_IMAGES: usize = 0xA8; // imagesOffset / size
+//     pair). ---
+const HDR_METHODS: usize = HEADER.methods; // methodsOffset / methodsSize
+const HDR_TYPES: usize = HEADER.types; // typeDefinitionsOffset / size
+const HDR_IMAGES: usize = HEADER.images; // imagesOffset / size
 
-// --- version-31 struct strides and field offsets ---
-const METHOD_STRIDE: usize = 0x24; // sizeof(Il2CppMethodDefinition)
-const METHOD_TOKEN_OFF: usize = 0x18; // .token (u32)
-const TYPE_STRIDE: usize = 0x58; // sizeof(Il2CppTypeDefinition)
-const TYPE_METHOD_START_OFF: usize = 0x24; // .methodStart (i32)
-const TYPE_METHOD_COUNT_OFF: usize = 0x40; // .method_count (u16)
-const IMAGE_STRIDE: usize = 0x28; // sizeof(Il2CppImageDefinition)
-const IMAGE_TYPE_START_OFF: usize = 0x08; // .typeStart (i32)
-const IMAGE_TYPE_COUNT_OFF: usize = 0x0C; // .typeCount (u32)
+// --- verified version-31 struct strides and field offsets ---
+const METHOD_STRIDE: usize = V31.method.stride;
+const METHOD_TOKEN_OFF: usize = V31.method.token;
+const TYPE_STRIDE: usize = V31.types.stride;
+const TYPE_METHOD_START_OFF: usize = V31.types.method_start;
+const TYPE_METHOD_COUNT_OFF: usize = V31.types.method_count;
+const IMAGE_STRIDE: usize = V31.images.stride;
+const IMAGE_TYPE_START_OFF: usize = V31.images.type_start;
+const IMAGE_TYPE_COUNT_OFF: usize = V31.images.type_count;
 
 /// `IMAGE_CODE_GEN_MODULE` method-definition token table id (`0x06 << 24`).
 const METHOD_TOKEN_TABLE: u32 = 0x0600_0000;
@@ -92,11 +95,6 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-
-/// Cheap check for the il2cpp metadata sanity magic, for scanning prefixes.
-pub fn is_metadata(data: &[u8]) -> bool {
-    rd_u32(data, 0) == Some(MAGIC)
-}
 
 /// De-obfuscate the method tokens in an il2cpp `global-metadata.dat`.
 ///

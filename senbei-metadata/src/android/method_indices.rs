@@ -8,11 +8,12 @@
 use serde::Serialize;
 
 use crate::common::MAGIC;
+use crate::layout::{HEADER, MetadataVersion, V24_1_METHOD_INDEX};
 
-const RAW_VERSION_24: u32 = 24;
-const HDR_METHODS: usize = 0x30;
-const V24_1_METHOD_STRIDE: usize = 0x34;
-const V24_1_METHOD_INDEX_OFFSET: usize = 0x14;
+const RAW_VERSION_24: u32 = MetadataVersion::V24.raw();
+const HDR_METHODS: usize = HEADER.methods;
+const V24_1_METHOD_STRIDE: usize = V24_1_METHOD_INDEX.stride;
+const V24_1_METHOD_INDEX_OFFSET: usize = V24_1_METHOD_INDEX.index;
 const V24_1_SELECTOR: u32 = 1;
 const EXCEPTION_COUNT: usize = 256;
 

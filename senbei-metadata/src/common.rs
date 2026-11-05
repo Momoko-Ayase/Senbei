@@ -1,7 +1,6 @@
 //! Shared IL2CPP metadata header primitives.
 
-/// IL2CPP global-metadata sanity magic.
-pub(crate) const MAGIC: u32 = 0xFAB1_1BAF;
+pub(crate) use crate::layout::MAGIC;
 
 /// Cheap check used by both platform scanners before opening a full metadata
 /// file.

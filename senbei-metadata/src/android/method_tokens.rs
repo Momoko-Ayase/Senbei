@@ -3,48 +3,39 @@
 use serde::Serialize;
 
 use crate::common::MAGIC;
+#[cfg(test)]
+use crate::layout::V31;
+use crate::layout::v39 as v39_layout;
+use crate::layout::{self, HEADER, MetadataVersion, V29};
 
 /// Seed embedded in the current `libil2cpp` module `0x0C`.
 pub const DEFAULT_METHOD_TOKEN_SEED: u32 = 0xa6fa_e968;
 
-const SUPPORTED_V29: u32 = 29;
-const SUPPORTED_V31: u32 = 31;
-const HDR_METHODS: usize = 0x30;
-const HDR_TYPES: usize = 0xa0;
-const HDR_IMAGES: usize = 0xa8;
-const TYPE_STRIDE: usize = 0x58;
-const TYPE_METHOD_START_OFFSET: usize = 0x24;
-const TYPE_METHOD_COUNT_OFFSET: usize = 0x40;
-const IMAGE_STRIDE: usize = 0x28;
-const IMAGE_TYPE_START_OFFSET: usize = 0x08;
-const IMAGE_TYPE_COUNT_OFFSET: usize = 0x0c;
+#[cfg(test)]
+const SUPPORTED_V29: u32 = MetadataVersion::V29.raw();
+#[cfg(test)]
+const SUPPORTED_V31: u32 = MetadataVersion::V31.raw();
+const SUPPORTED_V39: u32 = MetadataVersion::V39.raw();
+const HDR_METHODS: usize = HEADER.methods;
+const HDR_TYPES: usize = HEADER.types;
+const HDR_IMAGES: usize = HEADER.images;
+const TYPE_STRIDE: usize = V29.types.stride;
+const TYPE_METHOD_START_OFFSET: usize = V29.types.method_start;
+const TYPE_METHOD_COUNT_OFFSET: usize = V29.types.method_count;
+const IMAGE_STRIDE: usize = V29.images.stride;
+const IMAGE_TYPE_START_OFFSET: usize = V29.images.type_start;
+const IMAGE_TYPE_COUNT_OFFSET: usize = V29.images.type_count;
 const METHOD_TOKEN_TABLE: u32 = 0x0600_0000;
 
 // The aliases keep the v31 synthetic fixtures readable; production paths use
 // the version-specific layout returned by `layout_for_version`.
 #[cfg(test)]
-const METHOD_STRIDE: usize = 0x24;
+const METHOD_STRIDE: usize = V31.method.stride;
 #[cfg(test)]
-const METHOD_TOKEN_OFFSET: usize = 0x18;
+const METHOD_TOKEN_OFFSET: usize = V31.method.token;
 
-#[derive(Clone, Copy)]
-struct Layout {
-    method_stride: usize,
-    method_token_offset: usize,
-}
-
-fn layout_for_version(version: u32) -> Option<Layout> {
-    match version {
-        SUPPORTED_V29 => Some(Layout {
-            method_stride: 0x20,
-            method_token_offset: 0x14,
-        }),
-        SUPPORTED_V31 => Some(Layout {
-            method_stride: 0x24,
-            method_token_offset: 0x18,
-        }),
-        _ => None,
-    }
+fn layout_for_version(version: u32) -> Option<layout::FixedLayout> {
+    layout::fixed_layout(version)
 }
 
 /// Summary of one metadata restoration pass.
@@ -198,7 +189,7 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
         return Err(Error::NotMetadata);
     }
     let version = read_u32(data, 4)?;
-    if version == 39 {
+    if version == SUPPORTED_V39 {
         return restore_v39(data, seed);
     }
     let Some(layout) = layout_for_version(version) else {
@@ -208,13 +199,13 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
     let (method_offset, method_size) = table(data, HDR_METHODS)?;
     let (type_offset, type_size) = table(data, HDR_TYPES)?;
     let (image_offset, image_size) = table(data, HDR_IMAGES)?;
-    if method_size % layout.method_stride != 0
+    if method_size % layout.method.stride != 0
         || type_size % TYPE_STRIDE != 0
         || image_size % IMAGE_STRIDE != 0
     {
         return malformed("method/type/image table size is not divisible by its entry stride");
     }
-    let method_count = method_size / layout.method_stride;
+    let method_count = method_size / layout.method.stride;
     let type_count = type_size / TYPE_STRIDE;
     let image_count = image_size / IMAGE_STRIDE;
     let mut owners = vec![u32::MAX; method_count];
@@ -295,7 +286,7 @@ pub fn restore_method_tokens(data: &[u8], seed: u32) -> Result<(Vec<u8>, Report)
         let mut image_already_clean = true;
         for &method_index in &methods {
             let token_offset =
-                method_offset + method_index * layout.method_stride + layout.method_token_offset;
+                method_offset + method_index * layout.method.stride + layout.method.token;
             let token = read_u32(data, token_offset)?;
             if token & 0xff00_0000 != METHOD_TOKEN_TABLE {
                 return malformed(format!(
@@ -399,7 +390,7 @@ pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
         return Err(Error::NotMetadata);
     }
     let version = read_u32(data, 4)?;
-    if version == 39 {
+    if version == SUPPORTED_V39 {
         return discover_v39(data);
     }
     let Some(layout) = layout_for_version(version) else {
@@ -412,13 +403,13 @@ pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
     let (method_offset, method_size) = table(data, HDR_METHODS)?;
     let (type_offset, type_size) = table(data, HDR_TYPES)?;
     let (image_offset, image_size) = table(data, HDR_IMAGES)?;
-    if method_size % layout.method_stride != 0
+    if method_size % layout.method.stride != 0
         || type_size % TYPE_STRIDE != 0
         || image_size % IMAGE_STRIDE != 0
     {
         return malformed("method/type/image table size is not divisible by its entry stride");
     }
-    let method_count = method_size / layout.method_stride;
+    let method_count = method_size / layout.method.stride;
     let type_count = type_size / TYPE_STRIDE;
     let image_count = image_size / IMAGE_STRIDE;
     let mut reports = Vec::with_capacity(image_count);
@@ -480,7 +471,7 @@ pub fn discover_method_token_seeds(data: &[u8]) -> Result<SeedDiscoveryReport> {
         for method_index in methods {
             let token = read_u32(
                 data,
-                method_offset + method_index * layout.method_stride + layout.method_token_offset,
+                method_offset + method_index * layout.method.stride + layout.method.token,
             )?;
             if token & 0xff00_0000 != METHOD_TOKEN_TABLE {
                 return validation(format!(
@@ -584,12 +575,12 @@ fn decrypt_rid_with_key(rid: u32, low: u32, high: u32, key: u32) -> u32 {
     value + low
 }
 
-const V39_METHODS: usize = 5;
-const V39_PARAMETERS: usize = 10;
-const V39_GENERIC_CONTAINERS: usize = 14;
-const V39_INTERFACE_OFFSETS: usize = 18;
-const V39_TYPES: usize = 19;
-const V39_IMAGES: usize = 20;
+const V39_METHODS: usize = v39_layout::SECTION_METHODS;
+const V39_PARAMETERS: usize = v39_layout::SECTION_PARAMETERS;
+const V39_GENERIC_CONTAINERS: usize = v39_layout::SECTION_GENERIC_CONTAINERS;
+const V39_INTERFACE_OFFSETS: usize = v39_layout::SECTION_INTERFACE_OFFSETS;
+const V39_TYPES: usize = v39_layout::SECTION_TYPES;
+const V39_IMAGES: usize = v39_layout::SECTION_IMAGES;
 
 #[derive(Debug, Clone, Copy)]
 struct V39Layout {
@@ -609,10 +600,10 @@ struct V39Layout {
 }
 
 fn v39_section(data: &[u8], index: usize) -> Result<(usize, usize, usize)> {
-    let header = 8_usize
+    let header = v39_layout::SECTION_HEADER_BASE
         .checked_add(
             index
-                .checked_mul(12)
+                .checked_mul(v39_layout::SECTION_HEADER_STRIDE)
                 .ok_or_else(|| Error::Malformed("v39 section header offset overflow".to_owned()))?,
         )
         .ok_or_else(|| Error::Malformed("v39 section header offset overflow".to_owned()))?;
@@ -621,16 +612,6 @@ fn v39_section(data: &[u8], index: usize) -> Result<(usize, usize, usize)> {
     let count = read_u32(data, header + 8)? as usize;
     bytes(data, offset, size)?;
     Ok((offset, size, count))
-}
-
-fn v39_index_width(count: usize) -> usize {
-    if count <= u8::MAX as usize {
-        1
-    } else if count <= u16::MAX as usize {
-        2
-    } else {
-        4
-    }
 }
 
 fn read_v39_index(data: &[u8], offset: usize, width: usize) -> Result<usize> {
@@ -650,90 +631,48 @@ fn parse_v39(data: &[u8]) -> Result<V39Layout> {
         v39_section(data, V39_INTERFACE_OFFSETS)?;
     let (type_offset, type_size, type_count) = v39_section(data, V39_TYPES)?;
     let (image_offset, image_size, image_count) = v39_section(data, V39_IMAGES)?;
-    let parameter_index_width = v39_index_width(parameter_count);
-    let generic_container_index_width = v39_index_width(generic_count);
-    let type_definition_index_width = v39_index_width(type_count);
-    let type_index_width = if interface_count == 0 {
-        4
-    } else {
-        let element_size = interface_size
-            .checked_div(interface_count)
-            .ok_or_else(|| Error::Malformed("v39 interface-offset size is invalid".to_owned()))?;
-        element_size
-            .checked_sub(4)
-            .filter(|width| matches!(width, 1 | 2 | 4))
-            .ok_or_else(|| Error::Malformed("v39 type-index width is invalid".to_owned()))?
-    };
-    let method_stride = 20_usize
-        .checked_add(type_definition_index_width)
-        .and_then(|size| size.checked_add(type_index_width))
-        .and_then(|size| size.checked_add(parameter_index_width))
-        .and_then(|size| size.checked_add(generic_container_index_width))
-        .ok_or_else(|| Error::Malformed("v39 method stride overflow".to_owned()))?;
-    let type_stride = 68_usize
-        .checked_add(
-            type_index_width
-                .checked_mul(3)
-                .ok_or_else(|| Error::Malformed("v39 type stride overflow".to_owned()))?,
-        )
-        .and_then(|size| size.checked_add(generic_container_index_width))
-        .ok_or_else(|| Error::Malformed("v39 type stride overflow".to_owned()))?;
-    let image_stride = 32_usize
-        .checked_add(
-            type_definition_index_width
-                .checked_mul(2)
-                .ok_or_else(|| Error::Malformed("v39 image stride overflow".to_owned()))?,
-        )
-        .ok_or_else(|| Error::Malformed("v39 image stride overflow".to_owned()))?;
-    if method_count.checked_mul(method_stride) != Some(method_size)
-        || type_count.checked_mul(type_stride) != Some(type_size)
-        || image_count.checked_mul(image_stride) != Some(image_size)
+    let type_definition_index_width = v39_layout::index_width(type_count);
+    let type_index_width = v39_layout::type_index_width(interface_size, interface_count)
+        .ok_or_else(|| Error::Malformed("v39 type-index width is invalid".to_owned()))?;
+    let records = v39_layout::Records::from_widths(v39_layout::Widths {
+        type_definition: type_definition_index_width,
+        type_index: type_index_width,
+        parameter: v39_layout::index_width(parameter_count),
+        generic_container: v39_layout::index_width(generic_count),
+    })
+    .ok_or_else(|| Error::Malformed("v39 compact record layout overflow".to_owned()))?;
+    if method_count.checked_mul(records.method_stride) != Some(method_size)
+        || type_count.checked_mul(records.type_stride) != Some(type_size)
+        || image_count.checked_mul(records.image_stride) != Some(image_size)
         || parameter_count == 0 && parameter_size != 0
     {
         return malformed("v39 table size does not match its compact entry layout");
     }
-    let type_method_start_offset = 16_usize
-        .checked_add(
-            type_index_width
-                .checked_mul(3)
-                .ok_or_else(|| Error::Malformed("v39 type method offset overflow".to_owned()))?,
-        )
-        .and_then(|offset| offset.checked_add(generic_container_index_width))
-        .ok_or_else(|| Error::Malformed("v39 type method offset overflow".to_owned()))?;
-    let type_method_count_offset = type_method_start_offset
-        .checked_add(7 * 4)
-        .ok_or_else(|| Error::Malformed("v39 type method count offset overflow".to_owned()))?;
-    let method_token_offset = 4_usize
-        .checked_add(type_definition_index_width)
-        .and_then(|offset| offset.checked_add(type_index_width))
-        .and_then(|offset| offset.checked_add(4))
-        .and_then(|offset| offset.checked_add(parameter_index_width))
-        .and_then(|offset| offset.checked_add(generic_container_index_width))
-        .ok_or_else(|| Error::Malformed("v39 method token offset overflow".to_owned()))?;
-    if method_token_offset
+    if records
+        .method_token_offset
         .checked_add(4)
-        .is_none_or(|end| end > method_stride)
-        || type_method_count_offset
+        .is_none_or(|end| end > records.method_stride)
+        || records
+            .type_method_count_offset
             .checked_add(2)
-            .is_none_or(|end| end > type_stride)
+            .is_none_or(|end| end > records.type_stride)
     {
         return malformed("v39 compact layout fields exceed their records");
     }
-    // Touch the section base so malformed headers fail before any output copy.
     Ok(V39Layout {
         method_offset,
         method_count,
-        method_stride,
-        method_token_offset,
+        method_stride: records.method_stride,
+        method_token_offset: records.method_token_offset,
         type_definition_index_width,
         type_offset,
         type_count,
-        type_stride,
-        type_method_start_offset,
-        type_method_count_offset,
+        type_stride: records.type_stride,
+        type_method_start_offset: records.type_method_start_offset,
+        type_method_count_offset: records.type_method_count_offset,
         image_offset,
         image_count,
-        image_stride,
+        image_stride: records.image_stride,
     })
 }
 
@@ -793,7 +732,7 @@ fn v39_report(
     seed: u32,
 ) -> Report {
     Report {
-        version: 39,
+        version: SUPPORTED_V39,
         seed: format!("0x{seed:08X}"),
         encryption_status: if changed_tokens == 0 {
             "clean".to_owned()
@@ -1005,7 +944,7 @@ fn discover_v39(data: &[u8]) -> Result<SeedDiscoveryReport> {
         // The caller still tries the known default seed and validates it fully.
         if anchor.modulus < 1024 {
             return Ok(SeedDiscoveryReport {
-                version: 39,
+                version: SUPPORTED_V39,
                 images: reports,
                 seed_candidates: candidates,
             });
@@ -1030,7 +969,7 @@ fn discover_v39(data: &[u8]) -> Result<SeedDiscoveryReport> {
     candidates.sort_unstable();
     candidates.dedup();
     Ok(SeedDiscoveryReport {
-        version: 39,
+        version: SUPPORTED_V39,
         images: reports,
         seed_candidates: candidates,
     })

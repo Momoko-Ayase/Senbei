@@ -8,3 +8,6 @@ description = "Unity il2cpp metadata de-obfuscation for Senbei"
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
