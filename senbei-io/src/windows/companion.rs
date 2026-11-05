@@ -99,7 +99,7 @@ pub(super) fn prepare_companion(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn put32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -107,7 +107,7 @@ mod tests {
     }
 
     /// Generated PE and entry record; no protected binary bytes are embedded.
-    fn stub() -> Vec<u8> {
+    pub(crate) fn stub() -> Vec<u8> {
         let mut bytes = vec![0; 0x3000];
         bytes[..2].copy_from_slice(b"MZ");
         put32(&mut bytes, 0x3c, 0x80);

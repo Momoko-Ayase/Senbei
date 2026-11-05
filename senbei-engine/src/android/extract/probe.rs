@@ -1,10 +1,15 @@
 use std::path::Path;
 
 use senbei_crypto::android::Module9bConfig;
+use senbei_elf::AARCH64_MACHINE;
 
 use super::error::Error;
 use super::stage1::{self, DEFAULT_CIPHER_CONSTANT, DEFAULT_OUTER_SIZE};
 use crate::android::ResourceLimits;
+use crate::profile::{
+    AttemptOutcome, LayoutAttempt, LayoutKind, ObservedTarget, ProtectionEvidence,
+    ProtectionProfile, RecognitionStatus, TargetFormat,
+};
 
 /// Return whether `data` has a supported protected AArch64 IL2CPP layout.
 ///
@@ -38,9 +43,84 @@ pub fn probe_libil2cpp_with_limits(data: &[u8], limits: &ResourceLimits) -> Resu
     Ok(Module9bConfig::parse_embedded(&stage1.plaintext).is_ok())
 }
 
+/// [`is_protected_libil2cpp`] with the profile that produced the answer.
+///
+/// A false answer is `NotRecognized`. A size that exceeds the default ceilings
+/// stays a [`Error::Limit`] inside the profile rather than silently becoming
+/// "not protected": `RecognitionStatus::Blocked` plus the limit text. The
+/// matched case lists the staged route as `NotAttempted`; the probe never
+/// claims recovery.
+#[must_use]
+pub fn is_protected_libil2cpp_profiled(data: &[u8]) -> (ProtectionProfile, bool) {
+    let (profile, result) = probe_libil2cpp_profiled_with_limits(data, &ResourceLimits::default());
+    let protected = result.unwrap_or(false);
+    (profile, protected)
+}
+
+/// [`probe_libil2cpp_with_limits`] with its evidence preserved.
+///
+/// The profile is returned even when the probe returns [`Error::Limit`], and in
+/// that case `recognition` is `Blocked`, never `NotRecognized`.
+pub fn probe_libil2cpp_profiled_with_limits(
+    data: &[u8],
+    limits: &ResourceLimits,
+) -> (ProtectionProfile, Result<bool, Error>) {
+    let mut profile = ProtectionProfile::new(ObservedTarget::android(android_target_format(data)));
+    match probe_libil2cpp_with_limits(data, limits) {
+        Ok(true) => {
+            profile.recognition = RecognitionStatus::Recognized;
+            profile.evidence = vec![
+                ProtectionEvidence::PrivateSection,
+                ProtectionEvidence::AesSchedule,
+            ];
+            profile
+                .candidates
+                .push(LayoutAttempt::not_attempted(LayoutKind::AndroidStaged));
+            (profile, Ok(true))
+        }
+        Ok(false) => {
+            profile.recognition = RecognitionStatus::NotRecognized;
+            (profile, Ok(false))
+        }
+        Err(error) => {
+            profile.recognition = RecognitionStatus::Blocked;
+            profile.push_error(error.to_string());
+            if let Error::Limit(_) = error {
+                profile
+                    .candidates
+                    .push(LayoutAttempt::not_attempted(LayoutKind::AndroidStaged));
+            }
+            (profile, Err(error))
+        }
+    }
+}
+
+fn android_target_format(data: &[u8]) -> Option<TargetFormat> {
+    let elf = senbei_elf::parse(data).ok()?;
+    (elf.header.e_machine == AARCH64_MACHINE).then_some(TargetFormat::Elf64Aarch64)
+}
+
+/// Mark a matched Android profile as recovered after a successful restore.
+///
+/// The I/O adapter calls this after the staged restore actually writes an
+/// image; the probe alone must not claim recovery.
+pub fn record_android_recovered(profile: &mut ProtectionProfile) {
+    if profile.recognition == RecognitionStatus::Recognized {
+        profile.candidates = vec![LayoutAttempt {
+            layout: LayoutKind::AndroidStaged,
+            outcome: AttemptOutcome::Succeeded,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }];
+        profile.selected = Some(LayoutKind::AndroidStaged);
+        profile.recovery = crate::profile::RecoveryStatus::Succeeded;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::RecoveryStatus;
 
     /// Stage 1 header words, encrypted with the default cipher constant.
     fn encrypt_header(words: [u32; 8]) -> [u8; 0x20] {
@@ -129,5 +209,62 @@ mod tests {
             !probe_libil2cpp_with_limits(&[], &limits).expect("an empty image is not protected")
         );
         assert!(!is_protected_libil2cpp(&[]));
+    }
+
+    #[test]
+    fn profiled_limit_is_blocked_with_the_error_retained() {
+        let image = elf_with_payload_size(8);
+        let limits = ResourceLimits {
+            max_entry_bytes: 4,
+            max_total_bytes: 4,
+            ..ResourceLimits::default()
+        };
+        let (profile, result) = probe_libil2cpp_profiled_with_limits(&image, &limits);
+        assert!(matches!(result, Err(Error::Limit(_))));
+        assert_eq!(profile.recognition, RecognitionStatus::Blocked);
+        assert_ne!(profile.recognition, RecognitionStatus::NotRecognized);
+        assert!(!profile.errors.is_empty());
+        assert!(
+            profile
+                .errors
+                .iter()
+                .any(|error| error.contains("resource limit")),
+            "{:?}",
+            profile.errors
+        );
+        assert_eq!(profile.selected, None);
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::NotAttempted);
+    }
+
+    #[test]
+    fn profiled_not_protected_image_is_recognized_as_absent() {
+        let (profile, result) =
+            probe_libil2cpp_profiled_with_limits(&[], &ResourceLimits::default());
+        assert!(result.is_ok_and(|protected| !protected));
+        assert_eq!(profile.recognition, RecognitionStatus::NotRecognized);
+        assert!(profile.candidates.is_empty());
+        assert_eq!(
+            profile.observed.platform,
+            crate::profile::Platform::AndroidElf
+        );
+    }
+
+    #[test]
+    fn profiled_matched_image_lists_staged_route_without_claiming_recovery() {
+        // A complete, parseable Stage 1 + module 0x0C would require a full
+        // protected image; this fixture only reaches the pre-probe format
+        // branch, so verify the route contract on a profile built from it.
+        let mut profile =
+            ProtectionProfile::new(ObservedTarget::android(Some(TargetFormat::Elf64Aarch64)));
+        profile.recognition = RecognitionStatus::Recognized;
+        profile
+            .candidates
+            .push(LayoutAttempt::not_attempted(LayoutKind::AndroidStaged));
+        assert_eq!(profile.recovery, RecoveryStatus::NotAttempted);
+        assert_eq!(profile.selected, None);
+        record_android_recovered(&mut profile);
+        assert_eq!(profile.recovery, RecoveryStatus::Succeeded);
+        assert_eq!(profile.selected, Some(LayoutKind::AndroidStaged));
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::Succeeded);
     }
 }

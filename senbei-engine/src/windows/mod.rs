@@ -8,6 +8,13 @@ mod layout;
 pub(crate) mod parallel;
 
 use senbei_crypto::primitives;
+use serde::Serialize;
+
+use crate::profile::{
+    AttemptOutcome, LayoutAttempt, LayoutKind, ObservedTarget, ProtectionEvidence,
+    ProtectionProfile, RecognitionStatus, RecoveryStatus, TargetFormat,
+};
+use integrity::IntegritySeverity as ProfileSeverity;
 
 pub(crate) use crate::panic_capture::{PanicCapture, current_panic_capture, with_panic_capture};
 
@@ -64,7 +71,8 @@ pub(crate) fn is_supported_magic(magic: u32) -> bool {
     magic == MAGIC_KONN
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     NativeExe,
     ManagedExe,
@@ -197,6 +205,246 @@ pub fn unpack_auto_v(input: &[u8], verbose: bool) -> Result<(Kind, Vec<u8>), Unp
     Ok((detected.kind, out))
 }
 
+/// Inspect a Windows input without recovering it.
+///
+/// Recognizes the supported header magic, records the PE format/kind, and lists
+/// the routes a recovery would attempt. No candidate is run, so
+/// [`ProtectionProfile::selected`](crate::profile::ProtectionProfile::selected)
+/// stays `None` and every candidate is `NotAttempted`. Companion splicing is
+/// the I/O layer's job: pass the spliced bytes and mark the profile with
+/// [`ProtectionProfile::record_companion_spliced`](crate::profile::ProtectionProfile::record_companion_spliced).
+#[must_use]
+pub fn inspect_profile(input: &[u8]) -> ProtectionProfile {
+    let detected = detect(input);
+    inspect_detected(input, detected)
+}
+
+fn inspect_detected(input: &[u8], detected: Option<Detected>) -> ProtectionProfile {
+    let mut profile = ProtectionProfile::new(ObservedTarget::windows(
+        pe_target_format(input),
+        detected.map(|detected| detected.kind),
+    ));
+    let Some(detected) = detected else {
+        profile.recognition = RecognitionStatus::NotRecognized;
+        return profile;
+    };
+    profile.recognition = RecognitionStatus::Recognized;
+    profile.evidence.push(ProtectionEvidence::HeaderMagic);
+    profile.candidates = planned_routes(detected.kind);
+    profile
+}
+
+fn planned_routes(kind: Kind) -> Vec<LayoutAttempt> {
+    match kind {
+        Kind::NativeExe | Kind::ManagedExe => {
+            vec![LayoutAttempt::not_attempted(LayoutKind::ExeStyle)]
+        }
+        Kind::NativeDll | Kind::ManagedDll => vec![
+            LayoutAttempt::not_attempted(LayoutKind::Dll),
+            LayoutAttempt::not_attempted(LayoutKind::ExeStyle),
+        ],
+    }
+}
+
+fn pe_target_format(input: &[u8]) -> Option<TargetFormat> {
+    let headers = senbei_pe::parse(input).ok()?;
+    Some(if headers.is_pe32_plus {
+        TargetFormat::Pe32Plus
+    } else {
+        TargetFormat::Pe32
+    })
+}
+
+/// Detect, recover, and return the profile that records the route taken.
+///
+/// This is [`unpack_auto`] with its evidence preserved: the profile is returned
+/// on success and on [`Err`], so a failed attempt still says which routes ran
+/// and why they were rejected.
+pub fn unpack_auto_profiled(
+    input: &[u8],
+) -> (ProtectionProfile, Result<(Kind, Vec<u8>), UnpackError>) {
+    unpack_auto_profiled_v(input, false)
+}
+
+/// Verbose counterpart of [`unpack_auto_profiled`].
+pub fn unpack_auto_profiled_v(
+    input: &[u8],
+    verbose: bool,
+) -> (ProtectionProfile, Result<(Kind, Vec<u8>), UnpackError>) {
+    let detected = detect(input);
+    let mut profile = inspect_detected(input, detected);
+    let Some(detected) = detected else {
+        let error = UnpackError::NotCrackproof;
+        profile.push_error(error.to_string());
+        return (profile, Err(error));
+    };
+    let result = match detected.kind {
+        Kind::NativeExe | Kind::ManagedExe => {
+            run_exe_attempt(&mut profile, input, verbose).map(|out| (detected.kind, out))
+        }
+        Kind::NativeDll | Kind::ManagedDll => select_dll_layout_profiled(
+            &mut profile,
+            || dll::unpack_dll_v(input, verbose),
+            || exe::unpack_v(input, verbose),
+        )
+        .map(|out| (detected.kind, out)),
+    };
+    (profile, result)
+}
+
+/// Run only the EXE-style route and return its profile.
+///
+/// The external-companion I/O path uses this after splicing, because that
+/// layout is definitionally the EXE-style shell.
+pub fn unpack_exe_profiled(input: &[u8]) -> (ProtectionProfile, Result<Vec<u8>, UnpackError>) {
+    unpack_exe_profiled_v(input, false)
+}
+
+/// Verbose counterpart of [`unpack_exe_profiled`].
+pub fn unpack_exe_profiled_v(
+    input: &[u8],
+    verbose: bool,
+) -> (ProtectionProfile, Result<Vec<u8>, UnpackError>) {
+    let detected = detect(input);
+    let mut profile = inspect_detected(input, detected);
+    if detected.is_none() {
+        let error = UnpackError::NotCrackproof;
+        profile.push_error(error.to_string());
+        return (profile, Err(error));
+    }
+    // This entry point will never run the DLL route, so a DLL-kind detection's
+    // planned DLL candidate must not appear as an untried option.
+    profile
+        .candidates
+        .retain(|attempt| attempt.layout == LayoutKind::ExeStyle);
+    let result = run_exe_attempt(&mut profile, input, verbose);
+    (profile, result)
+}
+
+fn run_exe_attempt(
+    profile: &mut ProtectionProfile,
+    input: &[u8],
+    verbose: bool,
+) -> Result<Vec<u8>, UnpackError> {
+    match exe::unpack_v(input, verbose) {
+        Ok(out) => {
+            let report = integrity::check(&out);
+            let warnings = profile_messages(&report, ProfileSeverity::Warning);
+            profile.record_attempt(
+                LayoutKind::ExeStyle,
+                AttemptOutcome::Succeeded,
+                warnings,
+                Vec::new(),
+            );
+            profile.selected = Some(LayoutKind::ExeStyle);
+            profile.recovery = RecoveryStatus::Succeeded;
+            profile.record_static_validation(&report);
+            Ok(out)
+        }
+        Err(error) => {
+            profile.record_attempt(
+                LayoutKind::ExeStyle,
+                AttemptOutcome::Failed,
+                Vec::new(),
+                vec![error.to_string()],
+            );
+            profile.recovery = RecoveryStatus::Failed;
+            profile.push_error(error.to_string());
+            Err(error)
+        }
+    }
+}
+
+/// `select_dll_layout`, additionally recording each candidate in `profile`.
+///
+/// Routing and gates are exactly those of [`select_dll_layout`]: the DLL layout
+/// is accepted whenever it has no fatal finding, warnings included; the EXE
+/// layout runs only after the DLL layout errors or is structurally invalid.
+fn select_dll_layout_profiled<D, E>(
+    profile: &mut ProtectionProfile,
+    dll_layout: D,
+    exe_layout: E,
+) -> Result<Vec<u8>, UnpackError>
+where
+    D: FnOnce() -> Result<Vec<u8>, UnpackError>,
+    E: FnOnce() -> Result<Vec<u8>, UnpackError>,
+{
+    match accept_dll_layout(dll_layout()) {
+        Ok((output, report)) => {
+            record_accepted(profile, LayoutKind::Dll, report);
+            Ok(output)
+        }
+        Err(dll) => {
+            record_rejected(profile, LayoutKind::Dll, &dll);
+            match accept_dll_layout(exe_layout()) {
+                Ok((output, report)) => {
+                    record_accepted(profile, LayoutKind::ExeStyle, report);
+                    Ok(output)
+                }
+                Err(exe) => {
+                    record_rejected(profile, LayoutKind::ExeStyle, &exe);
+                    profile.recovery = RecoveryStatus::Failed;
+                    let error = UnpackError::PipelineFallbackFailed {
+                        dll: Box::new(dll.error),
+                        exe: Box::new(exe.error),
+                    };
+                    profile.push_error(error.to_string());
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+fn record_accepted(profile: &mut ProtectionProfile, layout: LayoutKind, report: IntegrityReport) {
+    let warnings = profile_messages(&report, ProfileSeverity::Warning);
+    profile.record_attempt(layout, AttemptOutcome::Succeeded, warnings, Vec::new());
+    profile.selected = Some(layout);
+    profile.recovery = RecoveryStatus::Succeeded;
+    profile.record_static_validation(&report);
+}
+
+fn record_rejected(profile: &mut ProtectionProfile, layout: LayoutKind, failure: &LayoutFailure) {
+    let (warnings, errors) = match &failure.report {
+        Some(report) => (
+            profile_messages(report, ProfileSeverity::Warning),
+            profile_messages(report, ProfileSeverity::Fatal),
+        ),
+        None => (Vec::new(), vec![failure.error.to_string()]),
+    };
+    let outcome = if failure.report.is_some() {
+        AttemptOutcome::Rejected
+    } else {
+        AttemptOutcome::Failed
+    };
+    profile.record_attempt(layout, outcome, warnings, errors);
+}
+
+fn profile_messages(report: &IntegrityReport, severity: ProfileSeverity) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == severity)
+        .map(|finding| finding.message.clone())
+        .collect()
+}
+
+/// One rejected layout attempt and the report that rejected it, if the
+/// pipeline produced an image at all.
+struct LayoutFailure {
+    error: UnpackError,
+    report: Option<IntegrityReport>,
+}
+
+impl std::fmt::Debug for LayoutFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayoutFailure")
+            .field("error", &self.error)
+            .field("rejected_by_integrity", &self.report.is_some())
+            .finish()
+    }
+}
+
 /// Pick between the older DLL layout and the EXE-style shell layout.
 ///
 /// `Ok` from a pipeline is not proof it chose the right layout: a wrong layout
@@ -225,18 +473,28 @@ where
 }
 
 fn validate_dll_layout(output: Result<Vec<u8>, UnpackError>) -> Result<Vec<u8>, UnpackError> {
-    let output = output?;
-    if let Some(report) = dll_layout_invalid(&output) {
-        return Err(UnpackError::InvalidLayoutCandidate {
-            issues: report
-                .findings
-                .into_iter()
-                .filter(|finding| finding.severity == integrity::IntegritySeverity::Fatal)
-                .map(|finding| finding.message)
-                .collect(),
-        });
+    accept_dll_layout(output)
+        .map(|(output, _)| output)
+        .map_err(|failure| failure.error)
+}
+
+/// Run one pipeline and apply the layout gate with a single integrity check.
+fn accept_dll_layout(
+    output: Result<Vec<u8>, UnpackError>,
+) -> Result<(Vec<u8>, IntegrityReport), LayoutFailure> {
+    let output = output.map_err(|error| LayoutFailure {
+        error,
+        report: None,
+    })?;
+    let report = integrity::check(&output);
+    if !report.has_fatal() {
+        return Ok((output, report));
     }
-    Ok(output)
+    let issues = profile_messages(&report, ProfileSeverity::Fatal);
+    Err(LayoutFailure {
+        error: UnpackError::InvalidLayoutCandidate { issues },
+        report: Some(report),
+    })
 }
 
 /// Structural defects that mean a DLL layout candidate must not be accepted.
@@ -251,6 +509,7 @@ fn validate_dll_layout(output: Result<Vec<u8>, UnpackError>) -> Result<Vec<u8>, 
 ///
 /// Severity comes from [`IntegrityReport::has_fatal`], which the checker sets
 /// when it records each finding. This does not re-read issue text.
+#[cfg(test)]
 fn dll_layout_invalid(image: &[u8]) -> Option<IntegrityReport> {
     let report = integrity::check(image);
     report.has_fatal().then_some(report)
@@ -320,6 +579,7 @@ mod tests {
 #[cfg(test)]
 mod dll_layout_selection {
     use super::*;
+    use crate::profile::{Platform, ValidationStatus};
 
     fn pipeline_err(stage: &'static str) -> UnpackError {
         UnpackError::InputTooShort {
@@ -614,5 +874,212 @@ mod dll_layout_selection {
             "{:?}",
             integrity::check(&readable).issues
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiled routing: same gates, evidence preserved.
+    // -----------------------------------------------------------------------
+
+    fn profiled<D, E>(
+        dll_layout: D,
+        exe_layout: E,
+    ) -> (ProtectionProfile, Result<Vec<u8>, UnpackError>)
+    where
+        D: FnOnce() -> Result<Vec<u8>, UnpackError>,
+        E: FnOnce() -> Result<Vec<u8>, UnpackError>,
+    {
+        let mut profile = ProtectionProfile::new(ObservedTarget::windows(
+            Some(TargetFormat::Pe32Plus),
+            Some(Kind::NativeDll),
+        ));
+        profile.recognition = RecognitionStatus::Recognized;
+        profile.candidates = planned_routes(Kind::NativeDll);
+        let result = select_dll_layout_profiled(&mut profile, dll_layout, exe_layout);
+        (profile, result)
+    }
+
+    #[test]
+    fn profiled_keeps_accepting_dll_route_and_leaves_exe_unattempted() {
+        let dll_image = valid_native_dll();
+        let (profile, result) = profiled(
+            || Ok(dll_image.clone()),
+            || panic!("EXE layout must not run when the DLL layout is valid"),
+        );
+        assert_eq!(result.unwrap(), dll_image);
+        assert_eq!(profile.selected, Some(LayoutKind::Dll));
+        assert_eq!(profile.recovery, RecoveryStatus::Succeeded);
+        assert_eq!(profile.static_validation, ValidationStatus::Clean);
+        assert_eq!(profile.candidates.len(), 2);
+        assert_eq!(profile.candidates[0].layout, LayoutKind::Dll);
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::Succeeded);
+        assert_eq!(profile.candidates[1].layout, LayoutKind::ExeStyle);
+        assert_eq!(profile.candidates[1].outcome, AttemptOutcome::NotAttempted);
+        assert!(profile.errors.is_empty());
+    }
+
+    #[test]
+    fn profiled_fallback_retains_the_rejected_dll_attempt_first() {
+        let dll_image = SyntheticPe {
+            entry_rva: 0x9000,
+            ..SyntheticPe::default()
+        }
+        .build();
+        let exe_image = valid_native_dll();
+        let (profile, result) = profiled(|| Ok(dll_image.clone()), || Ok(exe_image.clone()));
+        assert_eq!(result.unwrap(), exe_image);
+        assert_eq!(profile.selected, Some(LayoutKind::ExeStyle));
+        let dll = &profile.candidates[0];
+        assert_eq!(dll.layout, LayoutKind::Dll);
+        assert_eq!(dll.outcome, AttemptOutcome::Rejected);
+        assert!(
+            dll.errors
+                .iter()
+                .any(|error| error.contains("entry point RVA")),
+            "{:?}",
+            dll.errors
+        );
+        let exe = &profile.candidates[1];
+        assert_eq!(exe.outcome, AttemptOutcome::Succeeded);
+        // The accepted image is clean, so the rejected candidate's fatal
+        // findings stay on its own attempt rather than the profile top level.
+        assert!(profile.errors.is_empty());
+    }
+
+    #[test]
+    fn profiled_failure_reports_every_route_and_no_selection() {
+        let invalid = SyntheticPe {
+            entry_rva: 0x9000,
+            ..SyntheticPe::default()
+        }
+        .build();
+        let (profile, result) = profiled(|| Ok(invalid.clone()), || Ok(invalid.clone()));
+        assert!(result.is_err());
+        assert_eq!(profile.selected, None);
+        assert_eq!(profile.recovery, RecoveryStatus::Failed);
+        assert!(!profile.errors.is_empty());
+        assert_eq!(profile.candidates.len(), 2);
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::Rejected);
+        assert_eq!(profile.candidates[1].outcome, AttemptOutcome::Rejected);
+    }
+
+    #[test]
+    fn profiled_pipeline_errors_are_recorded_per_route() {
+        let (profile, result) = profiled(
+            || Err(pipeline_err("dll")),
+            || Err(pipeline_err("exe-layout")),
+        );
+        assert!(matches!(
+            result,
+            Err(UnpackError::PipelineFallbackFailed { .. })
+        ));
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::Failed);
+        assert_eq!(profile.candidates[1].outcome, AttemptOutcome::Failed);
+        assert!(profile.candidates[0].errors[0].contains("got 3"));
+        assert!(profile.candidates[1].errors[0].contains("got 10"));
+    }
+
+    #[test]
+    fn profiled_dll_warning_keeps_the_route_and_records_the_warning() {
+        let warned = SyntheticPe {
+            reloc: false,
+            ..SyntheticPe::default()
+        }
+        .build();
+        let (profile, result) = profiled(
+            || Ok(warned.clone()),
+            || panic!("warnings must not trigger the EXE layout"),
+        );
+        assert_eq!(result.unwrap(), warned);
+        assert_eq!(profile.selected, Some(LayoutKind::Dll));
+        assert_eq!(profile.static_validation, ValidationStatus::Warnings);
+        assert!(!profile.warnings.is_empty());
+        assert_eq!(profile.candidates[0].outcome, AttemptOutcome::Succeeded);
+        assert!(!profile.candidates[0].warnings.is_empty());
+    }
+
+    /// A minimal protected-shaped input `detect` accepts: enough bytes for the
+    /// header key table, a valid PE signature, the DLL characteristic, and a
+    /// PE32+ optional header. Generates header words at offset 4096 so that
+    /// `keys[1]` is the supported magic.
+    fn detected_dll_input() -> Vec<u8> {
+        let mut data = SyntheticPe::default().build();
+        data.resize(0x1100, 0);
+        let pe = 0x80usize;
+        let chars = 0x2000u16 | 0x0002;
+        data[pe + 22..pe + 24].copy_from_slice(&chars.to_le_bytes());
+        // Header key derivation: keys[0] = word(4096);
+        // keys[1] = keys[0] ^ word(4100). Choose keys[0] = 1 so the stored
+        // cell yields the magic.
+        let key0 = 1u32;
+        let cell = key0 ^ MAGIC_KONN;
+        data[4096..4100].copy_from_slice(&key0.to_le_bytes());
+        data[4100..4104].copy_from_slice(&cell.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn inspect_profile_reports_recognition_without_running_a_route() {
+        let profile = inspect_profile(&detected_dll_input());
+        assert_eq!(profile.recognition, RecognitionStatus::Recognized);
+        assert_eq!(profile.observed.platform, Platform::WindowsPe);
+        assert_eq!(profile.observed.format, Some(TargetFormat::Pe32Plus));
+        assert_eq!(profile.observed.kind, Some(Kind::NativeDll));
+        assert!(profile.evidence.contains(&ProtectionEvidence::HeaderMagic));
+        assert_eq!(profile.selected, None);
+        assert_eq!(profile.recovery, RecoveryStatus::NotAttempted);
+        assert_eq!(profile.static_validation, ValidationStatus::NotRun);
+        assert_eq!(profile.candidates.len(), 2);
+        assert!(
+            profile
+                .candidates
+                .iter()
+                .all(|attempt| attempt.outcome == AttemptOutcome::NotAttempted)
+        );
+    }
+
+    #[test]
+    fn profiled_entrypoints_reject_unknown_input_with_evidence() {
+        let sample = vec![0_u8; 64];
+        let (profile, result) = unpack_auto_profiled(&sample);
+        assert!(matches!(result, Err(UnpackError::NotCrackproof)));
+        assert_eq!(profile.recognition, RecognitionStatus::NotRecognized);
+        assert!(profile.candidates.is_empty());
+        assert!(!profile.errors.is_empty());
+
+        let (profile, result) = unpack_exe_profiled(&sample);
+        assert!(matches!(result, Err(UnpackError::NotCrackproof)));
+        assert_eq!(profile.recognition, RecognitionStatus::NotRecognized);
+        assert!(!profile.errors.is_empty());
+    }
+
+    #[test]
+    fn companion_splice_evidence_is_explicit() {
+        let mut profile = inspect_profile(&detected_dll_input());
+        assert!(!profile.observed.external_companion);
+        profile.record_companion_spliced();
+        assert!(profile.observed.external_companion);
+        assert!(
+            profile
+                .evidence
+                .contains(&ProtectionEvidence::CompanionSpliced)
+        );
+        // Pairing proves a splice, not that the loader declares an external
+        // suffix. That declaration requires separate entry-record evidence.
+        assert!(
+            !profile
+                .evidence
+                .contains(&ProtectionEvidence::ExternalCompanionDeclaration)
+        );
+        // Idempotent, and it never claims recovery.
+        profile.record_companion_spliced();
+        assert_eq!(
+            profile
+                .evidence
+                .iter()
+                .filter(|evidence| **evidence == ProtectionEvidence::CompanionSpliced)
+                .count(),
+            1
+        );
+        assert_eq!(profile.recovery, RecoveryStatus::NotAttempted);
     }
 }

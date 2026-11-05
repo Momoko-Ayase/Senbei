@@ -1,6 +1,7 @@
 //! Windows filesystem adapter for PE companion payloads and byte APIs.
 
 use senbei_engine as unpacker;
+use senbei_engine::profile::ProtectionProfile;
 use std::path::Path;
 
 use crate::atomic::write_atomic;
@@ -506,21 +507,144 @@ fn unpack_bytes_impl(
     companion: Option<&[u8]>,
     force_exe: bool,
 ) -> Result<UnpackedImage, unpacker::UnpackError> {
-    let spliced = companion::prepare_companion(input, companion)?;
+    unpack_bytes_profiled_impl(input, companion, force_exe, false).1
+}
+
+/// In-memory unpack that returns the route evidence alongside the result.
+///
+/// The profile is returned on success and on `Err`. It records the actual
+/// Windows route (DLL-first with EXE fallback, or EXE-only for a spliced
+/// companion / forced EXE), every candidate attempt, and — after the companion
+/// export/TLS/CLR overlays — the final image's static validation. When the
+/// splice succeeded the observed target says so and the EXE-style route is the
+/// only candidate, matching [`unpack_spliced_or_auto`].
+pub fn unpack_bytes_profiled(
+    input: &[u8],
+    companion: Option<&[u8]>,
+) -> (
+    ProtectionProfile,
+    Result<UnpackedImage, unpacker::UnpackError>,
+) {
+    unpack_bytes_profiled_impl(input, companion, false, false)
+}
+
+/// Verbose counterpart of [`unpack_bytes_profiled`].
+pub fn unpack_bytes_profiled_v(
+    input: &[u8],
+    companion: Option<&[u8]>,
+    verbose: bool,
+) -> (
+    ProtectionProfile,
+    Result<UnpackedImage, unpacker::UnpackError>,
+) {
+    unpack_bytes_profiled_impl(input, companion, false, verbose)
+}
+
+/// [`unpack_bytes_force_exe`] with the route profile.
+pub fn unpack_bytes_force_exe_profiled(
+    input: &[u8],
+    companion: Option<&[u8]>,
+) -> (
+    ProtectionProfile,
+    Result<UnpackedImage, unpacker::UnpackError>,
+) {
+    unpack_bytes_profiled_impl(input, companion, true, false)
+}
+
+/// Verbose counterpart of [`unpack_bytes_force_exe_profiled`].
+pub fn unpack_bytes_force_exe_profiled_v(
+    input: &[u8],
+    companion: Option<&[u8]>,
+    verbose: bool,
+) -> (
+    ProtectionProfile,
+    Result<UnpackedImage, unpacker::UnpackError>,
+) {
+    unpack_bytes_profiled_impl(input, companion, true, verbose)
+}
+
+fn unpack_bytes_profiled_impl(
+    input: &[u8],
+    companion: Option<&[u8]>,
+    force_exe: bool,
+    verbose: bool,
+) -> (
+    ProtectionProfile,
+    Result<UnpackedImage, unpacker::UnpackError>,
+) {
+    let spliced = match companion::prepare_companion(input, companion) {
+        Ok(spliced) => spliced,
+        Err(error) => {
+            let mut profile = unpacker::inspect_profile(input);
+            profile.recovery = unpacker::RecoveryStatus::Blocked;
+            if matches!(
+                error,
+                unpacker::UnpackError::CompanionMissing | unpacker::UnpackError::CompanionMismatch
+            ) {
+                profile
+                    .evidence
+                    .push(unpacker::ProtectionEvidence::ExternalCompanionDeclaration);
+                profile
+                    .candidates
+                    .retain(|attempt| attempt.layout == unpacker::LayoutKind::ExeStyle);
+            }
+            profile.push_error(error.to_string());
+            return (profile, Err(error));
+        }
+    };
     let bytes: &[u8] = spliced.as_deref().unwrap_or(input);
-    let (kind, mut out) = unpack_spliced_or_auto(bytes, spliced.is_some(), force_exe, false)?;
+    let exe_only = spliced.is_some() || force_exe;
+    let (mut profile, recovered) = if exe_only {
+        let (profile, result) = unpacker::unpack_exe_profiled_v(bytes, verbose);
+        (profile, result)
+    } else {
+        let (profile, result) = unpacker::unpack_auto_profiled_v(bytes, verbose);
+        (profile, result.map(|(_, out)| out))
+    };
+    if spliced.is_some() {
+        profile.record_companion_spliced();
+    }
+    let mut out = match recovered {
+        Ok(out) => out,
+        Err(error) => return (profile, Err(error)),
+    };
     if spliced.is_some() {
         overlay_exports_from_stub(&mut out, input);
         restore_tls_from_stub(&mut out, input);
-        restore_managed_from_stub(&mut out, input)?;
+        if let Err(error) = restore_managed_from_stub(&mut out, input) {
+            profile.recovery = unpacker::RecoveryStatus::Failed;
+            // The candidate's checks remain on its attempt. No final image was
+            // produced after the failed overlay, so final validation did not run.
+            profile.static_validation = unpacker::ValidationStatus::NotRun;
+            profile.warnings.clear();
+            profile.errors.clear();
+            profile.push_error(error.to_string());
+            return (profile, Err(error));
+        }
     }
     let integrity = unpacker::check_integrity(&out);
-    Ok(UnpackedImage {
-        kind,
-        bytes: out,
-        integrity,
-        companion: spliced.is_some(),
-    })
+    // The overlays change the image; the profile must describe the bytes
+    // actually returned, not the pre-overlay candidate.
+    profile.record_static_validation(&integrity);
+    // The profile's observed target was produced by the same detection that
+    // routed recovery; reuse it instead of scanning the header again.
+    let kind = match profile.observed.kind {
+        Some(kind) => kind,
+        None => {
+            let error = unpacker::UnpackError::NotCrackproof;
+            profile.push_error(error.to_string());
+            return (profile, Err(error));
+        }
+    };
+    (
+        profile,
+        Ok(UnpackedImage {
+            kind,
+            bytes: out,
+            integrity,
+            companion: spliced.is_some(),
+        }),
+    )
 }
 
 /// Like [`unpack_one`], but prints detailed `[N/9]` step progress (and a final
@@ -709,5 +833,126 @@ mod tests {
             ));
             assert_eq!(out, before);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profiled byte entry points.
+    // -----------------------------------------------------------------------
+
+    fn detected_dll_without_companion_declaration() -> Vec<u8> {
+        // Header key table at 4096 makes `detect` succeed; the rest of the
+        // file is deliberately not a valid protected image, so recovery fails
+        // after recognition. That is exactly the evidence path under test.
+        let mut data = vec![0_u8; 0x1100];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x80..0x84].copy_from_slice(b"PE\0\0");
+        data[0x80 + 4..0x80 + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        data[0x80 + 6..0x80 + 8].copy_from_slice(&1u16.to_le_bytes());
+        data[0x80 + 20..0x80 + 22].copy_from_slice(&0xf0u16.to_le_bytes());
+        data[0x80 + 22..0x80 + 24].copy_from_slice(&0x2000u16.to_le_bytes());
+        data[0x80 + 24..0x80 + 26].copy_from_slice(&0x20bu16.to_le_bytes());
+        let key0 = 1u32;
+        let cell = key0 ^ 0x4E4E_4F4B;
+        data[HEADER_OFF..HEADER_OFF + 4].copy_from_slice(&key0.to_le_bytes());
+        data[HEADER_OFF + 4..HEADER_OFF + 8].copy_from_slice(&cell.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn profiled_entry_points_return_the_profile_with_a_failed_recovery() {
+        let input = detected_dll_without_companion_declaration();
+        let (profile, result) = unpack_bytes_profiled(&input, None);
+        assert!(result.is_err(), "fixture is not a recoverable image");
+        assert_eq!(profile.recognition, unpacker::RecognitionStatus::Recognized);
+        assert_eq!(profile.observed.kind, Some(unpacker::Kind::NativeDll));
+        assert_eq!(profile.observed.platform, unpacker::Platform::WindowsPe);
+        assert_eq!(profile.selected, None);
+        assert!(!profile.errors.is_empty());
+        assert_eq!(profile.candidates[0].layout, unpacker::LayoutKind::Dll);
+        assert_eq!(
+            profile.candidates[0].outcome,
+            unpacker::AttemptOutcome::Failed
+        );
+        assert_eq!(profile.candidates[1].layout, unpacker::LayoutKind::ExeStyle);
+        assert_eq!(
+            profile.candidates[1].outcome,
+            unpacker::AttemptOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn profiled_force_exe_route_runs_only_the_exe_candidate() {
+        let input = detected_dll_without_companion_declaration();
+        let (profile, result) = unpack_bytes_force_exe_profiled(&input, None);
+        assert!(result.is_err());
+        assert_eq!(profile.candidates.len(), 1);
+        assert_eq!(profile.candidates[0].layout, unpacker::LayoutKind::ExeStyle);
+        assert!(!profile.observed.external_companion);
+    }
+
+    #[test]
+    fn profiled_companion_error_keeps_the_inspection_evidence() {
+        // The companion declaration stub is the one from companion.rs's own
+        // tests; without its payload the error is CompanionMissing.
+        let input = companion::tests::stub();
+        let (profile, result) = unpack_bytes_profiled(&input, None);
+        let error = result.err().expect("companion is missing");
+        assert_eq!(error, unpacker::UnpackError::CompanionMissing);
+        assert_eq!(profile.recognition, unpacker::RecognitionStatus::Recognized);
+        assert_eq!(profile.recovery, unpacker::RecoveryStatus::Blocked);
+        assert_eq!(
+            profile.static_validation,
+            unpacker::ValidationStatus::NotRun
+        );
+        assert!(
+            profile
+                .evidence
+                .contains(&unpacker::ProtectionEvidence::ExternalCompanionDeclaration)
+        );
+        assert!(
+            !profile
+                .evidence
+                .contains(&unpacker::ProtectionEvidence::CompanionSpliced)
+        );
+        assert!(
+            profile
+                .candidates
+                .iter()
+                .all(|attempt| attempt.outcome == unpacker::AttemptOutcome::NotAttempted)
+        );
+        assert!(!profile.errors.is_empty());
+        assert_eq!(profile.selected, None);
+    }
+
+    #[test]
+    fn profiled_splice_marks_the_external_companion_and_exe_route() {
+        let input = companion::tests::stub();
+        let payload = &input[HEADER_OFF..];
+        let (profile, result) = unpack_bytes_profiled(&input, Some(payload));
+        // The synthetic stub is recognized and spliced, but its payload is not
+        // a recoverable protected image, so recovery fails after the splice.
+        assert!(result.is_err());
+        assert!(profile.observed.external_companion);
+        assert!(
+            profile
+                .evidence
+                .contains(&unpacker::ProtectionEvidence::CompanionSpliced)
+        );
+        assert_eq!(profile.candidates.len(), 1);
+        assert_eq!(profile.candidates[0].layout, unpacker::LayoutKind::ExeStyle);
+        assert_eq!(profile.selected, None);
+    }
+
+    #[test]
+    fn profiled_unknown_input_is_not_recognized() {
+        let (profile, result) = unpack_bytes_profiled(&[], None);
+        assert!(matches!(result, Err(unpacker::UnpackError::NotCrackproof)));
+        assert_eq!(
+            profile.recognition,
+            unpacker::RecognitionStatus::NotRecognized
+        );
+        assert!(profile.candidates.is_empty());
+        assert_eq!(profile.observed.kind, None);
     }
 }
