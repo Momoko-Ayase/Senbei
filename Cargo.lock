@@ -479,6 +479,8 @@ dependencies = [
  "senbei-engine",
  "senbei-metadata",
  "senbei-pe",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "walkdir",

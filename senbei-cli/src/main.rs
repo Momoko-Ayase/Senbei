@@ -3,106 +3,324 @@ use senbei_io::{job, pause, scan};
 use std::path::Path;
 
 fn main() -> std::process::ExitCode {
-    let mut args = std::env::args().skip(1);
-    let mut path: Option<String> = None;
-    let mut out: Option<String> = None;
-    let mut quiet: u8 = 0;
-    let mut no_pause = false;
-    let mut no_log = false;
-    let mut verbose = false;
-    let mut scan_all = false;
-    let mut strict_integrity = false;
-    let mut limits = ResourceLimits::default();
-
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "-h" | "--help" => {
-                print_help();
-                return std::process::ExitCode::SUCCESS;
-            }
-            "-V" | "--version" => {
-                println!("Senbei {}", env!("CARGO_PKG_VERSION"));
-                return std::process::ExitCode::SUCCESS;
-            }
-            "-q" | "--quiet" => quiet = quiet.saturating_add(1),
-            "-v" | "--verbose" => verbose = true,
-            "--no-pause" => no_pause = true,
-            "--no-log" => no_log = true,
-            "--scan-all" => scan_all = true,
-            "--strict-integrity" => strict_integrity = true,
-            flag @ ("--max-entry-mib" | "--max-total-mib" | "--max-entries" | "--max-depth") => {
-                if let Err(message) = set_resource_limit(&mut limits, flag, args.next().as_deref())
-                {
-                    eprintln!("error: {message}");
-                    return std::process::ExitCode::from(2);
-                }
-            }
-            "--out" => match args.next() {
-                Some(v) if !v.starts_with('-') => out = Some(v),
-                _ => {
-                    eprintln!("error: --out requires a directory argument");
-                    return std::process::ExitCode::from(2);
-                }
-            },
-            other if other.starts_with('-') => {
-                eprintln!("error: unknown option '{other}'");
-                print_help();
-                return std::process::ExitCode::from(2);
-            }
-            other => {
-                if let Some(prev) = &path {
-                    eprintln!("error: multiple input paths given ('{prev}' and '{other}')");
-                    return std::process::ExitCode::from(2);
-                }
-                path = Some(other.to_string());
-            }
-        }
-    }
-
-    let code = match path {
-        None => {
-            print_help();
-            2
-        }
-        Some(p) => {
-            if quiet < 2 {
-                println!("Senbei {}", env!("CARGO_PKG_VERSION"));
-            }
-            let p = Path::new(&p);
-            let out_path = out.as_deref().map(Path::new);
-            let result = if p.is_dir() {
-                job::run_folder_with_limits(
-                    p,
-                    out_path,
-                    quiet,
-                    verbose,
-                    no_log,
-                    scan_all || scan::scan_all_env(),
-                    &limits,
-                )
-            } else {
-                job::run_file_with_limits(p, out_path, quiet, verbose, no_log, &limits)
-            };
-            match result {
-                Ok(summary) => {
-                    if quiet < 2 {
-                        println!("{}", summary.line());
-                        println!("done in {} ms", summary.duration_ms);
-                    }
-                    exit_code(&summary, strict_integrity)
-                }
-                Err(error) => {
-                    if quiet < 2 {
-                        eprintln!("error: {error:#}");
-                    }
-                    1
-                }
-            }
+    let mut options = match Options::parse(std::env::args().skip(1)) {
+        Ok(Outcome::Run(options)) => options,
+        Ok(Outcome::Handled(code)) => return code,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return std::process::ExitCode::from(2);
         }
     };
-
-    pause::maybe_pause(no_pause);
+    let code = execute(&mut options);
+    if !options.machine {
+        pause::maybe_pause(options.no_pause);
+    }
     std::process::ExitCode::from(code)
+}
+
+/// Which operation the command line asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    /// Detection only. Writes nothing.
+    Inspect,
+    /// Recover and write outputs.
+    Unpack,
+}
+
+struct Options {
+    command: Command,
+    path: String,
+    out: Option<String>,
+    quiet: u8,
+    no_pause: bool,
+    no_log: bool,
+    verbose: bool,
+    scan_all: bool,
+    strict_integrity: bool,
+    limits: ResourceLimits,
+    /// Machine-readable output on stdout and nothing else.
+    machine: bool,
+    /// Run the real recovery but keep no ordinary output and no log.
+    dry_run: bool,
+}
+
+enum Outcome {
+    Run(Options),
+    Handled(std::process::ExitCode),
+}
+
+impl Options {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Outcome, String> {
+        let mut args = args.peekable();
+        let mut command = Command::Unpack;
+        let mut subcommand: Option<String> = None;
+        let mut path: Option<String> = None;
+        let mut out: Option<String> = None;
+        let mut quiet: u8 = 0;
+        let mut no_pause = false;
+        let mut no_log = false;
+        let mut verbose = false;
+        let mut scan_all = false;
+        let mut strict_integrity = false;
+        let mut machine = false;
+        let mut dry_run = false;
+        let mut limits = ResourceLimits::default();
+
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "-h" | "--help" => {
+                    print_help();
+                    return Ok(Outcome::Handled(std::process::ExitCode::SUCCESS));
+                }
+                "-V" | "--version" => {
+                    println!("Senbei {}", env!("CARGO_PKG_VERSION"));
+                    return Ok(Outcome::Handled(std::process::ExitCode::SUCCESS));
+                }
+                "-q" | "--quiet" => quiet = quiet.saturating_add(1),
+                "-v" | "--verbose" => verbose = true,
+                "--no-pause" => no_pause = true,
+                "--no-log" => no_log = true,
+                "--scan-all" => scan_all = true,
+                "--strict-integrity" => strict_integrity = true,
+                "--json" => machine = true,
+                "--dry-run" => dry_run = true,
+                flag
+                @ ("--max-entry-mib" | "--max-total-mib" | "--max-entries" | "--max-depth") => {
+                    set_resource_limit(&mut limits, flag, args.next().as_deref())?;
+                }
+                "--out" => match args.next() {
+                    Some(v) if !v.starts_with('-') => out = Some(v),
+                    _ => return Err("--out requires a directory argument".to_owned()),
+                },
+                other if other.starts_with('-') => {
+                    print_help();
+                    return Err(format!("unknown option '{other}'"));
+                }
+                // A subcommand is only a subcommand when it is the first
+                // positional word. `senbei inspect` therefore means the
+                // subcommand, while `senbei foo/inspect` is a path.
+                other
+                    if path.is_none()
+                        && subcommand.is_none()
+                        && matches!(other, "inspect" | "unpack") =>
+                {
+                    command = if other == "inspect" {
+                        Command::Inspect
+                    } else {
+                        Command::Unpack
+                    };
+                    subcommand = Some(other.to_owned());
+                }
+                other => {
+                    if let Some(prev) = &path {
+                        return Err(format!(
+                            "multiple input paths given ('{prev}' and '{other}')"
+                        ));
+                    }
+                    path = Some(other.to_string());
+                }
+            }
+        }
+
+        let Some(path) = path else {
+            // A subcommand with no path is a usage error; no arguments at all
+            // still prints help and exits 2, as before.
+            if let Some(subcommand) = subcommand {
+                return Err(format!("'{subcommand}' requires an input path"));
+            }
+            print_help();
+            return Ok(Outcome::Handled(std::process::ExitCode::from(2)));
+        };
+
+        // These combinations would silently mean different things, so they are
+        // rejected rather than guessed at.
+        if command == Command::Inspect {
+            if dry_run {
+                return Err("'inspect' never recovers; drop --dry-run".to_owned());
+            }
+            if out.is_some() {
+                return Err("'inspect' writes nothing; --out is not allowed".to_owned());
+            }
+            if strict_integrity {
+                return Err(
+                    "'inspect' runs no static check; --strict-integrity is not allowed".to_owned(),
+                );
+            }
+        }
+        if machine {
+            // Machine output owns stdout; interleaved progress would corrupt it.
+            quiet = quiet.max(1);
+            no_log = true;
+        }
+        let dry_run = dry_run && command == Command::Unpack;
+        if dry_run {
+            // A dry run keeps nothing: no ordinary output directory, no log.
+            if out.is_some() {
+                return Err("--dry-run writes no output; --out is not allowed".to_owned());
+            }
+            no_log = true;
+        }
+
+        Ok(Outcome::Run(Options {
+            command,
+            path,
+            out,
+            quiet,
+            no_pause,
+            no_log,
+            verbose,
+            scan_all,
+            strict_integrity,
+            limits,
+            machine,
+            dry_run,
+        }))
+    }
+}
+
+/// Run the parsed command. Kept separate from argument parsing and the pause
+/// prompt so the execution step can be wrapped on its own.
+fn execute(options: &mut Options) -> u8 {
+    let path = Path::new(&options.path);
+    let scan_all = options.scan_all || scan::scan_all_env();
+    match options.command {
+        Command::Inspect => execute_inspect(options, path, scan_all),
+        Command::Unpack if options.dry_run => execute_dry_run(options, path, scan_all),
+        Command::Unpack => execute_unpack(options, path, scan_all),
+    }
+}
+
+/// Detection completes even when an input is not a target; only an input that
+/// could not be read makes inspection fail.
+fn execute_inspect(options: &Options, path: &Path, scan_all: bool) -> u8 {
+    match job::inspect_path(path, scan_all, &options.limits) {
+        Ok(report) => {
+            let code = report_exit_code(&report, false);
+            if options.machine {
+                println!("{}", report.to_json());
+            } else if options.quiet < 2 {
+                print!("{}", report.render_text());
+            }
+            code
+        }
+        Err(error) => {
+            if options.machine {
+                let report = job::error_report(job::Mode::Inspect, &format!("{error:#}"));
+                println!("{}", report.to_json());
+            } else if options.quiet < 2 {
+                eprintln!("error: {error:#}");
+            }
+            1
+        }
+    }
+}
+
+fn execute_dry_run(options: &Options, path: &Path, scan_all: bool) -> u8 {
+    match job::dry_run_path(path, scan_all, &options.limits) {
+        Ok(report) => {
+            let code = report_exit_code(&report, options.strict_integrity);
+            if options.machine {
+                println!("{}", report.to_json());
+            } else if options.quiet < 2 {
+                print!("{}", report.render_text());
+                println!("{}", report.summary_line());
+            }
+            code
+        }
+        Err(error) => {
+            if options.machine {
+                let report = job::error_report(job::Mode::DryRun, &format!("{error:#}"));
+                println!("{}", report.to_json());
+            } else if options.quiet < 2 {
+                eprintln!("error: {error:#}");
+            }
+            1
+        }
+    }
+}
+
+fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
+    if options.quiet < 2 && !options.machine {
+        println!("Senbei {}", env!("CARGO_PKG_VERSION"));
+    }
+    let out_path = options.out.as_deref().map(Path::new);
+    // A machine run goes through the same drivers with an observer attached;
+    // the observer never changes routing, output, or messages.
+    let mut collector = job::Collector::new(job::Mode::Unpack);
+    let result = if options.machine {
+        if path.is_dir() {
+            job::run_folder_reported(
+                path,
+                out_path,
+                options.quiet,
+                options.verbose,
+                options.no_log,
+                scan_all,
+                &options.limits,
+                &mut collector,
+            )
+        } else {
+            job::run_file_reported(
+                path,
+                out_path,
+                options.quiet,
+                options.verbose,
+                options.no_log,
+                &options.limits,
+                &mut collector,
+            )
+        }
+    } else if path.is_dir() {
+        job::run_folder_with_limits(
+            path,
+            out_path,
+            options.quiet,
+            options.verbose,
+            options.no_log,
+            scan_all,
+            &options.limits,
+        )
+    } else {
+        job::run_file_with_limits(
+            path,
+            out_path,
+            options.quiet,
+            options.verbose,
+            options.no_log,
+            &options.limits,
+        )
+    };
+
+    match result {
+        Ok(summary) => {
+            if options.machine {
+                println!("{}", collector.finish().to_json());
+            } else if options.quiet < 2 {
+                println!("{}", summary.line());
+                println!("done in {} ms", summary.duration_ms);
+            }
+            exit_code(&summary, options.strict_integrity)
+        }
+        Err(error) => {
+            if options.machine {
+                let mut failed = collector;
+                failed.push_error(format!("{error:#}"));
+                println!("{}", failed.finish().to_json());
+            } else if options.quiet < 2 {
+                eprintln!("error: {error:#}");
+            }
+            1
+        }
+    }
+}
+
+/// Exit status from a report: the same policy as the summary-driven one.
+fn report_exit_code(report: &job::Report, strict_integrity: bool) -> u8 {
+    if report.summary.errors > 0 || (strict_integrity && report.summary.suspect > 0) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Process status for a finished run.
@@ -151,13 +369,31 @@ fn set_resource_limit(
 
 fn print_help() {
     println!(
-        "senbei <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
+        "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
     );
     println!(
-        "  input        a Crackproof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
+        "  <file|folder>\n\
+         \x20              a Crackproof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
          \x20              a protected Android AArch64 library (.so), an Android app\n\
          \x20              package (.apk/.apks/.xapk), or a folder containing any of\n\
-         \x20              these"
+         \x20              these. The bare form is the same as 'unpack'."
+    );
+    println!(
+        "  inspect PATH\n\
+         \x20              detect only. Reports what each input is, whether it is\n\
+         \x20              recognized, and which recovery routes would be tried.\n\
+         \x20              Never recovers, never writes an output, never creates a log,\n\
+         \x20              and never claims a route succeeded or a check passed."
+    );
+    println!("  unpack PATH  detection and recovery; writes outputs (the default).");
+    println!(
+        "  --json       write one versioned machine-readable report to stdout and\n\
+         \x20              nothing else. Implies quiet and --no-log."
+    );
+    println!(
+        "  --dry-run    run the real recovery but keep nothing: no output tree and\n\
+         \x20              no log. Android extraction still uses its own temporary\n\
+         \x20              workspace, which is discarded."
     );
     println!(
         "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\
@@ -182,6 +418,10 @@ fn print_help() {
         defaults.max_total_bytes / (1024 * 1024),
         defaults.max_entries,
         defaults.max_depth,
+    );
+    println!(
+        "  Exit codes: 0 success, 1 a target failed (or a suspect with\n\
+         \x20 --strict-integrity), 2 the command line was rejected."
     );
 }
 
@@ -279,5 +519,80 @@ mod resource_limits {
                 .is_err()
         );
         assert_eq!(limits, ResourceLimits::default());
+    }
+}
+
+#[cfg(test)]
+mod command_line {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        match Options::parse(args.iter().map(|arg| (*arg).to_string()))? {
+            Outcome::Run(options) => Ok(options),
+            Outcome::Handled(code) => Err(format!(
+                "handled: {}",
+                code == std::process::ExitCode::SUCCESS
+            )),
+        }
+    }
+
+    #[test]
+    fn bare_path_is_an_unpack() {
+        let options = parse(&["app.exe"]).unwrap();
+        assert_eq!(options.command, Command::Unpack);
+        assert_eq!(options.path, "app.exe");
+        assert!(!options.dry_run);
+        assert!(!options.machine);
+    }
+
+    #[test]
+    fn legacy_flags_still_apply_around_a_bare_path() {
+        let options = parse(&["app.exe", "--out", "o", "-q", "-v", "--no-log"]).unwrap();
+        assert_eq!(options.path, "app.exe");
+        assert_eq!(options.out.as_deref(), Some("o"));
+        assert_eq!(options.quiet, 1);
+        assert!(options.verbose);
+        assert!(options.no_log);
+    }
+
+    #[test]
+    fn explicit_subcommands_are_recognised() {
+        assert_eq!(parse(&["inspect", "x"]).unwrap().command, Command::Inspect);
+        assert_eq!(parse(&["unpack", "x"]).unwrap().command, Command::Unpack);
+        // A directory literally named like a subcommand still works via path.
+        assert_eq!(parse(&["./inspect"]).unwrap().path, "./inspect");
+    }
+
+    #[test]
+    fn json_implies_quiet_and_no_log() {
+        let options = parse(&["--json", "app.exe"]).unwrap();
+        assert!(options.machine);
+        assert!(options.quiet >= 1);
+        assert!(options.no_log);
+    }
+
+    #[test]
+    fn dry_run_refuses_an_output_directory() {
+        assert!(parse(&["--dry-run", "--out", "o", "app.exe"]).is_err());
+        let options = parse(&["--dry-run", "app.exe"]).unwrap();
+        assert!(options.dry_run);
+        assert!(options.no_log);
+    }
+
+    #[test]
+    fn inspect_rejects_recovery_only_flags() {
+        assert!(parse(&["inspect", "--out", "o", "app.exe"]).is_err());
+        assert!(parse(&["inspect", "--dry-run", "app.exe"]).is_err());
+        assert!(parse(&["inspect", "--strict-integrity", "app.exe"]).is_err());
+        assert_eq!(
+            parse(&["inspect", "--json", "a"]).unwrap().command,
+            Command::Inspect
+        );
+    }
+
+    #[test]
+    fn a_subcommand_without_a_path_is_a_usage_error() {
+        assert!(parse(&["inspect"]).is_err());
+        assert!(parse(&["unpack"]).is_err());
     }
 }

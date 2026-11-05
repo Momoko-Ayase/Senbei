@@ -277,4 +277,160 @@ pub(super) mod tests {
             assert!(log.contains("module.exe._"), "{log}");
         }
     }
+
+    /// Inspection must describe a companion-declaring stub, not reproduce the
+    /// recovery entry point's refusal.
+    ///
+    /// [`stub`] is a generated PE32+ loader whose entry record declares the
+    /// `._` suffix, so `read_unpacker_input` errors on it when the payload is
+    /// missing or does not pair. Inspection is detection only and must keep
+    /// the stub's recognition while reporting the pairing as inventory.
+    fn inspect_report(path: &std::path::Path) -> serde_json::Value {
+        let report = crate::job::inspect_path(
+            path,
+            false,
+            &senbei_engine::android::ResourceLimits::default(),
+        )
+        .expect("inspection must not fail for a readable stub");
+        serde_json::from_str(&report.to_json()).expect("valid report")
+    }
+
+    fn assert_no_recovery_claim(input: &serde_json::Value) {
+        assert_eq!(input["status"], "recognized", "the stub is recognized");
+        let profile = &input["profile"];
+        assert_eq!(profile["recognition"], "recognized");
+        assert!(
+            profile["selected"].is_null(),
+            "inspection selects no route: {profile}"
+        );
+        assert_eq!(profile["recovery"], "not_attempted");
+        assert_eq!(profile["static_validation"], "not_run");
+        assert!(
+            input["outputs"].as_array().unwrap().is_empty(),
+            "inspection writes nothing"
+        );
+        assert!(input["recovered"].is_null());
+        for candidate in profile["candidates"].as_array().unwrap() {
+            assert_eq!(
+                candidate["outcome"], "not_attempted",
+                "inspection runs no route: {candidate}"
+            );
+        }
+        assert!(
+            input["errors"].as_array().unwrap().is_empty(),
+            "a companion relationship is inventory, not an error: {input}"
+        );
+    }
+
+    #[test]
+    fn inspect_of_a_companion_stub_without_its_payload_stays_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("module.exe");
+        std::fs::write(&input, stub()).unwrap();
+
+        // The recovery entry point refuses this input.
+        assert!(super::super::read_unpacker_input(&input).is_err());
+
+        let value = inspect_report(&input);
+        let reported = &value["inputs"][0];
+        assert_no_recovery_claim(reported);
+        assert_eq!(reported["companion"]["state"], "absent");
+        assert!(reported["companion"]["path"].is_null());
+        assert_eq!(
+            reported["profile"]["observed"]["external_companion"], false,
+            "nothing was spliced, so no external-companion claim"
+        );
+    }
+
+    #[test]
+    fn inspect_of_a_companion_stub_with_a_non_matching_payload_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("module.exe");
+        std::fs::write(&input, stub()).unwrap();
+        std::fs::write(dir.path().join("module.exe._"), [0u8; 32]).unwrap();
+
+        assert!(super::super::read_unpacker_input(&input).is_err());
+
+        let value = inspect_report(&input);
+        let reported = &value["inputs"][0];
+        assert_no_recovery_claim(reported);
+        assert_eq!(reported["companion"]["state"], "unmatched");
+        assert!(reported["companion"]["path"].is_string());
+        assert!(reported["companion"]["detail"].is_string());
+        assert_eq!(reported["profile"]["observed"]["external_companion"], false);
+    }
+
+    #[test]
+    fn inspect_of_a_companion_stub_with_its_payload_reports_the_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("module.exe");
+        let bytes = stub();
+        std::fs::write(&input, &bytes).unwrap();
+        // The companion is byte-for-byte the stub's payload from the header.
+        std::fs::write(dir.path().join("module.exe._"), &bytes[HEADER_OFF..]).unwrap();
+        assert!(super::super::read_unpacker_input(&input).is_ok());
+
+        let value = inspect_report(&input);
+        let reported = &value["inputs"][0];
+        assert_eq!(reported["status"], "recognized");
+        assert_eq!(reported["companion"]["state"], "spliced");
+        assert_eq!(reported["profile"]["observed"]["external_companion"], true);
+        // A real pairing is evidence; recovery still did not run.
+        assert_eq!(reported["profile"]["recovery"], "not_attempted");
+        assert!(reported["profile"]["selected"].is_null());
+        assert_eq!(reported["profile"]["static_validation"], "not_run");
+    }
+
+    #[test]
+    fn folder_inspect_of_companion_stubs_stays_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.exe");
+        let unmatched = dir.path().join("unmatched.dll");
+        std::fs::write(&missing, stub()).unwrap();
+        std::fs::write(&unmatched, stub()).unwrap();
+        std::fs::write(dir.path().join("unmatched.dll._"), [0u8; 32]).unwrap();
+
+        let report = crate::job::inspect_path(
+            dir.path(),
+            false,
+            &senbei_engine::android::ResourceLimits::default(),
+        )
+        .expect("folder inspection must not fail");
+        let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let inputs = value["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 2, "both stubs are inspected: {value}");
+        let states: Vec<&str> = inputs
+            .iter()
+            .map(|input| input["companion"]["state"].as_str().unwrap())
+            .collect();
+        assert!(states.contains(&"absent"), "{states:?}");
+        assert!(states.contains(&"unmatched"), "{states:?}");
+        for input in inputs {
+            assert_no_recovery_claim(input);
+        }
+        assert_eq!(value["summary"]["errors"], 0);
+    }
+
+    /// A genuine read error still fails the input, but never fabricates a
+    /// recovery attempt that inspection did not make.
+    #[test]
+    fn inspect_read_error_does_not_invent_a_failed_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.exe");
+        let report = crate::job::inspect_path(
+            &path,
+            false,
+            &senbei_engine::android::ResourceLimits::default(),
+        )
+        .expect("inspection returns a report even when the input cannot be read");
+        let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let input = &value["inputs"][0];
+        assert_eq!(input["status"], "error");
+        assert!(!input["errors"].as_array().unwrap().is_empty());
+        let profile = &input["profile"];
+        assert_eq!(profile["recovery"], "not_attempted");
+        assert!(profile["selected"].is_null());
+        assert_eq!(profile["static_validation"], "not_run");
+        assert!(profile["candidates"].as_array().unwrap().is_empty());
+    }
 }

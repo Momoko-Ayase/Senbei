@@ -490,6 +490,11 @@ pub(crate) struct RestoredLibrary {
     pub embedded_metadata: Option<Vec<u8>>,
     pub method_index_module: Option<Vec<u8>>,
     pub module_image: Option<String>,
+    /// Structural diagnostics from the engine's validation pass over the output
+    /// it just wrote. `None` means the restorer produced no report at all (a
+    /// test double, or an engine without a validation pass) — never that the
+    /// output validated. `Some(empty)` is a completed, clean validation.
+    pub validation: Option<super::ValidationDiagnostics>,
 }
 
 /// Injectable library restore. Tests supply a fake so application-context

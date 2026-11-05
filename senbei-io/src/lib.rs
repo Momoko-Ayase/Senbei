@@ -8,6 +8,7 @@ mod atomic;
 pub mod job;
 pub mod logfile;
 pub mod pause;
+pub mod report;
 pub mod scan;
 pub mod ui;
 pub mod windows;

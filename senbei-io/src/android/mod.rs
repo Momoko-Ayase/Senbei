@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 pub use crate::METADATA_FILE_NAME;
+use crate::report::{ContainerReport, ManifestReport};
 
 /// Package extensions recognised as Android app packages. Packages are
 /// *containers*: membership is decided by extension plus the ZIP magic, while
@@ -83,6 +84,162 @@ pub fn is_app_package(path: &Path, prefix: &[u8]) -> bool {
     is_package_name(path) && prefix.starts_with(b"PK\x03\x04")
 }
 
+/// Inventory an app package without restoring anything.
+///
+/// Reads the ZIP central directories and the bounded root manifests only; no
+/// `.so` or `global-metadata.dat` entry is extracted, so this is a membership
+/// report, not an inspection of protected content. Entries that a restore
+/// *would* probe are listed by name.
+pub fn inspect_package(package: &Path, limits: &ResourceLimits) -> Result<ContainerReport> {
+    let kind = package
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let bundle = kind == "apks" || kind == "xapk";
+    let mut budget = archive_limits::ArchiveBudget::from_limits(limits);
+    let mut archive = budget.open_archive(package)?;
+    let entry_count = archive.len();
+    let mut manifests = Vec::new();
+    let mut candidate_entries = Vec::new();
+    let mut nested_packages = Vec::new();
+
+    let mut nested_indices = Vec::new();
+    for index in 0..archive.len() {
+        let (name, is_dir) = {
+            let entry = archive.by_index(index)?;
+            (entry.enclosed_name(), entry.is_dir())
+        };
+        if is_dir {
+            continue;
+        }
+        let Some(name) = name else {
+            bail!("unsafe entry path in package `{}`", package.display());
+        };
+        if bundle {
+            if name
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("apk"))
+            {
+                nested_indices.push(index);
+                nested_packages.push(name.display().to_string());
+            }
+        } else if is_android_entry_name(&name) {
+            candidate_entries.push(name.display().to_string());
+        }
+    }
+
+    if !bundle {
+        let inventory = context::inventory_manifest_package(
+            &mut archive,
+            package,
+            package
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+            &package.display().to_string(),
+            &mut budget,
+        )?;
+        manifests.push(manifest_report(&package.display().to_string(), &inventory));
+        return Ok(ContainerReport {
+            kind,
+            manifests,
+            entry_count,
+            candidate_entries,
+            nested_packages,
+        });
+    }
+
+    // A bundle: each nested APK is its own package. Extract it to a temporary
+    // file (no protected entry is read) so its manifest can name it.
+    std::mem::drop(archive);
+    let temporary = tempfile::tempdir().context("create inventory workspace")?;
+    let mut budget = archive_limits::ArchiveBudget::from_limits(limits);
+    let mut archive = budget.open_archive(package)?;
+    for index in nested_indices {
+        let name = {
+            let entry = archive.by_index(index)?;
+            entry.enclosed_name()
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let path = extract_entry(&mut archive, index, &temporary, &name, &mut budget)
+            .with_context(|| format!("extract `{}`", name.display()))?;
+        let mut nested = budget.open_archive(&path)?;
+        let inventory = context::inventory_manifest_package(
+            &mut nested,
+            &path,
+            package,
+            &name.display().to_string(),
+            &mut budget,
+        )?;
+        manifests.push(manifest_report(&name.display().to_string(), &inventory));
+        for nested_index in 0..nested.len() {
+            let (entry_name, is_dir) = {
+                let entry = nested.by_index(nested_index)?;
+                (entry.enclosed_name(), entry.is_dir())
+            };
+            if is_dir {
+                continue;
+            }
+            if let Some(entry_name) = entry_name
+                && is_android_entry_name(&entry_name)
+            {
+                candidate_entries.push(format!("{}::{}", name.display(), entry_name.display()));
+            }
+        }
+    }
+    Ok(ContainerReport {
+        kind,
+        manifests,
+        entry_count,
+        candidate_entries,
+        nested_packages,
+    })
+}
+
+fn manifest_report(source: &str, inventory: &context::PackageInventory) -> ManifestReport {
+    let (package, version) = match &inventory.key {
+        context::AppKey::Manifest {
+            package, version, ..
+        } => (Some(package.clone()), Some(version.clone())),
+        _ => (None, None),
+    };
+    ManifestReport {
+        source: source.to_owned(),
+        named: package.is_some() && version.is_some(),
+        package,
+        version,
+    }
+}
+
+/// Structural diagnostics the restore engine reported for one output.
+///
+/// These are the cross-table findings from the engine's own validation pass
+/// (see [`senbei_engine::android::RestoreReport`]). A restore that returns
+/// success still validates; a finding here says a linker could not walk a table
+/// in the bytes that were produced. It never fails a restore, so it is reported
+/// as a warning, never as an error. Restorers that cannot report one leave the
+/// field empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationDiagnostics {
+    pub messages: Vec<String>,
+}
+
+impl ValidationDiagnostics {
+    /// A completed validation with no findings.
+    pub fn clean() -> Self {
+        Self::default()
+    }
+
+    /// True when the validation ran and found nothing.
+    pub fn is_clean(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
 /// Probe a file on disk: true when it is a protected AArch64 library.
 /// Reads the whole file (the payload section is found through the
 /// section-header table at the end); call only after [`is_elf64_aarch64`]
@@ -95,6 +252,27 @@ pub fn is_protected_so_file(path: &Path) -> bool {
         return false;
     };
     is_elf64_aarch64(&bytes) && is_protected_libil2cpp(&bytes)
+}
+
+/// [`probe_so_file_with_limits`] with the recognition profile it produced.
+///
+/// A resource-limit failure is reported as `Blocked` with the error retained,
+/// never as "not protected".
+pub(crate) fn probe_so_profiled(
+    path: &Path,
+    limits: &ResourceLimits,
+) -> Result<(senbei_engine::ProtectionProfile, Result<bool, String>)> {
+    let file = File::open(path).with_context(|| format!("open `{}`", path.display()))?;
+    let bytes = map_read_only(&file, path)?;
+    if !is_elf64_aarch64(&bytes) {
+        return Ok((
+            senbei_engine::ProtectionProfile::new(senbei_engine::ObservedTarget::android(None)),
+            Ok(false),
+        ));
+    }
+    let (profile, result) =
+        senbei_engine::android::probe_libil2cpp_profiled_with_limits(&bytes, limits);
+    Ok((profile, result.map_err(|error| error.to_string())))
 }
 
 pub(crate) fn probe_so_file_with_limits(
@@ -168,7 +346,7 @@ pub(crate) fn restore_so_with_engine_limits(
         .pop()
         .map(|(image, bytes)| (Some(image), Some(bytes)))
         .unwrap_or((None, None));
-    restore_libil2cpp_with_limits(
+    let report = restore_libil2cpp_with_limits(
         &RestoreOptions {
             input: input.to_path_buf(),
             output: dest.to_path_buf(),
@@ -181,6 +359,11 @@ pub(crate) fn restore_so_with_engine_limits(
         limits,
     )
     .context("restore protected library")?;
+    // Keep only the validation verdict this call already produced. Nothing is
+    // re-read or re-validated: the diagnostics describe the bytes just written.
+    let validation = Some(ValidationDiagnostics {
+        messages: report.validation.diagnostics,
+    });
     let restored_file =
         File::open(dest).with_context(|| format!("read restored `{}`", dest.display()))?;
     let restored = map_read_only(&restored_file, dest)?;
@@ -188,6 +371,7 @@ pub(crate) fn restore_so_with_engine_limits(
         embedded_metadata: senbei_metadata::android::extract_embedded_metadata(&restored),
         method_index_module,
         module_image,
+        validation,
     })
 }
 
@@ -202,9 +386,22 @@ pub fn restore_so_file_with_limits(
     verbose: bool,
     limits: &ResourceLimits,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(context::EngineRestorer(*limits)
-        .restore(input, dest, verbose)?
-        .embedded_metadata)
+    Ok(restore_so_file_with_diagnostics(input, dest, verbose, limits)?.0)
+}
+
+/// [`restore_so_file_with_limits`], also returning the validation diagnostics
+/// the engine reported for the image it just wrote.
+///
+/// The diagnostics come from that restore's own report; nothing is re-read or
+/// re-validated. They are advisory and never fail the restore.
+pub fn restore_so_file_with_diagnostics(
+    input: &Path,
+    dest: &Path,
+    verbose: bool,
+    limits: &ResourceLimits,
+) -> Result<(Option<Vec<u8>>, Option<ValidationDiagnostics>)> {
+    let restored = context::EngineRestorer(*limits).restore(input, dest, verbose)?;
+    Ok((restored.embedded_metadata, restored.validation))
 }
 
 /// Fresh run-scoped cache. Library hits reuse their module context; metadata hits
@@ -234,6 +431,9 @@ pub(crate) struct LooseLibraryOutcome {
     pub status: EntryStatus,
     /// Embedded metadata already written as part of this successful restore.
     pub embedded: Option<PathBuf>,
+    /// Structural diagnostics from the restore that produced this output.
+    /// `None` for duplicates, failures, and restorers without a report.
+    pub validation: Option<ValidationDiagnostics>,
 }
 
 pub(crate) fn restore_loose_library(
@@ -273,6 +473,7 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
         return Ok(LooseLibraryOutcome {
             status: EntryStatus::Duplicate,
             embedded: None,
+            validation: None,
         });
     }
     // A prior content-only success still needs context extraction. Restore it
@@ -297,6 +498,7 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
                     return Ok(LooseLibraryOutcome {
                         status: EntryStatus::Failed(error),
                         embedded: None,
+                        validation: None,
                     });
                 }
                 embedded = Some(meta_dest);
@@ -314,11 +516,15 @@ fn restore_loose_library_with<R: context::LibraryRestorer>(
                     EntryStatus::Restored
                 },
                 embedded,
+                // A duplicate restored only for its module context has no
+                // output of its own, so it reports no diagnostics.
+                validation: if prior { None } else { restored.validation },
             })
         }
         Err(error) => Ok(LooseLibraryOutcome {
             status: EntryStatus::Failed(error),
             embedded: None,
+            validation: None,
         }),
     }
 }
@@ -330,6 +536,8 @@ pub(crate) struct LooseMetadataOutcome {
     pub version: u32,
     pub remapped: usize,
     pub provenance: Vec<String>,
+    /// Route the transform actually took (seeded, structural, or method-index).
+    pub layout: senbei_engine::LayoutKind,
 }
 
 pub(crate) fn restore_loose_metadata(
@@ -363,7 +571,7 @@ pub(crate) fn restore_loose_metadata(
     let module = module.as_deref();
     // Loose metadata retains one output per path, as before. Do not keep all
     // restored blobs in the folder cache just to avoid a repeated permutation.
-    let (out, report) =
+    let (out, report, layout) =
         restore_metadata_bytes_with_module(&data, module).with_context(|| label.to_owned())?;
     if report.remapped > 0 {
         write_metadata_blob(dest, &out)?;
@@ -375,6 +583,7 @@ pub(crate) fn restore_loose_metadata(
         version: report.version,
         remapped: report.remapped,
         provenance,
+        layout,
     })
 }
 
@@ -528,13 +737,15 @@ pub fn content_identity(data: &[u8]) -> String {
 /// canonical form. Both paths are no-ops (`remapped == 0`) on an
 /// already-clean blob.
 pub fn restore_metadata_bytes(data: &[u8]) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
-    restore_metadata_bytes_with_module(data, None)
+    let (out, report, _route) = restore_metadata_bytes_with_module(data, None)?;
+    Ok((out, report))
 }
 
 pub(crate) fn restore_metadata_bytes_with_module(
     data: &[u8],
     method_index_module: Option<&[u8]>,
-) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report)> {
+) -> anyhow::Result<(Vec<u8>, senbei_metadata::Report, senbei_engine::LayoutKind)> {
+    use senbei_engine::LayoutKind;
     let version = data
         .get(4..8)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
@@ -556,6 +767,7 @@ pub(crate) fn restore_metadata_bytes_with_module(
                 remapped: report.changed_indices,
                 modules: 0,
             },
+            LayoutKind::MetadataMethodIndices,
         ));
     }
     if let Ok(discovery) = senbei_metadata::android::discover_method_token_seeds(data)
@@ -579,12 +791,13 @@ pub(crate) fn restore_metadata_bytes_with_module(
                         remapped: report.changed_tokens,
                         modules: report.images_with_methods,
                     },
+                    LayoutKind::MetadataSeeded,
                 ));
             }
         }
     }
     let (out, report) = senbei_metadata::deobfuscate(data).map_err(anyhow::Error::new)?;
-    Ok((out, report))
+    Ok((out, report, LayoutKind::MetadataStructural))
 }
 
 /// What happened to one archive entry (or one loose Android target).
@@ -600,6 +813,13 @@ pub struct EntryOutcome {
     /// Libraries whose module `0x0C` was paired with this metadata entry.
     /// Empty for libraries and for metadata that had no paired module.
     pub provenance: Vec<String>,
+    /// Route the transform took, for metadata entries only.
+    pub layout: Option<senbei_engine::LayoutKind>,
+    /// Raw il2cpp metadata version, for metadata entries only.
+    pub metadata_version: Option<u32>,
+    /// Structural diagnostics from the restore of this entry. `None` for
+    /// metadata entries, duplicates, and restorers without a report.
+    pub validation: Option<ValidationDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -965,6 +1185,9 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
         kind,
         status,
         provenance,
+        layout: None,
+        metadata_version: None,
+        validation: None,
     };
     if !is_so && !is_meta {
         return Ok(vec![outcome(
@@ -1010,7 +1233,12 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                     let mut outcomes = Vec::new();
                     let mut embedded_failed = None;
                     if !prior {
-                        outcomes.push(outcome(EntryKind::So, EntryStatus::Restored, Vec::new()));
+                        // The engine's own validation diagnostics for exactly
+                        // these bytes; nothing is re-validated here.
+                        let mut restored_outcome =
+                            outcome(EntryKind::So, EntryStatus::Restored, Vec::new());
+                        restored_outcome.validation = restored.validation.clone();
+                        outcomes.push(restored_outcome);
                     }
                     if !prior && let Some(blob) = &restored.embedded_metadata {
                         let meta_dest = embedded_metadata_dest(dest);
@@ -1021,6 +1249,9 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                                 kind: EntryKind::EmbeddedMetadata,
                                 status: EntryStatus::Restored,
                                 provenance: Vec::new(),
+                                layout: None,
+                                metadata_version: None,
+                                validation: None,
                             }),
                             Err(error) => embedded_failed = Some(error),
                         }
@@ -1088,18 +1319,17 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                 remapped: *remapped,
             },
         };
-        return Ok(vec![outcome(
-            kind,
-            EntryStatus::Duplicate,
-            provenance_labels(&provenance),
-        )]);
+        let mut entry_outcome =
+            outcome(kind, EntryStatus::Duplicate, provenance_labels(&provenance));
+        entry_outcome.metadata_version = version;
+        return Ok(vec![entry_outcome]);
     }
 
     // Metadata entry: write only when the restore actually changed protected
     // method fields — a clean blob needs no copy (same contract as loose files).
     // The binding was resolved before this write.
-    let kind_and_status = match restore_metadata_bytes_with_module(&entry_data, module) {
-        Ok((out, report)) if report.remapped > 0 => {
+    let (kind, status, layout) = match restore_metadata_bytes_with_module(&entry_data, module) {
+        Ok((out, report, layout)) if report.remapped > 0 => {
             let kind = EntryKind::Metadata {
                 remapped: report.remapped,
             };
@@ -1112,29 +1342,34 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                             remapped: report.remapped,
                         },
                     );
-                    (kind, EntryStatus::Restored)
+                    (kind, EntryStatus::Restored, Some(layout))
                 }
-                Err(error) => (kind, EntryStatus::Failed(error)),
+                Err(error) => (kind, EntryStatus::Failed(error), Some(layout)),
             }
         }
-        Ok(_) => {
+        // A blob that needed no change still reports the route that ran.
+        Ok((_, _report, layout)) => {
             state.cache.insert_metadata(
                 identity,
                 context_identity,
                 context::CachedMetadata::Unchanged,
             );
-            (EntryKind::Metadata { remapped: 0 }, EntryStatus::Unchanged)
+            (
+                EntryKind::Metadata { remapped: 0 },
+                EntryStatus::Unchanged,
+                Some(layout),
+            )
         }
         Err(error) => (
             EntryKind::Metadata { remapped: 0 },
             EntryStatus::Failed(error),
+            None,
         ),
     };
-    Ok(vec![outcome(
-        kind_and_status.0,
-        kind_and_status.1,
-        provenance_labels(&provenance),
-    )])
+    let mut entry_outcome = outcome(kind, status, provenance_labels(&provenance));
+    entry_outcome.layout = layout;
+    entry_outcome.metadata_version = version;
+    Ok(vec![entry_outcome])
 }
 
 fn record_module(

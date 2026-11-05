@@ -33,6 +33,9 @@ impl LibraryRestorer for ScriptedRestorer {
             embedded_metadata: self.embedded.clone(),
             method_index_module: Some(module),
             module_image: Some("module-0c.bin".to_owned()),
+            // A scripted restore has no engine report behind it, so it claims
+            // no validation verdict at all.
+            validation: None,
         })
     }
 
@@ -42,6 +45,33 @@ impl LibraryRestorer for ScriptedRestorer {
             .iter()
             .any(|(library, _)| library == &bytes)
             .then_some(bytes)
+    }
+}
+
+/// A [`ScriptedRestorer`] that also reports validation diagnostics, as a real
+/// engine restore does. Kept separate so the many existing scripted cases keep
+/// meaning "no engine report".
+struct DiagnosticRestorer {
+    inner: ScriptedRestorer,
+    diagnostics: Vec<String>,
+}
+
+impl LibraryRestorer for DiagnosticRestorer {
+    fn restore(
+        &mut self,
+        input: &Path,
+        dest: &Path,
+        verbose: bool,
+    ) -> anyhow::Result<RestoredLibrary> {
+        let mut restored = self.inner.restore(input, dest, verbose)?;
+        restored.validation = Some(ValidationDiagnostics {
+            messages: self.diagnostics.clone(),
+        });
+        Ok(restored)
+    }
+
+    fn protected_override(&mut self, input: &Path) -> Option<Vec<u8>> {
+        self.inner.protected_override(input)
     }
 }
 
@@ -1222,4 +1252,100 @@ fn axml_attr(name: u32, raw: u32, value_type: u8, data: u32) -> Vec<u8> {
     record.push(value_type);
     record.extend(u32::to_le_bytes(data));
     record
+}
+
+/// The engine's validation diagnostics travel from a restore into the entry
+/// outcome a reporter reads, for loose libraries and package entries alike.
+///
+/// They are advisory: the restore still succeeds, the output is still written,
+/// and nothing is re-validated or re-read to produce them.
+#[test]
+fn validation_diagnostics_reach_restored_outcomes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let finding = "dynamic symbol table is not referenced by a load segment";
+    let library = library_bytes(b"diag");
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("lib/arm64-v8a")).unwrap();
+    let so = app.join("lib/arm64-v8a/libil2cpp.so");
+    std::fs::write(&so, &library).unwrap();
+
+    let mut cache = run_cache();
+    let mut restorer = DiagnosticRestorer {
+        inner: ScriptedRestorer {
+            embedded: None,
+            modules: vec![(library, vec![0xAB; 16])],
+        },
+        diagnostics: vec![finding.to_owned()],
+    };
+
+    let scoped = loose_scopes(std::slice::from_ref(&so), &[]);
+    let outcome = restore_loose_library_with(
+        &so,
+        &root.join("out.so"),
+        "libil2cpp.so",
+        &scoped[0].key,
+        false,
+        &mut cache,
+        &mut restorer,
+    )
+    .unwrap();
+    assert!(matches!(outcome.status, EntryStatus::Restored));
+    assert_eq!(
+        outcome.validation.as_ref().map(|v| v.messages.clone()),
+        Some(vec![finding.to_owned()])
+    );
+    assert!(root.join("out.so").is_file(), "the output is still written");
+
+    // Repeated bytes are a duplicate: no output of their own, so no verdict.
+    let duplicate = restore_loose_library_with(
+        &so,
+        &root.join("out-duplicate.so"),
+        "libil2cpp.so",
+        &scoped[0].key,
+        false,
+        &mut cache,
+        &mut restorer,
+    )
+    .unwrap();
+    assert!(matches!(duplicate.status, EntryStatus::Duplicate));
+    assert!(
+        duplicate.validation.is_none(),
+        "a duplicate restored only for its module context reports no verdict"
+    );
+}
+
+/// A restorer with no engine report leaves the verdict empty instead of
+/// claiming a clean validation it never performed.
+#[test]
+fn scripted_restore_claims_no_validation_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let library = library_bytes(b"no-report");
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("lib/arm64-v8a")).unwrap();
+    let so = app.join("lib/arm64-v8a/libil2cpp.so");
+    std::fs::write(&so, &library).unwrap();
+
+    let mut cache = run_cache();
+    let mut restorer = ScriptedRestorer {
+        embedded: None,
+        modules: vec![(library, vec![0xCD; 16])],
+    };
+    let scoped = loose_scopes(std::slice::from_ref(&so), &[]);
+    let outcome = restore_loose_library_with(
+        &so,
+        &root.join("out.so"),
+        "libil2cpp.so",
+        &scoped[0].key,
+        false,
+        &mut cache,
+        &mut restorer,
+    )
+    .unwrap();
+    assert!(matches!(outcome.status, EntryStatus::Restored));
+    assert!(
+        outcome.validation.is_none(),
+        "a restorer without a report must not claim a clean verdict"
+    );
 }
