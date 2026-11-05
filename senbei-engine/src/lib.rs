@@ -4,6 +4,7 @@ pub mod android;
 mod findings;
 mod panic_capture;
 pub mod profile;
+mod threading;
 pub mod windows;
 
 pub use panic_capture::catch_unwind_quiet;
@@ -12,6 +13,7 @@ pub use profile::{
     ProtectionEvidence, ProtectionProfile, RecognitionStatus, RecoveryStatus, TargetFormat,
     ValidationStatus,
 };
+pub use threading::{thread_cap, with_thread_cap};
 
 pub use windows::{
     Detected, IntegrityFinding, IntegrityReport, IntegritySeverity, Kind, UnpackError,
@@ -19,16 +21,3 @@ pub use windows::{
     unpack_auto_profiled_v, unpack_auto_v, unpack_dll, unpack_dll_v, unpack_exe,
     unpack_exe_profiled, unpack_exe_profiled_v, unpack_exe_v,
 };
-
-/// Deterministic worker-thread cap shared by filesystem scanning and engines.
-pub fn thread_cap() -> usize {
-    if let Ok(value) = std::env::var("SENBEI_THREADS")
-        && let Ok(count) = value.trim().parse::<usize>()
-        && count >= 1
-    {
-        return count;
-    }
-    std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-}

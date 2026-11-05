@@ -1,5 +1,6 @@
 use senbei_engine::android::ResourceLimits;
 use senbei_io::{job, pause, scan};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 fn main() -> std::process::ExitCode {
@@ -11,7 +12,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let code = execute(&mut options);
+    let code = match options.threads {
+        Some(count) => senbei_engine::with_thread_cap(count, || execute(&mut options)),
+        None => execute(&mut options),
+    };
     if !options.machine {
         pause::maybe_pause(options.no_pause);
     }
@@ -37,6 +41,7 @@ struct Options {
     verbose: bool,
     scan_all: bool,
     strict_integrity: bool,
+    threads: Option<NonZeroUsize>,
     limits: ResourceLimits,
     /// Machine-readable output on stdout and nothing else.
     machine: bool,
@@ -62,6 +67,7 @@ impl Options {
         let mut verbose = false;
         let mut scan_all = false;
         let mut strict_integrity = false;
+        let mut threads = None;
         let mut machine = false;
         let mut dry_run = false;
         let mut limits = ResourceLimits::default();
@@ -84,6 +90,7 @@ impl Options {
                 "--strict-integrity" => strict_integrity = true,
                 "--json" => machine = true,
                 "--dry-run" => dry_run = true,
+                "--threads" => threads = Some(parse_thread_cap(args.next().as_deref())?),
                 flag
                 @ ("--max-entry-mib" | "--max-total-mib" | "--max-entries" | "--max-depth") => {
                     set_resource_limit(&mut limits, flag, args.next().as_deref())?;
@@ -171,11 +178,19 @@ impl Options {
             verbose,
             scan_all,
             strict_integrity,
+            threads,
             limits,
             machine,
             dry_run,
         }))
     }
+}
+
+fn parse_thread_cap(value: Option<&str>) -> Result<NonZeroUsize, String> {
+    value
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| "--threads requires a positive integer argument".to_owned())
 }
 
 /// Run the parsed command. Kept separate from argument parsing and the pause
@@ -369,7 +384,7 @@ fn set_resource_limit(
 
 fn print_help() {
     println!(
-        "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
+        "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--threads N] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
     );
     println!(
         "  <file|folder>\n\
@@ -394,6 +409,10 @@ fn print_help() {
         "  --dry-run    run the real recovery but keep nothing: no output tree and\n\
          \x20              no log. Android extraction still uses its own temporary\n\
          \x20              workspace, which is discarded."
+    );
+    println!(
+        "  --threads N  positive worker cap for this run. Overrides SENBEI_THREADS;\n\
+         \x20              1 selects the sequential path. The environment is unchanged."
     );
     println!(
         "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\
@@ -423,6 +442,45 @@ fn print_help() {
         "  Exit codes: 0 success, 1 a target failed (or a suspect with\n\
          \x20 --strict-integrity), 2 the command line was rejected."
     );
+}
+
+#[cfg(test)]
+mod thread_options {
+    use super::*;
+
+    #[test]
+    fn worker_cap_requires_a_positive_decimal_integer() {
+        assert_eq!(parse_thread_cap(Some("1")).unwrap().get(), 1);
+        assert_eq!(parse_thread_cap(Some("4")).unwrap().get(), 4);
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("+1"),
+            Some("1.5"),
+            Some("many"),
+            Some("999999999999999999999999999999"),
+        ] {
+            assert!(parse_thread_cap(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn caps_are_optional_and_work_with_both_commands() {
+        for (args, expected) in [
+            (vec!["x"], None),
+            (vec!["unpack", "x", "--threads", "1"], Some(1)),
+            (vec!["--threads", "4", "inspect", "x"], Some(4)),
+        ] {
+            let Outcome::Run(options) =
+                Options::parse(args.into_iter().map(str::to_owned)).unwrap()
+            else {
+                panic!("expected a parsed command");
+            };
+            assert_eq!(options.threads.map(NonZeroUsize::get), expected);
+        }
+    }
 }
 
 #[cfg(test)]
