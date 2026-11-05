@@ -1,0 +1,76 @@
+[package]
+name = "senbei-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "AGPL-3.0-only"
+
+# Standalone cargo-fuzz crate. It is listed in the workspace `exclude` array
+# and depends on the parent path crates, so `cargo fuzz` can build it without
+# changing any workspace manifest.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.senbei-engine]
+path = "../senbei-engine"
+
+[dependencies.senbei-elf]
+path = "../senbei-elf"
+
+[dependencies.senbei-metadata]
+path = "../senbei-metadata"
+
+[dependencies.senbei-pe]
+path = "../senbei-pe"
+
+# A ZIP parser target would duplicate senbei-io's archive preflight, which is
+# private to that crate. There is no small public seam to reach, so this crate
+# leaves ZIP fuzzing out rather than re-implementing preflight.
+
+[[bin]]
+name = "pe_detect"
+path = "fuzz_targets/pe_detect.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pe_integrity"
+path = "fuzz_targets/pe_integrity.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pe_parse"
+path = "fuzz_targets/pe_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "elf_layout"
+path = "fuzz_targets/elf_layout.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "metadata_parse"
+path = "fuzz_targets/metadata_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "metadata_restore"
+path = "fuzz_targets/metadata_restore.rs"
+test = false
+doc = false
+
+# Deterministic smoke runner. It exercises the same entry points with bounded
+# generated inputs, so a build/`cargo check` gate can run without nightly
+# libFuzzer. `cargo run --manifest-path fuzz/Cargo.toml --bin smoke`.
+[[bin]]
+name = "smoke"
+path = "src/smoke.rs"
+test = false
+doc = false

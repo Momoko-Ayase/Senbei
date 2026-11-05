@@ -10,8 +10,9 @@ members = [
 ]
 default-members = ["senbei-cli"]
 # The wasm bindings crate is its own crate (own Cargo.lock, cdylib) and stays
-# outside the workspace.
-exclude = ["senbei-wasm"]
+# outside the workspace. `fuzz` is a cargo-fuzz crate with its own nightly
+# requirements and must not join workspace builds.
+exclude = ["senbei-wasm", "fuzz"]
 resolver = "2"
 
 [workspace.package]

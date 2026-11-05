@@ -30,6 +30,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo test --release --workspace
 
+  fuzz-smoke:
+    # The libFuzzer targets need nightly and are exercised locally (fuzz/run.sh).
+    # This gate only proves the standalone fuzz crate still builds on stable and
+    # that the deterministic bounded smoke corpus completes without a panic.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check --manifest-path fuzz/Cargo.toml
+      - run: cargo run --release --manifest-path fuzz/Cargo.toml --bin smoke
+
   check-portable:
     # Build-only portability gate: non-Windows host and the wasm target the
     # web build uses. Clippy runs here too, not just on Windows: the platform
@@ -81,6 +91,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - run: cargo install wasm-pack --locked
       # `-- --locked` forwards to cargo: senbei-wasm/Cargo.lock is committed on
       # purpose, so the wasm build must be pinned by it rather than silently
@@ -88,6 +101,13 @@ jobs:
       # --out-dir emits the JS/wasm package into the static frontend's web/pkg/.
       - run: wasm-pack build --target web --release --out-dir ../web/pkg -- --locked
         working-directory: senbei-wasm
+      - name: Build Node bindings for native/WASM parity
+        run: wasm-pack build --target nodejs --release --out-dir ../target/wasm-parity/pkg -- --locked
+        working-directory: senbei-wasm
+      - name: Compare synthetic native and WASM transforms
+        run: cargo test --release -p senbei-cli --test wasm_parity
+        env:
+          SENBEI_WASM_PARITY: '1'
       - uses: actions/upload-artifact@v4
         with:
           name: senbei-web

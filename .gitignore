@@ -158,3 +158,12 @@ target/
 /senbei-wasm/target/
 /web/pkg/
 /web/.playwright-cli
+
+### senbei fuzz ###
+# cargo-fuzz outputs: mutated corpus, crash artifacts, and coverage can contain
+# bytes derived from user-supplied private corpora. Never commit them.
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+/fuzz/Cargo.lock
