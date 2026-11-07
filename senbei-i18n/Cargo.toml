@@ -1,0 +1,16 @@
+[package]
+name = "senbei-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "User-facing text for Senbei in English, Simplified Chinese, Traditional Chinese, Japanese, and Korean"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

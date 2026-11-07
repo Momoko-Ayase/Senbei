@@ -4,6 +4,7 @@ members = [
     "senbei-crypto",
     "senbei-elf",
     "senbei-engine",
+    "senbei-i18n",
     "senbei-io",
     "senbei-metadata",
     "senbei-pe",
@@ -44,6 +45,7 @@ zip = { version = "9.3", default-features = false, features = ["deflate"] }
 senbei-crypto = { path = "senbei-crypto" }
 senbei-elf = { path = "senbei-elf" }
 senbei-engine = { path = "senbei-engine" }
+senbei-i18n = { path = "senbei-i18n" }
 senbei-io = { path = "senbei-io" }
 senbei-metadata = { path = "senbei-metadata" }
 senbei-pe = { path = "senbei-pe" }
