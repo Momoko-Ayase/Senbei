@@ -8,6 +8,7 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use senbei_crypto::android::{
     ContainerHeader, HuffmanLzDecoder, Module9bConfig, ProtectedDescriptor, transform_segment,
 };
+use senbei_i18n::Step;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -463,12 +464,12 @@ where
             data_cursor = encoded_end;
         }
         if verbose {
-            eprintln!(
+            crate::progress::detail_err(format_args!(
                 "[{current:02}/{total:02}] writers={writer_count} encoded=0x{size:x}",
                 current = segment_index + 1,
                 total = header.segments.len(),
                 size = encoded.size,
-            );
+            ));
         }
     }
     Ok(statistics)
@@ -2671,7 +2672,7 @@ pub fn restore_libil2cpp_with_limits(
     {
         let mut output = map_mut(temporary.as_file(), private_size, &temporary_path)?;
         if options.verbose {
-            eprintln!("Decoding primary 0x9D target-image container...");
+            crate::progress::stage(Step::AndroidPrimary);
         }
         let mut writer = FileLayoutWriter {
             output: &mut output,
@@ -2711,7 +2712,7 @@ pub fn restore_libil2cpp_with_limits(
 
     if !options.outer_only {
         if options.verbose {
-            eprintln!("Decoding auxiliary 0x9D ELF materialization container...");
+            crate::progress::stage(Step::AndroidAuxiliary);
         }
         let mut decoded = allocate_auxiliary(auxiliary_header.output_size, limits, &mut bytes)?;
         let auxiliary_len = decoded.len();
@@ -2771,7 +2772,7 @@ pub fn restore_libil2cpp_with_limits(
             .set_len(mapping_bytes)
             .map_err(|error| Error::io("extend temporary output", &temporary_path, error))?;
         if options.verbose {
-            eprintln!("Rebuilding static ELF dynamic-linker tables...");
+            crate::progress::stage(Step::AndroidTables);
         }
         {
             let mut output = map_mut(temporary.as_file(), mapping_length, &temporary_path)?;

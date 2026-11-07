@@ -84,7 +84,10 @@ pub fn probe_libil2cpp_profiled_with_limits(
         }
         Err(error) => {
             profile.recognition = RecognitionStatus::Blocked;
-            profile.push_error(error.to_string());
+            profile.push_error(match &error {
+                Error::Limit(limit) => limit.message(),
+                other => other.to_string().into(),
+            });
             if let Error::Limit(_) = error {
                 profile
                     .candidates

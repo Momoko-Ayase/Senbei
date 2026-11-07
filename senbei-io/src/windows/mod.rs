@@ -672,7 +672,7 @@ pub fn unpack_one_v(
     }
     write_atomic(dest, &out)?;
     if verbose {
-        println!("Write to {}", dest.display());
+        crate::ui::write_to(dest, false);
     }
     Ok((kind, report))
 }

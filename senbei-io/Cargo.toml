@@ -12,6 +12,7 @@ indicatif.workspace = true
 memmap2.workspace = true
 owo-colors.workspace = true
 senbei-engine.workspace = true
+senbei-i18n.workspace = true
 senbei-elf.workspace = true
 senbei-pe.workspace = true
 senbei-metadata.workspace = true

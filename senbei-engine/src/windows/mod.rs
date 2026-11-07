@@ -10,6 +10,7 @@ pub(crate) mod parallel;
 pub mod research;
 
 use senbei_crypto::primitives;
+use senbei_i18n::Message;
 use serde::Serialize;
 
 use crate::profile::{
@@ -309,7 +310,7 @@ pub fn unpack_auto_profiled_v(
     let mut profile = inspect_detected(input, detected);
     let Some(detected) = detected else {
         let error = UnpackError::NotCrackProof;
-        profile.push_error(error.to_string());
+        profile.push_error(error.message());
         return (profile, Err(error));
     };
     let result = match detected.kind {
@@ -343,7 +344,7 @@ pub fn unpack_exe_profiled_v(
     let mut profile = inspect_detected(input, detected);
     if detected.is_none() {
         let error = UnpackError::NotCrackProof;
-        profile.push_error(error.to_string());
+        profile.push_error(error.message());
         return (profile, Err(error));
     }
     // This entry point will never run the DLL route, so a DLL-kind detection's
@@ -383,10 +384,10 @@ fn run_exe_attempt(
                 LayoutKind::ExeStyle,
                 AttemptOutcome::Failed,
                 Vec::new(),
-                vec![error.to_string()],
+                vec![error.message()],
             );
             profile.recovery = RecoveryStatus::Failed;
-            profile.push_error(error.to_string());
+            profile.push_error(error.message());
             Err(error)
         }
     }
@@ -431,7 +432,7 @@ where
                         dll: Box::new(dll.error),
                         exe: Box::new(exe.error),
                     };
-                    profile.push_error(error.to_string());
+                    profile.push_error(error.message());
                     Err(error)
                 }
             }
@@ -453,7 +454,7 @@ fn record_rejected(profile: &mut ProtectionProfile, layout: LayoutKind, failure:
             profile_messages(report, ProfileSeverity::Warning),
             profile_messages(report, ProfileSeverity::Fatal),
         ),
-        None => (Vec::new(), vec![failure.error.to_string()]),
+        None => (Vec::new(), vec![failure.error.message()]),
     };
     let outcome = if failure.report.is_some() {
         AttemptOutcome::Rejected
@@ -463,7 +464,7 @@ fn record_rejected(profile: &mut ProtectionProfile, layout: LayoutKind, failure:
     profile.record_attempt(layout, outcome, warnings, errors);
 }
 
-fn profile_messages(report: &IntegrityReport, severity: ProfileSeverity) -> Vec<String> {
+fn profile_messages(report: &IntegrityReport, severity: ProfileSeverity) -> Vec<Message> {
     report
         .findings
         .iter()

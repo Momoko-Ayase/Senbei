@@ -1,6 +1,7 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::Style;
 use senbei_engine::{IntegrityReport, Kind};
+use senbei_i18n::{Cli, Lang, Localize, Message, Step};
 use std::cell::Cell;
 use std::fmt::{self, Display};
 use std::io::IsTerminal;
@@ -99,6 +100,111 @@ impl Palette {
 
 pub(crate) fn count(palette: Palette, value: usize, nonzero: Tone) -> Painted<usize> {
     palette.paint(if value == 0 { Tone::Muted } else { nonzero }, value)
+}
+
+/// The run summary in `lang`: unpacked, skipped, errors, suspect, metadata,
+/// and packages (shown only when nonzero), each colored when nonzero.
+pub(crate) fn summary_line(
+    palette: Palette,
+    lang: Lang,
+    [unpacked, skipped, errors, suspect, metadata, packages]: [usize; 6],
+) -> String {
+    let mut line = Cli::Summary {
+        unpacked: count(palette, unpacked, Tone::Success).to_string(),
+        skipped: count(palette, skipped, Tone::Muted).to_string(),
+        errors: count(palette, errors, Tone::Error).to_string(),
+        suspect: count(palette, suspect, Tone::Warning).to_string(),
+        metadata: count(palette, metadata, Tone::Success).to_string(),
+    }
+    .localize(lang)
+    .into_owned();
+    if packages > 0 {
+        line.push_str(
+            &Cli::SummaryPackages {
+                packages: palette.paint(Tone::Value, packages).to_string(),
+            }
+            .localize(lang),
+        );
+    }
+    line
+}
+
+/// The muted line that shows the English a translated message came from.
+fn english_line(palette: Palette, lang: Lang, english: &str) -> String {
+    palette
+        .paint(
+            Tone::Muted,
+            format!("{}: {english}", Cli::DiagnosticEnglish.localize(lang)),
+        )
+        .to_string()
+}
+
+/// `error: <message>` in `lang`, newline-terminated. When the translation
+/// does not show everything the English said, the English follows.
+pub(crate) fn error_lines(palette: Palette, lang: Lang, message: &Message) -> String {
+    let mut lines = format!(
+        "{}: {}\n",
+        palette.paint(Tone::Error, Cli::Error.localize(lang)),
+        message.localized(lang)
+    );
+    if let Some(english) = message.detail(lang) {
+        lines.push_str(&format!("  {}\n", english_line(palette, lang, english)));
+    }
+    lines
+}
+
+/// Print `error: <message>` to stderr in the process language.
+pub fn print_error(message: &Message) {
+    eprint!(
+        "{}",
+        error_lines(Palette::stderr(), senbei_i18n::current(), message)
+    );
+}
+
+/// Print `error: <error chain>` to stderr in the process language.
+pub fn print_anyhow(error: &anyhow::Error) {
+    print_error(&crate::message::of_error(error));
+}
+
+/// Print `error: <what>: <error chain>` to stderr in the process language.
+pub(crate) fn print_error_about(what: Cli, error: &anyhow::Error) {
+    let lang = senbei_i18n::current();
+    let palette = Palette::stderr();
+    let message = crate::message::of_error(error);
+    eprintln!(
+        "{}: {}: {}",
+        palette.paint(Tone::Error, Cli::Error.localize(lang)),
+        what.localize(lang),
+        message.localized(lang)
+    );
+    if let Some(english) = message.detail(lang) {
+        eprintln!("  {}", english_line(palette, lang, english));
+    }
+}
+
+/// The verbose `Write to <dest>` line after an output was written, with the
+/// destination colored when `painted`. A run with an observer receives it as
+/// a progress event instead.
+pub(crate) fn write_to(dest: &Path, painted: bool) {
+    let event = senbei_engine::progress::Event::Step {
+        step: Step::WriteTo {
+            dest: dest.display().to_string(),
+        },
+        position: None,
+    };
+    if !senbei_engine::progress::emit(&event) {
+        let dest = if painted {
+            Palette::stdout()
+                .paint(Tone::Value, dest.display())
+                .to_string()
+        } else {
+            dest.display().to_string()
+        };
+        println!(
+            "{}",
+            Step::WriteTo { dest }.localize(senbei_i18n::current())
+        );
+    }
 }
 
 fn color_enabled(mode: ColorMode, terminal: bool, no_color: bool, dumb: bool) -> bool {
@@ -220,12 +326,15 @@ pub fn metadata(bar: &ProgressBar, quiet: bool, rel: &Path, remapped: usize, des
         return;
     }
     let palette = Palette::stdout();
+    let line = Cli::MetadataLine {
+        rel: palette.paint(Tone::Label, rel.display()).to_string(),
+        dest: palette.paint(Tone::Value, dest.display()).to_string(),
+        remapped: palette.paint(Tone::Value, remapped).to_string(),
+    };
     let msg = format!(
-        "{} metadata  {}  ->  {}  ({} method fields remapped)",
+        "{} {}",
         palette.paint(Tone::Success, "✓"),
-        palette.paint(Tone::Label, rel.display()),
-        palette.paint(Tone::Value, dest.display()),
-        palette.paint(Tone::Value, remapped)
+        line.localize(senbei_i18n::current())
     );
     bar.suspend(|| println!("{msg}"));
 }
@@ -236,11 +345,17 @@ pub fn err(bar: &ProgressBar, quiet: bool, rel: &Path, e: &anyhow::Error) {
         return;
     }
     let palette = Palette::stderr();
-    let msg = format!(
-        "{} {}  {e:#}",
+    let lang = senbei_i18n::current();
+    let message = crate::message::of_error(e);
+    let mut msg = format!(
+        "{} {}  {}",
         palette.paint(Tone::Error, "✗"),
-        palette.paint(Tone::Label, rel.display())
+        palette.paint(Tone::Label, rel.display()),
+        message.localized(lang)
     );
+    if let Some(english) = message.detail(lang) {
+        msg.push_str(&format!("\n    {}", english_line(palette, lang, english)));
+    }
     bar.suspend(|| eprintln!("{msg}"));
 }
 
@@ -251,14 +366,25 @@ pub fn suspect(bar: &ProgressBar, quiet: bool, rel: &Path, report: &IntegrityRep
         return;
     }
     let palette = Palette::stderr();
+    let lang = senbei_i18n::current();
     let msg = format!(
         "{} {}  {}: {}",
         palette.paint(Tone::Warning, "!"),
         palette.paint(Tone::Label, rel.display()),
-        palette.paint(Tone::Warning, "integrity check failed"),
-        report.issues.join("; ")
+        palette.paint(Tone::Warning, Cli::IntegrityFailed.localize(lang)),
+        issues(report, lang)
     );
     bar.suspend(|| eprintln!("{msg}"));
+}
+
+/// The static check's findings in `lang`, separated as in the log.
+pub(crate) fn issues(report: &IntegrityReport, lang: Lang) -> String {
+    report
+        .issues
+        .iter()
+        .map(|issue| issue.localized(lang))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]

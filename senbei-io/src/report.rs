@@ -24,10 +24,13 @@
 //! mistaken for inspected protected content.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+
+use senbei_i18n::{Cli, Lang, Localize, Message, Msg};
 
 use senbei_engine::{
     AttemptOutcome, LayoutKind, ProtectionEvidence, ProtectionProfile, RecognitionStatus,
@@ -211,7 +214,7 @@ pub struct ScanReport {
 pub struct CompanionReport {
     pub state: CompanionState,
     pub path: Option<String>,
-    pub detail: Option<String>,
+    pub detail: Option<Message>,
     /// Identity of the physical companion, distinct from the spliced view.
     pub source: Option<Digest>,
 }
@@ -275,7 +278,7 @@ pub struct ContainerReport {
 pub struct StageReport {
     pub stage: Stage,
     pub status: StageStatus,
-    pub detail: Option<String>,
+    pub detail: Option<Message>,
     pub duration_ms: Option<u64>,
 }
 
@@ -289,7 +292,7 @@ impl StageReport {
         }
     }
 
-    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+    pub fn detail(mut self, detail: impl Into<Message>) -> Self {
         self.detail = Some(detail.into());
         self
     }
@@ -318,8 +321,8 @@ pub struct EntryReport {
     pub provenance: Vec<String>,
     /// Where the restored bytes were written (absent in dry-run/inspect).
     pub output: Option<OutputFile>,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
+    pub warnings: Vec<Message>,
+    pub errors: Vec<Message>,
 }
 
 impl EntryReport {
@@ -373,8 +376,8 @@ pub struct InputReport {
     /// Libraries whose decoded module was paired with this metadata input.
     pub provenance: Vec<String>,
     pub stages: Vec<StageReport>,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
+    pub warnings: Vec<Message>,
+    pub errors: Vec<Message>,
     pub duration_ms: u64,
 }
 
@@ -405,11 +408,11 @@ impl InputReport {
         }
     }
 
-    pub fn warning(&mut self, message: impl Into<String>) {
+    pub fn warning(&mut self, message: impl Into<Message>) {
         self.warnings.push(message.into());
     }
 
-    pub fn error(&mut self, message: impl Into<String>) {
+    pub fn error(&mut self, message: impl Into<Message>) {
         self.errors.push(message.into());
     }
 }
@@ -454,8 +457,12 @@ pub struct Report {
     pub inputs: Vec<InputReport>,
     pub summary: SummaryReport,
     /// Run-level failures that are not attributable to one input.
-    pub errors: Vec<String>,
+    pub errors: Vec<Message>,
     pub duration_ms: u64,
+    /// The run was cancelled before every input was processed. Only a front
+    /// end can cancel, so the CLI's JSON never carries this field.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 impl Report {
@@ -469,64 +476,75 @@ impl Report {
         })
     }
 
-    /// Plain summary in the same shape as [`crate::job::Summary::line`].
+    /// Plain English summary in the same shape as [`crate::job::Summary::line`].
     pub fn summary_line(&self) -> String {
-        self.summary_line_with_palette(crate::ui::Palette::plain())
+        self.summary_line_in(crate::ui::Palette::plain(), Lang::En)
     }
 
-    /// Console summary with colors for actual nonzero outcomes.
+    /// Console summary in the process language, with colors for actual
+    /// nonzero outcomes.
     pub fn summary_line_with_palette(&self, palette: crate::ui::Palette) -> String {
-        use crate::ui::{Tone, count};
+        self.summary_line_in(palette, senbei_i18n::current())
+    }
 
+    /// The summary line in `lang`.
+    pub fn summary_line_in(&self, palette: crate::ui::Palette, lang: Lang) -> String {
         let s = &self.summary;
-        let mut line = format!(
-            "{} unpacked · {} skipped · {} errors · {} suspect · {} metadata",
-            count(palette, s.recovered, Tone::Success),
-            count(palette, s.skipped, Tone::Muted),
-            count(palette, s.errors, Tone::Error),
-            count(palette, s.suspect, Tone::Warning),
-            count(palette, s.metadata, Tone::Success)
-        );
-        if s.packages > 0 {
-            line.push_str(&format!(
-                " · {} packages",
-                palette.paint(Tone::Value, s.packages)
-            ));
-        }
-        line
+        crate::ui::summary_line(
+            palette,
+            lang,
+            [
+                s.recovered,
+                s.skipped,
+                s.errors,
+                s.suspect,
+                s.metadata,
+                s.packages,
+            ],
+        )
     }
 
-    /// Plain human-readable rendering, independent of the destination terminal.
+    /// Plain English rendering, independent of the destination terminal.
     pub fn render_text(&self) -> String {
-        self.render_text_with_palette(crate::ui::Palette::plain())
+        self.render_text_in(crate::ui::Palette::plain(), Lang::En)
     }
 
-    /// Human-readable rendering with an explicit console palette. Report data
-    /// and JSON remain unstyled; callers select the destination's color policy.
+    /// Console rendering in the process language. Report data and JSON remain
+    /// unstyled; callers select the destination's color policy.
     pub fn render_text_with_palette(&self, palette: crate::ui::Palette) -> String {
+        self.render_text_in(palette, senbei_i18n::current())
+    }
+
+    /// Human-readable rendering in `lang`. Only the summary lines are
+    /// translated; structural research evidence stays English.
+    pub fn render_text_in(&self, palette: crate::ui::Palette, lang: Lang) -> String {
         use crate::ui::Tone;
 
         let mut text = String::new();
         if let Some(scan) = self.scan {
             text.push_str(&format!(
-                "{}: {} probed non-targets · {} walk errors · {} probe errors\n",
-                palette.paint(Tone::Heading, "scan"),
-                scan.non_target_skipped,
-                scan.walk_errors,
-                scan.probe_errors
+                "{}: {}\n",
+                palette.paint(Tone::Heading, Cli::ReportScanHeading.localize(lang)),
+                Cli::ReportScan {
+                    skipped: scan.non_target_skipped,
+                    walk_errors: scan.walk_errors,
+                    probe_errors: scan.probe_errors,
+                }
+                .localize(lang)
             ));
             if scan.walk_errors > 0 || scan.probe_errors > 0 {
-                text.push_str(&format!("{}: analysis is incomplete; some directory entries or selected files could not be examined\n", palette.paint(Tone::Warning, "warning")));
+                text.push_str(&format!(
+                    "{}: {}\n",
+                    palette.paint(Tone::Warning, Cli::Warning.localize(lang)),
+                    Cli::ReportScanIncomplete.localize(lang)
+                ));
             }
         }
         for input in &self.inputs {
-            text.push_str(&text::render_input(input, palette));
+            text.push_str(&text::render_input(input, palette, lang));
         }
         for error in &self.errors {
-            text.push_str(&format!(
-                "{}: {error}\n",
-                palette.paint(Tone::Error, "error")
-            ));
+            text.push_str(&crate::ui::error_lines(palette, lang, error));
         }
         text
     }
@@ -539,7 +557,10 @@ pub struct Collector {
     scan: Option<ScanReport>,
     inputs: Vec<InputReport>,
     summary: SummaryReport,
-    errors: Vec<String>,
+    errors: Vec<Message>,
+    observer: Option<Arc<dyn crate::observe::RunObserver>>,
+    cancel: Option<crate::observe::CancelToken>,
+    cancelled: bool,
 }
 
 impl Collector {
@@ -551,7 +572,39 @@ impl Collector {
             inputs: Vec::new(),
             summary: SummaryReport::default(),
             errors: Vec::new(),
+            observer: None,
+            cancel: None,
+            cancelled: false,
         }
+    }
+
+    /// Tell `observer` about each input as the run reaches and finishes it.
+    pub fn with_observer(mut self, observer: Arc<dyn crate::observe::RunObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Stop the run at the next input once `cancel` is set.
+    pub fn with_cancel(mut self, cancel: crate::observe::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    pub(crate) fn observer(&self) -> Option<&Arc<dyn crate::observe::RunObserver>> {
+        self.observer.as_ref()
+    }
+
+    /// True once cancellation was requested. The report then records that the
+    /// run stopped early.
+    pub(crate) fn should_stop(&mut self) -> bool {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(crate::observe::CancelToken::is_cancelled)
+        {
+            self.cancelled = true;
+        }
+        self.cancelled
     }
 
     pub fn mode(&self) -> Mode {
@@ -585,9 +638,9 @@ impl Collector {
             // Research inspection and dry runs keep their actual recovery
             // outcomes, but never advertise temporary artifacts as outputs.
             let discarded = if self.mode == Mode::Inspect {
-                "research inspection: no output file was retained"
+                Msg::OutputNotRetained
             } else {
-                "dry run: the produced output was discarded"
+                Msg::DryRunDiscarded
             };
             if !input.outputs.is_empty() {
                 // The produced byte count is a real result of the attempt even
@@ -605,7 +658,7 @@ impl Collector {
                 for stage in &mut input.stages {
                     if stage.stage == Stage::OutputWrite {
                         stage.status = StageStatus::Skipped;
-                        stage.detail = Some(discarded.to_owned());
+                        stage.detail = Some(Message::new(discarded.clone()));
                     }
                 }
                 if !input
@@ -650,6 +703,9 @@ impl Collector {
             InputStatus::Skipped => self.summary.skipped += 1,
             InputStatus::Error => self.summary.errors += 1,
         }
+        if let Some(observer) = &self.observer {
+            observer.input_finished(&input);
+        }
         self.inputs.push(input);
     }
 
@@ -658,7 +714,7 @@ impl Collector {
     }
 
     /// Record a run-level failure that is not attributable to one input.
-    pub fn push_error(&mut self, message: impl Into<String>) {
+    pub fn push_error(&mut self, message: impl Into<Message>) {
         self.errors.push(message.into());
     }
 
@@ -675,6 +731,7 @@ impl Collector {
             summary: self.summary,
             errors: self.errors,
             duration_ms: self.started.elapsed().as_millis() as u64,
+            cancelled: self.cancelled,
         }
     }
 }
@@ -715,17 +772,17 @@ pub(crate) fn android_recovered_profile() -> ProtectionProfile {
 ///
 /// Recognition is inherited from the scan probe that selected the file; the
 /// route is recorded as failed with the error that stopped it.
-pub(crate) fn android_failed_profile(error: &str) -> ProtectionProfile {
+pub(crate) fn android_failed_profile(error: &Message) -> ProtectionProfile {
     let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::android(None));
     profile.recognition = RecognitionStatus::Recognized;
     profile.candidates = vec![senbei_engine::LayoutAttempt {
         layout: LayoutKind::AndroidStaged,
         outcome: AttemptOutcome::Failed,
         warnings: Vec::new(),
-        errors: vec![error.to_owned()],
+        errors: vec![error.clone()],
     }];
     profile.recovery = RecoveryStatus::Failed;
-    profile.push_error(error.to_owned());
+    profile.push_error(error.clone());
     profile
 }
 
@@ -773,7 +830,7 @@ pub(crate) fn metadata_unchanged_profile(
 pub(crate) fn metadata_failed_profile(
     identity: Option<senbei_metadata::MetadataIdentity>,
     route: LayoutKind,
-    error: &str,
+    error: &Message,
 ) -> ProtectionProfile {
     let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::metadata(
         identity.map(|identity| identity.raw_version),
@@ -785,10 +842,10 @@ pub(crate) fn metadata_failed_profile(
         layout: route,
         outcome: AttemptOutcome::Failed,
         warnings: Vec::new(),
-        errors: vec![error.to_owned()],
+        errors: vec![error.clone()],
     }];
     profile.recovery = RecoveryStatus::Failed;
-    profile.push_error(error.to_owned());
+    profile.push_error(error.clone());
     profile.static_validation = ValidationStatus::NotRun;
     profile
 }
@@ -812,7 +869,7 @@ mod tests {
             let profile = metadata_failed_profile(
                 senbei_metadata::identify(&header),
                 LayoutKind::MetadataStructural,
-                "transform did not validate",
+                &"transform did not validate".into(),
             );
             assert_eq!(profile.observed.metadata_version, Some(version));
             assert_eq!(profile.recognition, RecognitionStatus::Blocked);
@@ -932,7 +989,7 @@ mod tests {
         entry.analysis_incomplete = true;
         entry
             .errors
-            .push("resource ceiling prevented restoration".to_owned());
+            .push("resource ceiling prevented restoration".into());
         input.entries.push(entry);
         let mut collector = Collector::new(Mode::Inspect);
         collector.push(input);

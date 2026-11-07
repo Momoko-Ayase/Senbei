@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use senbei_i18n::{Cli, Lang, Localize, Message, Msg};
+
 use crate::atomic::write_atomic;
+use crate::message::{Coded, of_error};
 pub use crate::report::{Collector, Mode, REPORT_FORMAT_VERSION, Report};
 use crate::report::{
     CompanionReport, CompanionState, ContainerReport, Digest, EntryKind, EntryReport, EntryStatus,
@@ -34,30 +37,31 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// The plain summary line shared by CLI output and the log file.
+    /// The plain English summary line, as the log file records it.
     pub fn line(&self) -> String {
-        self.line_with_palette(crate::ui::Palette::plain())
+        self.line_in(crate::ui::Palette::plain(), Lang::En)
     }
 
-    /// Console rendering without adding presentation escapes to log data.
+    /// Console rendering in the process language, without adding
+    /// presentation escapes to log data.
     pub fn line_with_palette(&self, palette: crate::ui::Palette) -> String {
-        use crate::ui::{Tone, count};
+        self.line_in(palette, senbei_i18n::current())
+    }
 
-        let mut line = format!(
-            "{} unpacked · {} skipped · {} errors · {} suspect · {} metadata",
-            count(palette, self.unpacked, Tone::Success),
-            count(palette, self.skipped, Tone::Muted),
-            count(palette, self.errors, Tone::Error),
-            count(palette, self.suspect, Tone::Warning),
-            count(palette, self.metadata, Tone::Success)
-        );
-        if self.packages > 0 {
-            line.push_str(&format!(
-                " · {} packages",
-                palette.paint(Tone::Value, self.packages)
-            ));
-        }
-        line
+    /// The summary line in `lang`.
+    pub fn line_in(&self, palette: crate::ui::Palette, lang: Lang) -> String {
+        crate::ui::summary_line(
+            palette,
+            lang,
+            [
+                self.unpacked,
+                self.skipped,
+                self.errors,
+                self.suspect,
+                self.metadata,
+                self.packages,
+            ],
+        )
     }
 }
 
@@ -176,7 +180,7 @@ pub fn run_folder_reported(
 ///
 /// Used when a run cannot start at all (an unreadable input, a rejected
 /// command line), so `--json` callers still receive one versioned document.
-pub fn error_report(mode: Mode, message: &str) -> Report {
+pub fn error_report(mode: Mode, message: impl Into<Message>) -> Report {
     let mut collector = Collector::new(mode);
     collector.push_error(message);
     collector.finish()
@@ -188,6 +192,61 @@ pub fn error_report(mode: Mode, message: &str) -> Report {
 /// [`run_folder_with_limits`]; the collector only observes.
 #[allow(clippy::too_many_arguments)]
 fn run_folder_inner(
+    root: &Path,
+    out_dir: Option<&Path>,
+    quiet: u8,
+    verbose: bool,
+    no_log: bool,
+    scan_all: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+    reporter: Option<&mut Collector>,
+) -> anyhow::Result<Summary> {
+    observed(reporter, |reporter| {
+        run_folder_body(
+            root, out_dir, quiet, verbose, no_log, scan_all, limits, reporter,
+        )
+    })
+}
+
+/// Run `body` with the pipelines' verbose progress sent to the collector's
+/// observer, when it has one. Without an observer progress prints as before.
+fn observed<R>(
+    reporter: Option<&mut Collector>,
+    body: impl FnOnce(Option<&mut Collector>) -> R,
+) -> R {
+    match reporter.as_deref().and_then(Collector::observer).cloned() {
+        Some(observer) => senbei_engine::progress::with_sink(
+            move |event| observer.progress(event),
+            || body(reporter),
+        ),
+        None => body(reporter),
+    }
+}
+
+/// True once the run's front end asked it to stop. Checked before each input.
+fn stop(reporter: &mut Option<&mut Collector>) -> bool {
+    reporter.as_deref_mut().is_some_and(Collector::should_stop)
+}
+
+/// Tell the run's observer that work on `path` began.
+fn started(reporter: &Option<&mut Collector>, path: &Path) {
+    if let Some(observer) = reporter.as_deref().and_then(Collector::observer) {
+        observer.input_started(path);
+    }
+}
+
+/// Verbose pipeline steps are shown on an unquiet console, or sent to an
+/// observer, which never prints them.
+fn verbose_steps(verbose: bool, quiet: u8, reporter: &Option<&mut Collector>) -> bool {
+    verbose
+        && (quiet == 0
+            || reporter
+                .as_deref()
+                .is_some_and(|reporter| reporter.observer().is_some()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_folder_body(
     root: &Path,
     out_dir: Option<&Path>,
     quiet: u8,
@@ -229,10 +288,11 @@ fn run_folder_inner(
     // fail the run (exit 1) rather than report "0 errors" over a partial scan.
     let scan_failed = scan_stats.walk_errors + scan_stats.probe_errors;
     if scan_failed > 0 && quiet == 0 {
+        let lang = senbei_i18n::current();
         eprintln!(
-            "{}: {} file(s) could not be read during the scan and may be missed targets",
-            Palette::stderr().paint(Tone::Warning, "warning"),
-            scan_failed
+            "{}: {}",
+            Palette::stderr().paint(Tone::Warning, Cli::Warning.localize(lang)),
+            Cli::ScanUnreadable { count: scan_failed }.localize(lang)
         );
     }
     if let Some(log) = &log {
@@ -252,7 +312,8 @@ fn run_folder_inner(
     let suppress_file_lines = quiet >= 1;
     // Quiet wins over verbose: step progress only when quiet == 0 (spec: verbose
     // lines only when quiet == 0; quiet ≥ 2 must stay fully silent even with -v).
-    let verbose_steps = verbose && quiet == 0;
+    // An observer receives the steps instead of the console.
+    let verbose_steps = verbose_steps(verbose, quiet, &reporter);
     // Verbose mode prints multi-line `[N/9]` step output per file straight to
     // stdout; an active progress bar would be clobbered by it, so hide the bar
     // (its per-file ok/err lines still print) when verbose is on.
@@ -277,9 +338,21 @@ fn run_folder_inner(
             walk_errors: scan_stats.walk_errors,
             probe_errors: scan_stats.probe_errors,
         });
+        if let Some(observer) = reporter.observer() {
+            observer.scanned(
+                candidates.len()
+                    + scan.android_so.len()
+                    + scan.android_packages.len()
+                    + metas.len(),
+            );
+        }
     }
 
     for input in candidates {
+        if stop(&mut reporter) {
+            break;
+        }
+        started(&reporter, input);
         let rel = rel_in_tree(root, input);
         let dest = out_root.join(out_name(&rel));
         let started = Instant::now();
@@ -346,7 +419,7 @@ fn run_folder_inner(
             }
             Err(panic) => {
                 s.errors += 1;
-                let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                let e = anyhow::Error::new(Coded::panic("", panic_payload(&panic)));
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                 if let Some(log) = &log {
                     log.step(&format!(
@@ -378,6 +451,10 @@ fn run_folder_inner(
             .iter()
             .any(|library| library == &scoped.path)
     }) {
+        if stop(&mut reporter) {
+            break;
+        }
+        started(&reporter, &scoped.path);
         let rel = rel_in_tree(root, &scoped.path);
         let dest = out_root.join(out_name(&rel));
         let input_owned = scoped.path.clone();
@@ -487,7 +564,7 @@ fn run_folder_inner(
             }
             Err(panic) => {
                 s.errors += 1;
-                let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                let e = anyhow::Error::new(Coded::panic("", panic_payload(&panic)));
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                 if let Some(log) = &log {
                     log.step(&format!(
@@ -516,7 +593,14 @@ fn run_folder_inner(
     let package_groups =
         crate::android::loose_apk_groups_cached(&scan.android_packages, &mut android_cache);
     for group in &package_groups {
+        if stop(&mut reporter) {
+            break;
+        }
         if group.len() > 1 {
+            // A split set restores as one unit and reports each member.
+            for package in group {
+                started(&reporter, package);
+            }
             s.packages += group.len();
             // Relative output paths are computed here, by the same helper the
             // rest of the driver uses: they must stay relative so joining them
@@ -588,10 +672,10 @@ fn run_folder_inner(
                     }
                 }
                 Err(panic) => {
-                    let e = anyhow::anyhow!(
-                        "unexpected panic during package restore: {}",
-                        panic_payload(&panic)
-                    );
+                    let e = anyhow::Error::new(Coded::panic(
+                        " during package restore",
+                        panic_payload(&panic),
+                    ));
                     s.errors += 1;
                     crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                     if let Some(log) = &log {
@@ -608,6 +692,10 @@ fn run_folder_inner(
             continue;
         }
         for package in group {
+            if stop(&mut reporter) {
+                break;
+            }
+            started(&reporter, package);
             let rel = rel_in_tree(root, package);
             s.packages += 1;
             let package_owned = package.clone();
@@ -648,7 +736,7 @@ fn run_folder_inner(
                 Err(panic) => {
                     // A panic may leave a partial module recorded. Keeping the cache
                     // preserves successful dedup; a conflict still fails closed.
-                    let e = anyhow::anyhow!("unexpected panic: {}", panic_payload(&panic));
+                    let e = anyhow::Error::new(Coded::panic("", panic_payload(&panic)));
                     s.errors += 1;
                     crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                     if let Some(log) = &log {
@@ -675,6 +763,10 @@ fn run_folder_inner(
         .iter()
         .filter(|scoped| metas.iter().any(|meta| meta == &scoped.path))
     {
+        if stop(&mut reporter) {
+            break;
+        }
+        started(&reporter, &scoped.path);
         let rel = rel_in_tree(root, &scoped.path);
         let dest = out_root.join(out_name(&rel));
         let meta_owned = scoped.path.clone();
@@ -740,9 +832,11 @@ fn run_folder_inner(
                     s.skipped += 1;
                     if !suppress_file_lines {
                         eprintln!(
-                            "{} {}  unsupported metadata version {v}, left untouched",
+                            "{} {}  {}",
                             Palette::stderr().paint(Tone::Warning, "-"),
-                            rel.display()
+                            rel.display(),
+                            Cli::MetadataUnsupportedLine { version: v }
+                                .localize(senbei_i18n::current())
                         );
                     }
                     if let Some(log) = &log {
@@ -768,10 +862,10 @@ fn run_folder_inner(
             }
             Err(panic) => {
                 s.errors += 1;
-                let e = anyhow::anyhow!(
-                    "unexpected panic during de-obfuscation: {}",
-                    panic_payload(&panic)
-                );
+                let e = anyhow::Error::new(Coded::panic(
+                    " during de-obfuscation",
+                    panic_payload(&panic),
+                ));
                 crate::ui::err(&bar, suppress_file_lines, &rel, &e);
                 if let Some(log) = &log {
                     log.step(&format!(
@@ -853,6 +947,21 @@ fn run_file_inner(
     verbose: bool,
     no_log: bool,
     limits: &senbei_engine::android::ResourceLimits,
+    reporter: Option<&mut Collector>,
+) -> anyhow::Result<Summary> {
+    observed(reporter, |reporter| {
+        run_file_body(input, out_dir, quiet, verbose, no_log, limits, reporter)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_file_body(
+    input: &Path,
+    out_dir: Option<&Path>,
+    quiet: u8,
+    verbose: bool,
+    no_log: bool,
+    limits: &senbei_engine::android::ResourceLimits,
     mut reporter: Option<&mut Collector>,
 ) -> anyhow::Result<Summary> {
     let t0 = std::time::Instant::now();
@@ -883,6 +992,11 @@ fn run_file_inner(
     let research = reporter
         .as_deref()
         .is_some_and(|reporter| reporter.mode() == Mode::Inspect);
+    let verbose_steps = verbose_steps(verbose, quiet, &reporter);
+    if let Some(observer) = reporter.as_deref().and_then(Collector::observer) {
+        observer.scanned(1);
+    }
+    started(&reporter, input);
 
     let prefix = {
         use std::io::Read;
@@ -906,7 +1020,7 @@ fn run_file_inner(
     let is_android_package = !is_android_so && crate::android::is_app_package(input, &prefix);
 
     if is_meta {
-        match deobfuscate_metadata_researched(input, &dest, verbose && quiet == 0, research, None) {
+        match deobfuscate_metadata_researched(input, &dest, verbose_steps, research, None) {
             Ok((report, layout, metadata_research)) if report.remapped > 0 => {
                 s.metadata = 1;
                 if let Some(log) = &log {
@@ -916,12 +1030,16 @@ fn run_file_inner(
                     ));
                 }
                 if quiet == 0 {
+                    let palette = Palette::stdout();
+                    let line = Cli::MetadataVersionLine {
+                        version: palette.paint(Tone::Value, report.version).to_string(),
+                        dest: palette.paint(Tone::Value, format!("{dest:?}")).to_string(),
+                        remapped: palette.paint(Tone::Value, report.remapped).to_string(),
+                    };
                     println!(
-                        "{} metadata v{} -> {} ({} method fields remapped)",
-                        Palette::stdout().paint(Tone::Success, "✓"),
-                        Palette::stdout().paint(Tone::Value, report.version),
-                        Palette::stdout().paint(Tone::Value, format!("{dest:?}")),
-                        Palette::stdout().paint(Tone::Value, report.remapped)
+                        "{} {}",
+                        palette.paint(Tone::Success, "✓"),
+                        line.localize(senbei_i18n::current())
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
@@ -939,11 +1057,15 @@ fn run_file_inner(
                     ));
                 }
                 if quiet == 0 {
+                    let lang = senbei_i18n::current();
+                    let palette = Palette::stdout();
+                    let version = Cli::MetadataAlreadyClean {
+                        version: palette.paint(Tone::Value, report.version).to_string(),
+                    };
                     println!(
-                        "metadata v{}: {}",
-                        Palette::stdout().paint(Tone::Value, report.version),
-                        Palette::stdout()
-                            .paint(Tone::Muted, "already de-obfuscated, nothing to do")
+                        "{} {}",
+                        version.localize(lang),
+                        palette.paint(Tone::Muted, Cli::MetadataNothingToDo.localize(lang))
                     );
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
@@ -960,7 +1082,7 @@ fn run_file_inner(
                 }
                 // Level 1 quiet: banner/summary/duration only (match folder mode).
                 if quiet == 0 {
-                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
+                    crate::ui::print_anyhow(&e);
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
                     let unsupported = unsupported_version(&e);
@@ -973,7 +1095,7 @@ fn run_file_inner(
             crate::android::restore_so_file_researched(
                 input,
                 &dest,
-                verbose && quiet == 0,
+                verbose_steps,
                 limits,
                 research,
             )
@@ -985,13 +1107,8 @@ fn run_file_inner(
                 )
             })
         } else {
-            crate::android::restore_so_file_with_diagnostics(
-                input,
-                &dest,
-                verbose && quiet == 0,
-                limits,
-            )
-            .map(|(embedded, validation)| (embedded, validation, None))
+            crate::android::restore_so_file_with_diagnostics(input, &dest, verbose_steps, limits)
+                .map(|(embedded, validation)| (embedded, validation, None))
         };
         match restore {
             Ok((embedded, validation, android_research)) => {
@@ -1015,11 +1132,15 @@ fn run_file_inner(
                             log.step(&format!("META {:?} (embedded) -> {:?}", input, meta_dest));
                         }
                         if quiet == 0 {
+                            let palette = Palette::stdout();
+                            let line = Cli::EmbeddedMetadataLine {
+                                input: palette.paint(Tone::Label, input.display()).to_string(),
+                                dest: palette.paint(Tone::Value, meta_dest.display()).to_string(),
+                            };
                             println!(
-                                "{} metadata  {} (embedded)  ->  {}",
-                                Palette::stdout().paint(Tone::Success, "✓"),
-                                Palette::stdout().paint(Tone::Label, input.display()),
-                                Palette::stdout().paint(Tone::Value, meta_dest.display())
+                                "{} {}",
+                                palette.paint(Tone::Success, "✓"),
+                                line.localize(senbei_i18n::current())
                             );
                         }
                     }
@@ -1030,10 +1151,7 @@ fn run_file_inner(
                             log.step(&format!("ERR {:?}: embedded metadata: {e:#}", input));
                         }
                         if quiet == 0 {
-                            eprintln!(
-                                "{}: embedded metadata: {e:#}",
-                                Palette::stderr().paint(Tone::Error, "error")
-                            );
+                            crate::ui::print_error_about(Cli::EmbeddedMetadataFailed, &e);
                         }
                     }
                 }
@@ -1050,7 +1168,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
+                    crate::ui::print_anyhow(&e);
                 }
                 if let Some(reporter) = reporter.as_deref_mut() {
                     let mut reported = android_library_input_with_error(
@@ -1082,7 +1200,7 @@ fn run_file_inner(
             &rel,
             &out_root,
             &mut seen,
-            verbose && quiet == 0,
+            verbose_steps,
             limits,
             research,
         ) {
@@ -1104,7 +1222,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
+                    crate::ui::print_anyhow(&e);
                 }
                 if let Some(reporter) = reporter {
                     reporter.push(failed_input(input, &e, t0));
@@ -1118,14 +1236,10 @@ fn run_file_inner(
         let (profile, observed, result) = match reporter.is_some() {
             true => {
                 let (profile, observed, result) =
-                    unpack_one_researched(input, &dest, verbose && quiet == 0, research);
+                    unpack_one_researched(input, &dest, verbose_steps, research);
                 (Some(profile), observed, result)
             }
-            false => (
-                None,
-                None,
-                unpack_one_v(input, &dest, verbose && quiet == 0),
-            ),
+            false => (None, None, unpack_one_v(input, &dest, verbose_steps)),
         };
         match result {
             Ok((kind, report)) => {
@@ -1151,13 +1265,14 @@ fn run_file_inner(
                         ));
                     }
                     if quiet == 0 {
+                        let lang = senbei_i18n::current();
                         eprintln!(
                             "{}: {}",
                             Palette::stderr().paint(
                                 Tone::Warning,
-                                "! integrity check failed (likely to crash at runtime)"
+                                Cli::IntegrityFailedLikelyCrash.localize(lang)
                             ),
-                            report.issues.join("; ")
+                            crate::ui::issues(&report, lang)
                         );
                     }
                 }
@@ -1173,7 +1288,7 @@ fn run_file_inner(
                     log.step(&format!("ERR {:?}: {e:#}", input));
                 }
                 if quiet == 0 {
-                    eprintln!("{}: {e:#}", Palette::stderr().paint(Tone::Error, "error"));
+                    crate::ui::print_anyhow(&e);
                 }
                 if let Some(reporter) = reporter {
                     let mut reported = match profile {
@@ -1321,10 +1436,7 @@ fn deobfuscate_metadata_researched(
         }
         write_atomic(dest, &out)?;
         if verbose {
-            println!(
-                "Write to {}",
-                Palette::stdout().paint(Tone::Value, dest.display())
-            );
+            crate::ui::write_to(dest, true);
         }
     }
     Ok((report, layout, metadata_research))
@@ -1676,7 +1788,7 @@ fn unpack_one_researched(
         Err(error) => {
             let mut profile = observed_profile(input);
             profile.recovery = senbei_engine::RecoveryStatus::Blocked;
-            profile.push_error(format!("{error:#}"));
+            profile.push_error(of_error(&error));
             return (profile, None, Err(error));
         }
     };
@@ -1755,10 +1867,7 @@ fn unpack_one_researched(
         return (profile, observed, Err(error.into()));
     }
     if verbose {
-        println!(
-            "Write to {}",
-            Palette::stdout().paint(Tone::Value, dest.display())
-        );
+        crate::ui::write_to(dest, true);
     }
     (profile, observed, Ok((image.kind, image.integrity)))
 }
@@ -1869,13 +1978,11 @@ pub(crate) fn companion_report(
             _ => path.map(|path| path.display().to_string()),
         },
         detail: match state {
-            CompanionState::Unmatched => {
-                Some("a sibling `._` exists but is not this stub's payload".to_owned())
-            }
-            CompanionState::Unreadable => Some(match unreadable {
-                Some(reason) => format!("the sibling `._` could not be read: {reason}"),
-                None => "the sibling `._` could not be read".to_owned(),
-            }),
+            CompanionState::Unmatched => Some(Message::new(Msg::CompanionUnmatched)),
+            CompanionState::Unreadable => Some(Message::new(match unreadable {
+                Some(reason) => Msg::CompanionUnreadable { reason },
+                None => Msg::CompanionUnreadableUnknown,
+            })),
             _ => None,
         },
         source,
@@ -1971,7 +2078,7 @@ fn failed_input(input: &Path, error: &anyhow::Error, started: Instant) -> InputR
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = InputStatus::Error;
     entry.analysis_incomplete = analysis_incomplete(error);
-    let detail = format!("{error:#}");
+    let detail = of_error(error);
     entry.error(detail.clone());
     entry.profile = Some(failure_profile(input, &detail));
     entry
@@ -1994,7 +2101,7 @@ fn failed_input_with_profile(
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = InputStatus::Error;
     entry.analysis_incomplete = analysis_incomplete(error);
-    let detail = format!("{error:#}");
+    let detail = of_error(error);
     entry.error(detail.clone());
     entry.companion = crate::windows::is_pe_extension(input).then(|| {
         let (state, source, unreadable) =
@@ -2055,13 +2162,13 @@ fn observed_profile(input: &Path) -> senbei_engine::ProtectionProfile {
 }
 
 /// Profile of an input whose recovery failed.
-fn failure_profile(input: &Path, detail: &str) -> senbei_engine::ProtectionProfile {
+fn failure_profile(input: &Path, detail: &Message) -> senbei_engine::ProtectionProfile {
     use senbei_engine::{AttemptOutcome, LayoutKind, ProtectionProfile, RecoveryStatus};
     let Ok(prefix) = read_prefix(input) else {
         let mut profile =
             ProtectionProfile::new(senbei_engine::ObservedTarget::windows(None, None));
         profile.recovery = RecoveryStatus::Failed;
-        profile.push_error(detail.to_owned());
+        profile.push_error(detail.clone());
         return profile;
     };
     if senbei_metadata::is_metadata(&prefix) {
@@ -2092,8 +2199,8 @@ fn failure_profile(input: &Path, detail: &str) -> senbei_engine::ProtectionProfi
             .find(|candidate| candidate.outcome == AttemptOutcome::NotAttempted)
             .map(|candidate| candidate.layout)
         {
-            Some(layout) => (layout, vec![detail.to_owned()]),
-            None => (LayoutKind::ExeStyle, vec![detail.to_owned()]),
+            Some(layout) => (layout, vec![detail.clone()]),
+            None => (LayoutKind::ExeStyle, vec![detail.clone()]),
         };
         if let Some(attempt) = profile.attempt_mut(layout) {
             attempt.outcome = AttemptOutcome::Failed;
@@ -2107,7 +2214,7 @@ fn failure_profile(input: &Path, detail: &str) -> senbei_engine::ProtectionProfi
             });
         }
         profile.recovery = RecoveryStatus::Failed;
-        profile.push_error(detail.to_owned());
+        profile.push_error(detail.clone());
         return profile;
     }
     if crate::android::is_elf64_aarch64(&prefix) {
@@ -2115,7 +2222,7 @@ fn failure_profile(input: &Path, detail: &str) -> senbei_engine::ProtectionProfi
     }
     let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::windows(None, None));
     profile.recovery = RecoveryStatus::Failed;
-    profile.push_error(detail.to_owned());
+    profile.push_error(detail.clone());
     profile
 }
 
@@ -2156,7 +2263,11 @@ fn android_library_input_with_error(
                 .push(StageReport::new(Stage::Recovery, StageStatus::Skipped));
         }
         _ => {
-            let detail = entry.errors.first().cloned().unwrap_or_default();
+            let detail = entry
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Message::raw(""));
             entry.profile = Some(crate::report::android_failed_profile(&detail));
             entry
                 .stages
@@ -2190,8 +2301,12 @@ fn apply_android_validation(
     } else {
         senbei_engine::ValidationStatus::Warnings
     };
-    profile.warnings.extend(validation.messages.iter().cloned());
-    report.warnings.extend(validation.messages.iter().cloned());
+    profile
+        .warnings
+        .extend(validation.messages.iter().cloned().map(Message::from));
+    report
+        .warnings
+        .extend(validation.messages.iter().cloned().map(Message::from));
     // The stage itself succeeded — the restore validated the output. Findings
     // are carried as detail and warnings, not as a failed stage.
     let mut stage = StageReport::new(Stage::StaticValidation, StageStatus::Ok);
@@ -2265,8 +2380,7 @@ fn metadata_input(
             None => crate::report::metadata_unchanged_profile(identity),
         });
         entry.stages.push(
-            StageReport::new(Stage::Recovery, StageStatus::Skipped)
-                .detail("the transform ran and validated; nothing needed rewriting"),
+            StageReport::new(Stage::Recovery, StageStatus::Skipped).detail(Msg::TransformNoop),
         );
     }
     entry.duration_ms = crate::report::now_ms(started);
@@ -2346,14 +2460,12 @@ fn metadata_failure_input(
         report.status = InputStatus::Skipped;
         report.errors.clear();
         report.profile = Some(crate::report::metadata_unchanged_profile(identity));
-        report.warning(format!(
-            "unsupported metadata version {version}, left untouched"
-        ));
+        report.warning(Msg::MetadataLeftUntouched { version });
     } else {
         report.profile = Some(crate::report::metadata_failed_profile(
             identity,
             senbei_engine::LayoutKind::MetadataStructural,
-            &format!("{error:#}"),
+            &of_error(error),
         ));
     }
     report
@@ -2416,7 +2528,9 @@ fn package_input(
         .flat_map(|validation| validation.messages.iter().cloned())
         .collect();
     if !diagnostics.is_empty() {
-        entry.warnings.extend(diagnostics.clone());
+        entry
+            .warnings
+            .extend(diagnostics.iter().cloned().map(Message::from));
         entry.stages.push(
             StageReport::new(Stage::StaticValidation, StageStatus::Ok)
                 .detail(diagnostics.join("; ")),
@@ -2475,7 +2589,7 @@ fn entry_report(outcome: &crate::android::EntryOutcome) -> EntryReport {
         report.output = Some(OutputFile::from_path(&outcome.dest));
     }
     if let crate::android::EntryStatus::Failed(error) = &outcome.status {
-        report.errors.push(format!("{error:#}"));
+        report.errors.push(of_error(error));
         // A resource or I/O ceiling stopped this entry before its structure
         // could be judged; a structural rejection is an observed finding.
         report.analysis_incomplete = analysis_incomplete(error);
@@ -2485,7 +2599,9 @@ fn entry_report(outcome: &crate::android::EntryOutcome) -> EntryReport {
     if status == EntryStatus::Restored
         && let Some(validation) = &outcome.validation
     {
-        report.warnings.extend(validation.messages.iter().cloned());
+        report
+            .warnings
+            .extend(validation.messages.iter().cloned().map(Message::from));
     }
     report
 }
@@ -2814,7 +2930,7 @@ mod incomplete_analysis_tests {
         std::fs::write(&path, b"not really an ELF").unwrap();
         let mut input = InputReport::new(&path, Role::Content);
         input.status = InputStatus::Error;
-        input.profile = Some(crate::report::android_failed_profile("limit"));
+        input.profile = Some(crate::report::android_failed_profile(&"limit".into()));
         input.analysis_incomplete = true;
         let reported = inspect_status(input);
         assert_eq!(reported.status, InputStatus::Error);
@@ -2823,7 +2939,9 @@ mod incomplete_analysis_tests {
         // The same target without an incompleteness marker is a finding.
         let mut complete = InputReport::new(&path, Role::Content);
         complete.status = InputStatus::Error;
-        complete.profile = Some(crate::report::android_failed_profile("layout rejected"));
+        complete.profile = Some(crate::report::android_failed_profile(
+            &"layout rejected".into(),
+        ));
         let reported = inspect_status(complete);
         assert_eq!(reported.status, InputStatus::Recognized);
         assert!(!reported.analysis_incomplete);
@@ -2834,7 +2952,7 @@ mod incomplete_analysis_tests {
     fn a_container_inherits_an_incomplete_entry() {
         let mut entry = EntryReport::new("app.apk::lib/arm64-v8a/libil2cpp.so", EntryStatus::Error);
         entry.analysis_incomplete = true;
-        entry.errors.push("resource limit".to_owned());
+        entry.errors.push("resource limit".into());
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("app.apk");
         std::fs::write(&path, b"PK").unwrap();

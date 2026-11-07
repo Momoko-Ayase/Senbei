@@ -1,19 +1,26 @@
 use senbei_engine::android::ResourceLimits;
+use senbei_i18n::{Cli, Localize};
 use senbei_io::{
-    job, pause, scan,
+    job,
+    message::of_error,
+    pause, scan,
     ui::{self, ColorMode, Palette, Tone},
 };
 use std::num::NonZeroUsize;
 use std::path::Path;
 
 fn main() -> std::process::ExitCode {
+    // Console text follows the user's language; logs and JSON stay English.
+    senbei_i18n::set_current(senbei_io::locale::detect());
     let mut options = match Options::parse(std::env::args().skip(1)) {
         Ok(Outcome::Run(options)) => options,
         Ok(Outcome::Handled(code)) => return code,
         Err(message) => {
+            let lang = senbei_i18n::current();
             eprintln!(
-                "{}: {message}",
-                Palette::stderr().paint(Tone::Error, "error")
+                "{}: {}",
+                Palette::stderr().paint(Tone::Error, Cli::Error.localize(lang)),
+                message.localize(lang)
             );
             return std::process::ExitCode::from(2);
         }
@@ -67,7 +74,7 @@ enum Outcome {
 }
 
 impl Options {
-    fn parse(args: impl Iterator<Item = String>) -> Result<Outcome, String> {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Outcome, Box<Cli>> {
         let mut args = args.peekable();
         let mut command = Command::Unpack;
         let mut subcommand: Option<String> = None;
@@ -114,11 +121,14 @@ impl Options {
                 }
                 "--out" => match args.next() {
                     Some(v) if !v.starts_with('-') => out = Some(v),
-                    _ => return Err("--out requires a directory argument".to_owned()),
+                    _ => return Err(Cli::OutRequiresDirectory.into()),
                 },
                 other if other.starts_with('-') => {
                     print_help();
-                    return Err(format!("unknown option '{other}'"));
+                    return Err(Cli::UnknownOption {
+                        option: other.to_owned(),
+                    }
+                    .into());
                 }
                 // A subcommand is only a subcommand when it is the first
                 // positional word. `senbei inspect` therefore means the
@@ -137,9 +147,11 @@ impl Options {
                 }
                 other => {
                     if let Some(prev) = &path {
-                        return Err(format!(
-                            "multiple input paths given ('{prev}' and '{other}')"
-                        ));
+                        return Err(Cli::MultipleInputs {
+                            first: prev.clone(),
+                            second: other.to_owned(),
+                        }
+                        .into());
                     }
                     path = Some(other.to_string());
                 }
@@ -150,7 +162,7 @@ impl Options {
             // A subcommand with no path is a usage error; no arguments at all
             // still prints help and exits 2, as before.
             if let Some(subcommand) = subcommand {
-                return Err(format!("'{subcommand}' requires an input path"));
+                return Err(Cli::SubcommandNeedsPath { subcommand }.into());
             }
             print_help();
             return Ok(Outcome::Handled(std::process::ExitCode::from(2)));
@@ -160,10 +172,10 @@ impl Options {
         // rejected rather than guessed at.
         if command == Command::Inspect {
             if dry_run {
-                return Err("'inspect' writes nothing; drop --dry-run".to_owned());
+                return Err(Cli::InspectNoDryRun.into());
             }
             if out.is_some() {
-                return Err("'inspect' writes nothing; --out is not allowed".to_owned());
+                return Err(Cli::InspectNoOut.into());
             }
             // `--strict-integrity` is meaningful: inspection runs the real
             // static check and reports its verdict.
@@ -177,7 +189,7 @@ impl Options {
         if dry_run {
             // A dry run keeps nothing: no ordinary output directory, no log.
             if out.is_some() {
-                return Err("--dry-run writes no output; --out is not allowed".to_owned());
+                return Err(Cli::DryRunNoOut.into());
             }
             no_log = true;
         }
@@ -201,20 +213,20 @@ impl Options {
     }
 }
 
-fn parse_color(value: Option<&str>) -> Result<ColorMode, String> {
+fn parse_color(value: Option<&str>) -> Result<ColorMode, Box<Cli>> {
     match value {
         Some("auto") => Ok(ColorMode::Auto),
         Some("always") => Ok(ColorMode::Always),
         Some("never") => Ok(ColorMode::Never),
-        _ => Err("--color requires auto, always, or never".to_owned()),
+        _ => Err(Cli::ColorRequiresMode.into()),
     }
 }
 
-fn parse_thread_cap(value: Option<&str>) -> Result<NonZeroUsize, String> {
+fn parse_thread_cap(value: Option<&str>) -> Result<NonZeroUsize, Box<Cli>> {
     value
         .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|text| text.parse().ok())
-        .ok_or_else(|| "--threads requires a positive integer argument".to_owned())
+        .ok_or_else(|| Cli::ThreadsRequiresInteger.into())
 }
 
 /// Run the parsed command. Kept separate from argument parsing and the pause
@@ -246,13 +258,10 @@ fn execute_inspect(options: &Options, path: &Path, scan_all: bool) -> u8 {
         }
         Err(error) => {
             if options.machine {
-                let report = job::error_report(job::Mode::Inspect, &format!("{error:#}"));
+                let report = job::error_report(job::Mode::Inspect, of_error(&error));
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                eprintln!(
-                    "{}: {error:#}",
-                    Palette::stderr().paint(Tone::Error, "error")
-                );
+                ui::print_anyhow(&error);
             }
             1
         }
@@ -273,13 +282,10 @@ fn execute_dry_run(options: &Options, path: &Path, scan_all: bool) -> u8 {
         }
         Err(error) => {
             if options.machine {
-                let report = job::error_report(job::Mode::DryRun, &format!("{error:#}"));
+                let report = job::error_report(job::Mode::DryRun, of_error(&error));
                 println!("{}", report.to_json());
             } else if options.quiet < 2 {
-                eprintln!(
-                    "{}: {error:#}",
-                    Palette::stderr().paint(Tone::Error, "error")
-                );
+                ui::print_anyhow(&error);
             }
             1
         }
@@ -350,10 +356,12 @@ fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
                 println!("{}", collector.finish().to_json());
             } else if options.quiet < 2 {
                 println!("{}", summary.line_with_palette(Palette::stdout()));
+                let done = Cli::DoneIn {
+                    ms: summary.duration_ms,
+                };
                 println!(
                     "{}",
-                    Palette::stdout()
-                        .paint(Tone::Muted, format!("done in {} ms", summary.duration_ms))
+                    Palette::stdout().paint(Tone::Muted, done.localize(senbei_i18n::current()))
                 );
             }
             exit_code(&summary, options.strict_integrity)
@@ -361,13 +369,10 @@ fn execute_unpack(options: &Options, path: &Path, scan_all: bool) -> u8 {
         Err(error) => {
             if options.machine {
                 let mut failed = collector;
-                failed.push_error(format!("{error:#}"));
+                failed.push_error(of_error(&error));
                 println!("{}", failed.finish().to_json());
             } else if options.quiet < 2 {
-                eprintln!(
-                    "{}: {error:#}",
-                    Palette::stderr().paint(Tone::Error, "error")
-                );
+                ui::print_anyhow(&error);
             }
             1
         }
@@ -400,20 +405,27 @@ fn set_resource_limit(
     limits: &mut ResourceLimits,
     flag: &str,
     value: Option<&str>,
-) -> Result<(), String> {
-    let invalid = || format!("{flag} requires an unsigned integer argument");
+) -> Result<(), Box<Cli>> {
+    let invalid = || Cli::LimitRequiresInteger {
+        flag: flag.to_owned(),
+    };
     let text = value
         .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
         .ok_or_else(invalid)?;
     let value: u64 = text.parse().map_err(|_| invalid())?;
     if value == 0 && flag != "--max-depth" {
-        return Err(format!("{flag} must be greater than zero"));
+        return Err(Cli::LimitMustBePositive {
+            flag: flag.to_owned(),
+        }
+        .into());
     }
     match flag {
         "--max-entry-mib" | "--max-total-mib" => {
             let bytes = value
                 .checked_mul(1024 * 1024)
-                .ok_or_else(|| format!("{flag} exceeds the supported byte range"))?;
+                .ok_or_else(|| Cli::LimitTooLarge {
+                    flag: flag.to_owned(),
+                })?;
             if flag == "--max-entry-mib" {
                 limits.max_entry_bytes = bytes;
             } else {
@@ -422,7 +434,12 @@ fn set_resource_limit(
         }
         "--max-entries" => limits.max_entries = usize::try_from(value).map_err(|_| invalid())?,
         "--max-depth" => limits.max_depth = usize::try_from(value).map_err(|_| invalid())?,
-        _ => return Err(format!("unknown resource option '{flag}'")),
+        _ => {
+            return Err(Cli::UnknownLimit {
+                flag: flag.to_owned(),
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -431,73 +448,28 @@ fn print_help() {
     println!(
         "senbei [inspect|unpack] <file|folder> [--out DIR] [-v|--verbose] [-q|--quiet]... [--json] [--dry-run] [--threads N] [--color auto|always|never] [--scan-all] [--strict-integrity] [--max-entry-mib N] [--max-total-mib N] [--max-entries N] [--max-depth N] [--no-log] [--no-pause] [-V|--version] [-h|--help]"
     );
-    println!(
-        "  <file|folder>\n\
-         \x20              a CrackProof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
-         \x20              a protected Android AArch64 library (.so), an Android app\n\
-         \x20              package (.apk/.apks/.xapk), or a folder containing any of\n\
-         \x20              these. The bare form is the same as 'unpack'."
-    );
-    println!(
-        "  inspect PATH\n\
-         \x20              run the real static recovery for research, and report\n\
-         \x20              everything observed: recognition evidence, each route\n\
-         \x20              tried and why it was rejected, the route selected, the\n\
-         \x20              static check's verdict, and the engines' own structural\n\
-         \x20              evidence (protected-header fields, seeds, module records,\n\
-         \x20              restored-image facts). Nothing is kept: no output file,\n\
-         \x20              no log, no temporary tree, and the input is never run."
-    );
-    println!("  unpack PATH  detection and recovery; writes outputs (the default).");
-    println!(
-        "  --json       write one versioned machine-readable report to stdout and\n\
-         \x20              nothing else. Implies quiet and --no-log."
-    );
-    println!(
-        "  --dry-run    run the real recovery but keep nothing: no output tree and\n\
-         \x20              no log. Android extraction still uses its own temporary\n\
-         \x20              workspace, which is discarded."
-    );
-    println!(
-        "  --threads N  positive worker cap for this run. Overrides SENBEI_THREADS;\n\
-         \x20              1 selects the sequential path. The environment is unchanged."
-    );
-    println!(
-        "  --color MODE auto (default), always, or never; --color=MODE also works.\n\
-         \x20              Auto colors terminal stdout/stderr separately, unless\n\
-         \x20              NO_COLOR is nonempty or TERM=dumb. Explicit always/never\n\
-         \x20              override these variables. JSON and saved logs stay plain."
-    );
-    println!(
-        "  --scan-all   probe selected .exe/.dll/.so/metadata names below the\n\
-         \x20              size floor; other filenames remain excluded."
-    );
-    println!(
-        "  --strict-integrity\n\
-         \x20              exit non-zero when any output fails the static integrity\n\
-         \x20              check (a suspect) or a file errors. Off by default: a\n\
-         \x20              suspect is still written and the process exits 0 unless\n\
-         \x20              a file errors. Quiet levels are unchanged.\n\
-         \x20              With 'inspect', the check applies to the image actually\n\
-         \x20              recovered for research; no output file is retained."
-    );
     let defaults = ResourceLimits::default();
-    println!(
-        "  Android resource limits (MiB = 1048576 bytes):\n\
-         \x20 --max-entry-mib N  single archive entry/decoded buffer/output (default {})\n\
-         \x20 --max-total-mib N  cumulative archive bytes and per-engine task budget (default {})\n\
-         \x20 --max-entries N    archive entries/stage-2 records (default {})\n\
-         \x20 --max-depth N      nesting depth, root = 0 (default {})\n\
-         \x20 Limits are checked before extraction/allocation; they are not a peak-RSS cap.",
-        defaults.max_entry_bytes / (1024 * 1024),
-        defaults.max_total_bytes / (1024 * 1024),
-        defaults.max_entries,
-        defaults.max_depth,
-    );
-    println!(
-        "  Exit codes: 0 success, 1 a target failed (or a suspect with\n\
-         \x20 --strict-integrity), 2 the command line was rejected."
-    );
+    let lang = senbei_i18n::current();
+    for block in [
+        Cli::HelpPath,
+        Cli::HelpInspect,
+        Cli::HelpUnpack,
+        Cli::HelpJson,
+        Cli::HelpDryRun,
+        Cli::HelpThreads,
+        Cli::HelpColor,
+        Cli::HelpScanAll,
+        Cli::HelpStrictIntegrity,
+        Cli::HelpLimits {
+            entry_mib: defaults.max_entry_bytes / (1024 * 1024),
+            total_mib: defaults.max_total_bytes / (1024 * 1024),
+            entries: defaults.max_entries,
+            depth: defaults.max_depth,
+        },
+        Cli::HelpExitCodes,
+    ] {
+        println!("{}", block.localize(lang));
+    }
 }
 
 #[cfg(test)]
@@ -641,7 +613,9 @@ mod command_line {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Options, String> {
-        match Options::parse(args.iter().map(|arg| (*arg).to_string()))? {
+        let parsed = Options::parse(args.iter().map(|arg| (*arg).to_string()))
+            .map_err(|error| error.localize(senbei_i18n::Lang::En).into_owned())?;
+        match parsed {
             Outcome::Run(options) => Ok(options),
             Outcome::Handled(code) => Err(format!(
                 "handled: {}",

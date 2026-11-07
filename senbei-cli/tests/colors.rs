@@ -10,6 +10,7 @@ fn senbei() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_senbei"));
     command
         .arg("--no-pause")
+        .env("SENBEI_LANG", "en")
         .env_remove("NO_COLOR")
         .env("TERM", "xterm-256color");
     command

@@ -20,6 +20,7 @@ use super::super::{
 };
 use senbei_crypto::bytecode::{Op, OpsLut, generate};
 use senbei_crypto::primitives::{self, *};
+use senbei_i18n::Step;
 
 /// Per-code-block index for trace events. The four blocks share one research
 /// stage, so an explicit index keeps their events orderable.
@@ -627,13 +628,31 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         );
     }
     if verbose {
-        println!("[1/9] Initializing keys...");
-        println!("  keys[0] key       = 0x{:08X}", keys[0] as u32);
-        println!("  keys[1] signature = 0x{:08X}", keys[1] as u32);
-        println!("  keys[3] base      = 0x{:08X}", keys[3] as u32);
-        println!("  keys[4] src_off   = 0x{:08X}", keys[4] as u32);
-        println!("  keys[5] size      = 0x{:08X}", keys[5] as u32);
-        println!("  keys[6] anchor    = 0x{:08X}", keys[6] as u32);
+        crate::progress::step(1, 9, Step::InitKeys);
+        crate::progress::detail(format_args!(
+            "  keys[0] key       = 0x{:08X}",
+            keys[0] as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  keys[1] signature = 0x{:08X}",
+            keys[1] as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  keys[3] base      = 0x{:08X}",
+            keys[3] as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  keys[4] src_off   = 0x{:08X}",
+            keys[4] as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  keys[5] size      = 0x{:08X}",
+            keys[5] as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  keys[6] anchor    = 0x{:08X}",
+            keys[6] as u32
+        ));
     }
 
     if !super::super::is_supported_magic(keys[1] as u32) {
@@ -706,9 +725,15 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         );
     }
     if verbose {
-        println!("[2/9] Decrypting key table...");
-        println!("  size_of_image = 0x{:08X}", size_of_image as u32);
-        println!("  base_offset   = 0x{:08X}", base_offset as u32);
+        crate::progress::step(2, 9, Step::DecryptKeyTable);
+        crate::progress::detail(format_args!(
+            "  size_of_image = 0x{:08X}",
+            size_of_image as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  base_offset   = 0x{:08X}",
+            base_offset as u32
+        ));
     }
 
     // DecryptKeyTable.
@@ -805,10 +830,19 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         research::emit_u32(ResearchStage::DllStages, "descriptor_shift", 21);
     }
     if verbose {
-        println!("[3/9] Decrypting primary descriptor...");
-        println!("  xor_accumulator = 0x{:08X}", xor_accumulator);
-        println!("  checksum1       = 0x{:08X}", checksum1 as u32);
-        println!("  decrypted_addr1 = 0x{:08X}", decrypted_addr1 as u32);
+        crate::progress::step(3, 9, Step::DecryptPrimary);
+        crate::progress::detail(format_args!(
+            "  xor_accumulator = 0x{:08X}",
+            xor_accumulator
+        ));
+        crate::progress::detail(format_args!(
+            "  checksum1       = 0x{:08X}",
+            checksum1 as u32
+        ));
+        crate::progress::detail(format_args!(
+            "  decrypted_addr1 = 0x{:08X}",
+            decrypted_addr1 as u32
+        ));
     }
     let primary_end = decrypted_addr1.checked_add(3856);
     if decrypted_addr1 < keys[3]
@@ -939,15 +973,15 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         );
     }
     if verbose {
-        println!("[4/9] Processing relocations & decomp params...");
-        println!("  addr2          = 0x{:08X}", addr2 as u32);
-        println!(
+        crate::progress::step(4, 9, Step::RelocsParams);
+        crate::progress::detail(format_args!("  addr2          = 0x{:08X}", addr2 as u32));
+        crate::progress::detail(format_args!(
             "  decomp_params  = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
             decomp_params[0] as u32,
             decomp_params[1] as u32,
             decomp_params[2] as u32,
             decomp_params[3] as u32
-        );
+        ));
     }
 
     let checksum2 = calculate_checksum(&out, (keys[6] + 5640) as u32) as i32;
@@ -981,9 +1015,9 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
 
     let addr3b = get_i32(&out, decrypted_addr1 + 3728);
     if verbose {
-        println!("[5/9] Decrypting code block 1 (addr3)...");
-        println!("  checksum2 = 0x{:08X}", checksum2 as u32);
-        println!("  addr3b    = 0x{:08X}", addr3b as u32);
+        crate::progress::step(5, 9, Step::DecryptBlock1);
+        crate::progress::detail(format_args!("  checksum2 = 0x{:08X}", checksum2 as u32));
+        crate::progress::detail(format_args!("  addr3b    = 0x{:08X}", addr3b as u32));
     }
 
     let crc_data_offset = decrypted_addr1 + 3488;
@@ -1046,10 +1080,10 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
     research::emit_u32(ResearchStage::DllStages, "crc_val", crc_val as u32);
     research::emit_u32(ResearchStage::DllStages, "checksum3", checksum3 as u32);
     if verbose {
-        println!("[6/9] Decrypting code blocks 2-3 (addr3b, addr4)...");
-        println!("  crc_val   = 0x{:08X}", crc_val as u32);
-        println!("  checksum3 = 0x{:08X}", checksum3 as u32);
-        println!("  addr4     = 0x{:08X}", addr4 as u32);
+        crate::progress::step(6, 9, Step::DecryptBlocks2To3);
+        crate::progress::detail(format_args!("  crc_val   = 0x{:08X}", crc_val as u32));
+        crate::progress::detail(format_args!("  checksum3 = 0x{:08X}", checksum3 as u32));
+        crate::progress::detail(format_args!("  addr4     = 0x{:08X}", addr4 as u32));
     }
 
     let checksum4 = calculate_checksum(&out, (decrypted_addr1 + 3472) as u32) as i32;
@@ -1108,9 +1142,9 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         DecompressionStage::DllCodeBlock4,
     )?;
     if verbose {
-        println!("[7/9] Decrypting code block 4 (addr5)...");
-        println!("  checksum4 = 0x{:08X}", checksum4 as u32);
-        println!("  addr5     = 0x{:08X}", addr5 as u32);
+        crate::progress::step(7, 9, Step::DecryptBlock4);
+        crate::progress::detail(format_args!("  checksum4 = 0x{:08X}", checksum4 as u32));
+        crate::progress::detail(format_args!("  addr5     = 0x{:08X}", addr5 as u32));
     }
 
     let metadata_offset = addr5 + 12312;
@@ -1188,15 +1222,15 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
         trace_offset(section_image_base),
     );
     if verbose {
-        println!("[8/9] Decrypting & decompressing sections...");
-        println!(
+        crate::progress::step(8, 9, Step::DllSections);
+        crate::progress::detail(format_args!(
             "  section_image_base  = 0x{:08X}",
             section_image_base as u32
-        );
-        println!(
+        ));
+        crate::progress::detail(format_args!(
             "  section_data_offset = 0x{:08X}",
             section_data_offset as u32
-        );
+        ));
     }
 
     // Managed-only pre-fill of .text (Task 3.2). No-op for native (clr_rva == 0).
@@ -1278,7 +1312,7 @@ fn unpack_dll_inner(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError>
 
     out[..4096].copy_from_slice(&file_data[..4096]);
     if verbose {
-        println!("[9/9] Fixing up PE header & section table...");
+        crate::progress::step(9, 9, Step::FixHeaders);
     }
 
     let section_header_base = get_u16(file_data, (pe_offset + 20) as u32) as i32 + pe_offset;

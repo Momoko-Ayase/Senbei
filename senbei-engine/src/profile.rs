@@ -13,6 +13,7 @@
 //! vendor version, or runtime-behaviour claim. A caller can serialize it as-is;
 //! the schema is versioned by [`PROFILE_FORMAT_VERSION`].
 
+use senbei_i18n::Message;
 use serde::Serialize;
 
 use crate::windows::{IntegrityReport, IntegritySeverity, Kind};
@@ -180,8 +181,8 @@ impl ObservedTarget {
 pub struct LayoutAttempt {
     pub layout: LayoutKind,
     pub outcome: AttemptOutcome,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
+    pub warnings: Vec<Message>,
+    pub errors: Vec<Message>,
 }
 
 impl LayoutAttempt {
@@ -211,10 +212,10 @@ pub struct ProtectionProfile {
     /// The route whose output was accepted, when recovery succeeded.
     pub selected: Option<LayoutKind>,
     /// Defects still present after the final validation. Empty when clean.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Message>,
     /// Unresolved failures: rejected/failed candidates when no route was
     /// accepted, or fatal findings on an accepted image. Empty when none.
-    pub errors: Vec<String>,
+    pub errors: Vec<Message>,
 }
 
 impl ProtectionProfile {
@@ -234,11 +235,11 @@ impl ProtectionProfile {
         }
     }
 
-    pub fn push_warning(&mut self, message: impl Into<String>) {
+    pub fn push_warning(&mut self, message: impl Into<Message>) {
         self.warnings.push(message.into());
     }
 
-    pub fn push_error(&mut self, message: impl Into<String>) {
+    pub fn push_error(&mut self, message: impl Into<Message>) {
         self.errors.push(message.into());
     }
 
@@ -269,8 +270,8 @@ impl ProtectionProfile {
         &mut self,
         layout: LayoutKind,
         outcome: AttemptOutcome,
-        warnings: Vec<String>,
-        errors: Vec<String>,
+        warnings: Vec<Message>,
+        errors: Vec<Message>,
     ) -> &mut LayoutAttempt {
         if self.attempt_mut(layout).is_none() {
             self.candidates.push(LayoutAttempt::not_attempted(layout));
@@ -312,7 +313,7 @@ fn validation_status(report: &IntegrityReport) -> ValidationStatus {
     }
 }
 
-fn messages(report: &IntegrityReport, severity: IntegritySeverity) -> Vec<String> {
+fn messages(report: &IntegrityReport, severity: IntegritySeverity) -> Vec<Message> {
     report
         .findings
         .iter()
@@ -330,13 +331,13 @@ mod tests {
         IntegrityReport {
             issues: findings
                 .iter()
-                .map(|(_, issue)| (*issue).to_owned())
+                .map(|(_, issue)| Message::raw(issue.to_string()))
                 .collect(),
             findings: findings
                 .iter()
                 .map(|(severity, message)| IntegrityFinding {
                     severity: *severity,
-                    message: (*message).to_owned(),
+                    message: Message::raw(message.to_string()),
                 })
                 .collect(),
         }
@@ -393,7 +394,7 @@ mod tests {
             LayoutKind::Dll,
             AttemptOutcome::Rejected,
             Vec::new(),
-            vec!["bad".to_owned()],
+            vec![Message::raw("bad")],
         );
         profile.record_attempt(
             LayoutKind::ExeStyle,

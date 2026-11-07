@@ -4,6 +4,7 @@ pub mod android;
 mod findings;
 mod panic_capture;
 pub mod profile;
+pub mod progress;
 mod threading;
 pub mod windows;
 

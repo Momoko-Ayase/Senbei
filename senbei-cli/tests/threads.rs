@@ -3,7 +3,9 @@
 use std::process::Command;
 
 fn senbei() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_senbei"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_senbei"));
+    command.env("SENBEI_LANG", "en");
+    command
 }
 
 #[test]

@@ -40,7 +40,9 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 pub use crate::METADATA_FILE_NAME;
+use crate::message::Coded;
 use crate::report::{ContainerReport, ManifestReport};
+use senbei_i18n::Msg;
 
 /// Package extensions recognised as Android app packages. Packages are
 /// *containers*: membership is decided by extension plus the ZIP magic, while
@@ -114,7 +116,9 @@ pub fn inspect_package(package: &Path, limits: &ResourceLimits) -> Result<Contai
             continue;
         }
         let Some(name) = name else {
-            bail!("unsafe entry path in package `{}`", package.display());
+            bail!(Coded::new(Msg::UnsafePackageEntry {
+                package: package.display().to_string(),
+            }));
         };
         if bundle {
             if name
@@ -642,7 +646,7 @@ pub(crate) fn restore_loose_metadata(
             ),
             Err(ambiguity) => {
                 let provenance = context::provenance_for(modules.as_ref(), Some(&ambiguity));
-                bail!(provenance_error(&provenance));
+                bail!(provenance_error(&provenance, &ambiguity));
             }
         }
     } else {
@@ -657,7 +661,7 @@ pub(crate) fn restore_loose_metadata(
     if report.remapped > 0 {
         write_metadata_blob(dest, &out)?;
         if verbose {
-            println!("Write to {}", dest.display());
+            crate::ui::write_to(dest, false);
         }
     }
     Ok(LooseMetadataOutcome {
@@ -995,7 +999,7 @@ pub(crate) fn restore_metadata_with_module(
         // version" and could be mistaken for a clean skip. No module is a
         // failed binding, not an unsupported layout.
         let Some(module) = method_index_module else {
-            let error = anyhow::anyhow!("no module 0x0C for v24.1 metadata");
+            let error = anyhow::Error::new(Coded::new(Msg::NoModule0c));
             return Err(fail(&mut facts, error));
         };
         let (out, report) = senbei_metadata::android::restore_method_indices_v24_1(data, module)
@@ -1335,7 +1339,9 @@ fn restore_package_pass<R: context::LibraryRestorer>(
             continue;
         }
         let Some(name) = name else {
-            bail!("unsafe entry path in package `{}`", package.display());
+            bail!(Coded::new(Msg::UnsafePackageEntry {
+                package: package.display().to_string(),
+            }));
         };
         if bundle {
             if name
@@ -1436,7 +1442,9 @@ fn restore_package_pass<R: context::LibraryRestorer>(
             };
             if !is_dir {
                 let Some(entry_name) = entry_name else {
-                    bail!("unsafe entry path in `{}`", nested_label.display());
+                    bail!(Coded::new(Msg::UnsafeNestedEntry {
+                        path: nested_label.display().to_string(),
+                    }));
                 };
                 if is_android_entry_name(&entry_name) {
                     entries.push((nested_index, entry_name));
@@ -1674,7 +1682,10 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                 let provenance = context::provenance_for(modules.as_ref(), Some(&ambiguity));
                 return Ok(vec![outcome(
                     EntryKind::Metadata { remapped: 0 },
-                    EntryStatus::Failed(anyhow::anyhow!(provenance_error(&provenance))),
+                    EntryStatus::Failed(anyhow::Error::new(provenance_error(
+                        &provenance,
+                        &ambiguity,
+                    ))),
                     provenance_labels(&provenance),
                 )]);
             }
@@ -1792,13 +1803,20 @@ fn provenance_labels(provenance: &context::MetadataProvenance) -> Vec<String> {
         .collect()
 }
 
-fn provenance_error(provenance: &context::MetadataProvenance) -> String {
+fn provenance_error(
+    provenance: &context::MetadataProvenance,
+    ambiguity: &context::ContextAmbiguity,
+) -> Coded {
+    let msg = match ambiguity {
+        context::ContextAmbiguity::Missing => Msg::NoModule0c,
+        context::ContextAmbiguity::Conflicting { .. } => Msg::AmbiguousModule0c,
+    };
     let why = provenance
         .note
         .clone()
         .unwrap_or_else(|| "ambiguous module 0x0C binding".to_owned());
     if provenance.sources.is_empty() {
-        return why;
+        return Coded::with_text(msg, why);
     }
     let sources = provenance
         .sources
@@ -1806,7 +1824,7 @@ fn provenance_error(provenance: &context::MetadataProvenance) -> String {
         .map(|source| source.label.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{why}; modules from {sources}")
+    Coded::with_text(msg, format!("{why}; modules from {sources}"))
 }
 
 /// Output path for a metadata blob unwrapped from a restored library: next to

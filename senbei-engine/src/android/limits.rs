@@ -110,6 +110,28 @@ pub enum LimitExceeded {
     Depth { requested: usize, limit: usize },
 }
 
+impl LimitExceeded {
+    /// The ceiling as a translatable message whose English is this error's.
+    pub fn message(&self) -> senbei_i18n::Message {
+        use senbei_i18n::Msg;
+        let msg = match *self {
+            Self::Entry { requested, limit } => Msg::LimitEntry { requested, limit },
+            Self::Total {
+                requested,
+                adding,
+                limit,
+            } => Msg::LimitTotal {
+                requested,
+                adding,
+                limit,
+            },
+            Self::Entries { requested, limit } => Msg::LimitEntries { requested, limit },
+            Self::Depth { requested, limit } => Msg::LimitDepth { requested, limit },
+        };
+        senbei_i18n::Message::with_text(msg, self.to_string())
+    }
+}
+
 /// Running sum of retained or temporary bytes for one task.
 ///
 /// Each call starts its own budget at zero. Charging checks the single-entry
@@ -212,6 +234,37 @@ impl EntryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_messages_keep_the_error_wording_and_translate_it() {
+        use senbei_i18n::Lang;
+        for error in [
+            LimitExceeded::Entry {
+                requested: 10,
+                limit: 4,
+            },
+            LimitExceeded::Total {
+                requested: 9,
+                adding: 3,
+                limit: 8,
+            },
+            LimitExceeded::Entries {
+                requested: 101,
+                limit: 100,
+            },
+            LimitExceeded::Depth {
+                requested: 33,
+                limit: 32,
+            },
+        ] {
+            let message = error.message();
+            assert_eq!(message.text(), error.to_string());
+            assert!(message.msg().is_some());
+            for lang in Lang::ALL {
+                assert_eq!(message.detail(lang), None, "{lang:?}");
+            }
+        }
+    }
 
     #[test]
     fn defaults_match_the_documented_ceilings() {

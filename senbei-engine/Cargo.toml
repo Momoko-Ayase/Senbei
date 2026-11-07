@@ -14,6 +14,7 @@ sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 senbei-crypto.workspace = true
+senbei-i18n.workspace = true
 senbei-elf.workspace = true
 senbei-pe.workspace = true
 

@@ -32,7 +32,7 @@ fn unreadable_unpack_input_blocks_routes_instead_of_inventing_an_attempt() {
 
 fn senbei() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_senbei"));
-    command.arg("--no-pause");
+    command.arg("--no-pause").env("SENBEI_LANG", "en");
     command
 }
 
@@ -638,6 +638,7 @@ fn a_relative_path_is_reported_verbatim() {
     let td = tempfile::tempdir().unwrap();
     write_plain(td.path(), "plain.exe");
     let output = Command::new(env!("CARGO_BIN_EXE_senbei"))
+        .env("SENBEI_LANG", "en")
         .current_dir(td.path())
         .args(["--no-pause", "inspect", "plain.exe", "--json"])
         .output()

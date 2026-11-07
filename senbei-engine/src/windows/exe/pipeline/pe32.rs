@@ -1,6 +1,7 @@
 use super::super::super::layout;
 use super::super::super::research::{self, AddressSpace, ResearchStage};
 use super::*;
+use senbei_i18n::Step;
 
 /// Name of the dd8 formula the PE32 selector actually chose. `None` is the
 /// selector's skip verdict, not "did not run".
@@ -209,8 +210,8 @@ impl<'a> Unpacker<'a> {
             tbl as u64,
         );
         if verbose {
-            println!("[3/9] Locating config layout (PE32)...");
-            println!("  tbl = 0x{:X}, compact = {}", tbl, compact);
+            crate::progress::step(3, 9, Step::Pe32LocateConfig);
+            crate::progress::detail(format_args!("  tbl = 0x{:X}, compact = {}", tbl, compact));
         }
 
         // ---- Stage 3: SecondStage ----
@@ -234,10 +235,10 @@ impl<'a> Unpacker<'a> {
             header_checksum,
         );
         if verbose {
-            println!(
+            crate::progress::detail(format_args!(
                 "  ss = 0x{:08X}, size = 0x{:X}, shift = 0x{:X}",
                 ss, ss_size, ss_shift
-            );
+            ));
         }
 
         // ---- PE32 fixed offsets ----
@@ -304,11 +305,11 @@ impl<'a> Unpacker<'a> {
             info_table as u64,
         );
         if verbose {
-            println!("[4/9] Decrypting stages (PE32)...");
-            println!(
+            crate::progress::step(4, 9, Step::Pe32Stages);
+            crate::progress::detail(format_args!(
                 "  thirdStage start = 0x{:X}, infoTable = 0x{:X}",
                 ts, info_table
-            );
+            ));
         }
 
         // ---- Process infoTable ----
@@ -372,7 +373,9 @@ impl<'a> Unpacker<'a> {
             forth_key_rounds,
         );
         if verbose {
-            println!("  fourth-stage key rounds = {forth_key_rounds}");
+            crate::progress::detail(format_args!(
+                "  fourth-stage key rounds = {forth_key_rounds}"
+            ));
         }
         let forth_addr = dp_base.wrapping_add(0x40);
         let fk = header_checksum ^ second_stage_cs ^ forth_stage_key;
@@ -433,11 +436,11 @@ impl<'a> Unpacker<'a> {
         // ---- EighthStage ----
         let seven_start_actual = get_u32(&self.decompressed, seven_addr);
         if verbose {
-            println!("[5/9] Decrypting eighthStage (PE32)...");
-            println!(
+            crate::progress::step(5, 9, Step::Pe32EighthStage);
+            crate::progress::detail(format_args!(
                 "  sevenStart = 0x{:X}, sevenDsz = 0x{:X}",
                 seven_start_actual, seven_dsz
-            );
+            ));
         }
         // Locate the customDecryptor LFSR block (scan backward from middle, then
         // forward as fallback).
@@ -470,7 +473,9 @@ impl<'a> Unpacker<'a> {
         let eighth_key_rounds =
             stage_key_rounds(&self.decompressed, dp_base.wrapping_add(0x80), 4)?;
         if verbose {
-            println!("  eighth-stage key rounds = {eighth_key_rounds}");
+            crate::progress::detail(format_args!(
+                "  eighth-stage key rounds = {eighth_key_rounds}"
+            ));
         }
         let eighth_addr = dp_base.wrapping_add(0xC0);
         let eighth_dsz = get_u32(&self.decompressed, eighth_addr.wrapping_add(12));
@@ -568,10 +573,10 @@ impl<'a> Unpacker<'a> {
         );
         let eighth_start = get_u32(&self.decompressed, eighth_addr);
         if verbose {
-            println!(
+            crate::progress::detail(format_args!(
                 "  eighthStart = 0x{:08X}, dsz = 0x{:X}",
                 eighth_start, eighth_dsz
-            );
+            ));
         }
 
         // ---- Final processing offsets (anchored on the eighthStage config cluster) ----
@@ -637,10 +642,10 @@ impl<'a> Unpacker<'a> {
                 }
                 if let Some((dist, base)) = best {
                     if verbose {
-                        println!(
+                        crate::progress::detail(format_args!(
                             "  pe32 cluster via fileCS (no 0x7679): base=+0x{:X} dist_info3=0x{:X}",
                             base, dist
-                        );
+                        ));
                     }
                     m = Some(base);
                 }
@@ -723,10 +728,10 @@ impl<'a> Unpacker<'a> {
                 }
                 if let Some(c) = chosen {
                     if verbose {
-                        println!(
+                        crate::progress::detail(format_args!(
                             "  pe32 fileLFSR via trial-validate: +0x{:X} (expected +0x{:X}, considered {})",
                             c, off_file_lfsr, considered
-                        );
+                        ));
                     }
                     lfsr_off = c;
                 } else {
@@ -818,7 +823,7 @@ impl<'a> Unpacker<'a> {
 
         // ---- File data decompression ----
         if verbose {
-            println!("[6/9] Loading and decompressing file data (PE32)...");
+            crate::progress::step(6, 9, Step::Pe32Load);
         }
         let compress_data_offset = (!get_u32(self.file_data, 0x1080)).wrapping_add(0x1000);
         let compressed_info_addr = eighth_start.wrapping_add(off_compressed_info);
@@ -1026,9 +1031,12 @@ impl<'a> Unpacker<'a> {
             );
             if let Some(big) = selection {
                 if verbose {
-                    println!(
-                        "[7/9] Decrypting .text (PE32 dd8, formula={})...",
-                        if big { "0x8000*(page+1)" } else { "page+1" }
+                    crate::progress::step(
+                        7,
+                        9,
+                        Step::Pe32Text {
+                            formula: if big { "0x8000*(page+1)" } else { "page+1" },
+                        },
                     );
                 }
                 research::emit_text(
@@ -1070,7 +1078,7 @@ impl<'a> Unpacker<'a> {
                     }
                 }
             } else if verbose {
-                println!("[7/9] Skipping .text dd8 (already plaintext)...");
+                crate::progress::step(7, 9, Step::Pe32TextSkip);
             }
         }
 
@@ -1249,14 +1257,17 @@ impl<'a> Unpacker<'a> {
                     block = block.wrapping_add(block_size);
                 }
                 if verbose && rearmed > 0 {
-                    println!("  re-armed {} TLS field relocations", rearmed);
+                    crate::progress::detail(format_args!(
+                        "  re-armed {} TLS field relocations",
+                        rearmed
+                    ));
                 }
             }
         }
 
         // ---- Import table (PE32, 4-byte thunks) ----
         if verbose {
-            println!("[8/9] Decrypting import strings (PE32)...");
+            crate::progress::step(8, 9, Step::Pe32Imports);
         }
         let import_table_addr = eighth_start.wrapping_add(off_import_table);
         let mut import_table_ptr = get_u32(&self.decompressed, import_table_addr);
@@ -1361,7 +1372,7 @@ impl<'a> Unpacker<'a> {
 
         // ---- Output transforms ----
         if verbose {
-            println!("[9/9] Rebuilding PE file layout (PE32)...");
+            crate::progress::step(9, 9, Step::Pe32Rebuild);
         }
         let mut out = std::mem::take(&mut self.decompressed);
         // kmiat import relocation is an EXE-only fixup: it discards the original

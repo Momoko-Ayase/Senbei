@@ -835,10 +835,16 @@ fn run_pe(
             output.detected_kind = Some(kind_name(image.kind).to_owned());
             output.bytes = Some(image.bytes.len() as u64);
             output.sha256 = Some(sha256_hex(&image.bytes));
+            let issues: Vec<String> = image
+                .integrity
+                .issues
+                .iter()
+                .map(|issue| issue.text().to_owned())
+                .collect();
             output.integrity = Some(IntegrityInfo {
                 ok: image.integrity.ok(),
                 fatal: image.integrity.has_fatal(),
-                issues: image.integrity.issues.clone(),
+                issues: issues.clone(),
             });
             if expect_failure {
                 output.fail("expected failure, but the input unpacked");
@@ -847,13 +853,7 @@ fn run_pe(
                     "expected failure, but the input unpacked",
                 );
             } else {
-                compare_output(
-                    &mut output,
-                    &image.bytes,
-                    expected,
-                    allow_suspect,
-                    &image.integrity.issues,
-                );
+                compare_output(&mut output, &image.bytes, expected, allow_suspect, &issues);
                 finish_case(report, &mut output, "unpacked");
             }
         }

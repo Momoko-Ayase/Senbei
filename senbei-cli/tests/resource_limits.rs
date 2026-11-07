@@ -2,7 +2,9 @@ use std::process::Command;
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_senbei"));
-    command.args(["--no-pause", "--no-log"]);
+    command
+        .args(["--no-pause", "--no-log"])
+        .env("SENBEI_LANG", "en");
     command
 }
 

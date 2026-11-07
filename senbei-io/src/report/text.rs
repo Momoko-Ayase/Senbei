@@ -1,8 +1,14 @@
 //! Human-readable research reports. JSON retains the same underlying evidence.
+//!
+//! The summary lines of an input (target, recognition, routes, stages, and
+//! findings) follow the reader's language. The structural research sections
+//! (PE layout, recovery trace, Android and metadata evidence) are technical
+//! dumps and stay English, like the JSON they mirror.
 
 use std::fmt::{self, Write};
 
 use senbei_engine::windows::{ResearchTrace, TraceValue, WindowsInspection};
+use senbei_i18n::{Cli, Lang, Localize, Message, Term};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -12,14 +18,25 @@ use crate::ui::{Painted, Palette, Tone};
 struct Text {
     contents: String,
     palette: Palette,
+    lang: Lang,
 }
 
 impl Text {
+    #[cfg(test)]
     fn new(palette: Palette) -> Self {
+        Self::in_language(palette, Lang::En)
+    }
+
+    fn in_language(palette: Palette, lang: Lang) -> Self {
         Self {
             contents: String::new(),
             palette,
+            lang,
         }
+    }
+
+    fn say(&self, line: Cli) -> String {
+        line.localize(self.lang).into_owned()
     }
 }
 
@@ -34,8 +51,12 @@ fn status(palette: Palette, value: &impl Serialize) -> Painted<String> {
 }
 
 fn status_text(palette: Palette, value: String) -> Painted<String> {
-    let normalized = value.replace('_', " ");
-    let tone = match normalized.as_str() {
+    palette.paint(tone_of(&value), value)
+}
+
+/// The tone of a report value, judged by its English meaning.
+fn tone_of(value: &str) -> Tone {
+    match value.replace('_', " ").as_str() {
         "ok" | "clean" | "succeeded" | "restored" | "unchanged" | "accepted" | "matched"
         | "validated" => Tone::Success,
         "error" | "failed" | "unreadable" | "rejected" => Tone::Error,
@@ -45,8 +66,7 @@ fn status_text(palette: Palette, value: String) -> Painted<String> {
         "skipped" | "not run" | "not attempted" | "unavailable" | "absent" | "duplicate"
         | "not recognized" => Tone::Muted,
         _ => Tone::Value,
-    };
-    palette.paint(tone, value)
+    }
 }
 
 fn label(value: &impl Serialize) -> String {
@@ -55,6 +75,23 @@ fn label(value: &impl Serialize) -> String {
         Ok(value) => value.to_string(),
         Err(_) => "unavailable".to_owned(),
     }
+}
+
+/// [`label`] in `lang`, for the values the catalog names.
+fn term(lang: Lang, value: &impl Serialize) -> String {
+    if let Ok(Value::String(wire)) = serde_json::to_value(value)
+        && let Some(term) = Term::from_value(&wire)
+    {
+        return term.localize(lang).into_owned();
+    }
+    label(value)
+}
+
+/// [`status`] in the reader's language: toned by the English value.
+fn term_status(text: &Text, value: &impl Serialize) -> String {
+    text.palette
+        .paint(tone_of(&label(value)), term(text.lang, value))
+        .to_string()
 }
 
 fn hex<T: Into<u64>>(palette: Palette, value: Option<T>) -> Painted<String> {
@@ -83,22 +120,72 @@ fn diagnostic(text: &mut Text, indent: &str, kind: &str, message: &str) {
     }
 }
 
-pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
-    let mut text = Text::new(palette);
-    let _ = writeln!(text, "{}", palette.paint(Tone::Heading, &input.path));
-    if input.analysis_incomplete {
+/// How a finding is labelled in the summary part of a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Finding {
+    Warning,
+    Error,
+    Reason,
+    Detail,
+}
+
+impl Finding {
+    fn label(self) -> Cli {
+        match self {
+            Self::Warning => Cli::DiagnosticWarning,
+            Self::Error => Cli::DiagnosticError,
+            Self::Reason => Cli::DiagnosticReason,
+            Self::Detail => Cli::DiagnosticDetail,
+        }
+    }
+
+    fn tone(self) -> Tone {
+        match self {
+            Self::Error => Tone::Error,
+            Self::Warning | Self::Reason => Tone::Warning,
+            Self::Detail => Tone::Muted,
+        }
+    }
+}
+
+/// A finding in the reader's language. When the translation does not show
+/// everything the English said, the English follows on its own muted line.
+fn finding(text: &mut Text, indent: &str, kind: Finding, message: &Message) {
+    let palette = text.palette;
+    let label = text.say(kind.label());
+    for line in message.localized(text.lang).lines() {
         let _ = writeln!(
             text,
-            "  {}: I/O, resource limits or infrastructure prevented the requested work",
-            palette.paint(Tone::Error, "analysis incomplete")
+            "{indent}{}: {line}",
+            palette.paint(kind.tone(), &label)
         );
     }
-    if let Some(source) = &input.source {
-        let _ = writeln!(
-            text,
-            "  source: {} bytes (0x{:X})",
-            source.size, source.size
+    if let Some(english) = message.detail(text.lang) {
+        let label = text.say(Cli::DiagnosticEnglish);
+        for line in english.lines() {
+            let _ = writeln!(
+                text,
+                "{indent}  {}",
+                palette.paint(Tone::Muted, format!("{label}: {line}"))
+            );
+        }
+    }
+}
+
+pub(super) fn render_input(input: &InputReport, palette: Palette, lang: Lang) -> String {
+    let mut text = Text::in_language(palette, lang);
+    let _ = writeln!(text, "{}", palette.paint(Tone::Heading, &input.path));
+    if input.analysis_incomplete {
+        let line = format!(
+            "  {}: {}",
+            palette.paint(Tone::Error, text.say(Cli::AnalysisIncomplete)),
+            text.say(Cli::AnalysisIncompleteInput)
         );
+        let _ = writeln!(text, "{line}");
+    }
+    if let Some(source) = &input.source {
+        let line = text.say(Cli::Source { size: source.size });
+        let _ = writeln!(text, "  {line}");
         let _ = writeln!(
             text,
             "  SHA-256: {}",
@@ -107,72 +194,73 @@ pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
     }
     if let Some(profile) = &input.profile {
         let target = &profile.observed;
-        let _ = writeln!(
-            text,
-            "  target: {} · {} · {}",
-            label(&target.platform),
-            target
+        let line = text.say(Cli::Target {
+            platform: term(lang, &target.platform),
+            format: target
                 .format
                 .as_ref()
-                .map(label)
-                .unwrap_or_else(|| "format unavailable".to_owned()),
-            target
+                .map(|format| term(lang, format))
+                .unwrap_or_else(|| text.say(Cli::FormatUnavailable)),
+            kind: target
                 .kind
                 .as_ref()
-                .map(label)
-                .unwrap_or_else(|| "kind not applicable or unavailable".to_owned())
-        );
-        let _ = writeln!(
-            text,
-            "  protection recognition: {}",
-            status(palette, &profile.recognition)
-        );
+                .map(|kind| term(lang, kind))
+                .unwrap_or_else(|| text.say(Cli::KindUnavailable)),
+        });
+        let _ = writeln!(text, "  {line}");
+        let line = text.say(Cli::ProtectionRecognition {
+            status: term_status(&text, &profile.recognition),
+        });
+        let _ = writeln!(text, "  {line}");
         if !profile.evidence.is_empty() {
             let evidence = profile
                 .evidence
                 .iter()
-                .map(label)
+                .map(|evidence| term(lang, evidence))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(text, "    evidence: {evidence}");
+            let line = text.say(Cli::Evidence { evidence });
+            let _ = writeln!(text, "    {line}");
         }
         for candidate in &profile.candidates {
-            let _ = writeln!(
-                text,
-                "  route {}: {}",
-                palette.paint(Tone::Label, label(&candidate.layout)),
-                status(palette, &candidate.outcome)
-            );
+            let line = text.say(Cli::Route {
+                route: palette
+                    .paint(Tone::Label, term(lang, &candidate.layout))
+                    .to_string(),
+                outcome: term_status(&text, &candidate.outcome),
+            });
+            let _ = writeln!(text, "  {line}");
             for message in &candidate.warnings {
-                diagnostic(&mut text, "    ", "warning", message);
+                finding(&mut text, "    ", Finding::Warning, message);
             }
             for message in &candidate.errors {
-                diagnostic(&mut text, "    ", "reason", message);
+                finding(&mut text, "    ", Finding::Reason, message);
             }
         }
         if let Some(selected) = profile.selected {
-            let _ = writeln!(
-                text,
-                "  selected route: {}",
-                palette.paint(Tone::Success, label(&selected))
-            );
+            let line = text.say(Cli::SelectedRoute {
+                route: palette
+                    .paint(Tone::Success, term(lang, &selected))
+                    .to_string(),
+            });
+            let _ = writeln!(text, "  {line}");
         }
-        let _ = writeln!(
-            text,
-            "  static recovery: {}",
-            status(palette, &profile.recovery)
-        );
-        let _ = writeln!(
-            text,
-            "  output static validation: {}",
-            status(palette, &profile.static_validation)
-        );
+        let line = text.say(Cli::StaticRecovery {
+            status: term_status(&text, &profile.recovery),
+        });
+        let _ = writeln!(text, "  {line}");
+        let line = text.say(Cli::OutputValidation {
+            status: term_status(&text, &profile.static_validation),
+        });
+        let _ = writeln!(text, "  {line}");
     }
     if let Some(companion) = &input.companion {
+        let line = text.say(Cli::Companion {
+            state: term_status(&text, &companion.state),
+        });
         let _ = writeln!(
             text,
-            "  companion: {}{}",
-            status(palette, &companion.state),
+            "  {line}{}",
             companion
                 .path
                 .as_ref()
@@ -180,27 +268,24 @@ pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
                 .unwrap_or_default()
         );
         if let Some(source) = &companion.source {
-            let _ = writeln!(
-                text,
-                "    {} bytes · SHA-256 {}",
-                source.size, source.sha256
-            );
+            let line = text.say(Cli::CompanionIdentity {
+                size: source.size,
+                sha256: source.sha256.clone(),
+            });
+            let _ = writeln!(text, "    {line}");
         }
         if let Some(detail) = &companion.detail {
-            diagnostic(&mut text, "    ", "detail", detail);
+            finding(&mut text, "    ", Finding::Detail, detail);
         }
     }
     if let Some(research) = &input.research {
-        let _ = writeln!(
-            text,
-            "  analysis input view: {}",
-            label(&research.input_view)
-        );
+        let line = text.say(Cli::InputView {
+            view: term(lang, &research.input_view),
+        });
+        let _ = writeln!(text, "  {line}");
         if research.input_view == super::ResearchInputView::SplicedCompanion {
-            let _ = writeln!(
-                text,
-                "    file offsets below 0x1000 address the stub; offsets at/above 0x1000 address companion offset (file offset - 0x1000)"
-            );
+            let line = text.say(Cli::InputViewSplicedNote);
+            let _ = writeln!(text, "    {line}");
         }
         render_windows(&mut text, "protected input", &research.input);
         render_trace(&mut text, &research.trace);
@@ -227,67 +312,69 @@ pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
         }
     }
     if let Some(metadata) = &input.metadata {
-        let _ = writeln!(
-            text,
-            "  IL2CPP metadata version: {} · layout definition {}",
-            metadata.raw_version,
-            label(&metadata.layout)
-        );
-        let _ = writeln!(
-            text,
-            "    seeded method tokens: {}",
-            metadata.capabilities.seeded_method_tokens
-        );
-        let _ = writeln!(
-            text,
-            "    structural method tokens: {}",
-            metadata.capabilities.structural_method_tokens
-        );
-        let _ = writeln!(
-            text,
-            "    method-index restoration: {} · application context required: {}",
-            metadata.capabilities.method_index_restore,
-            metadata.capabilities.method_index_requires_context
-        );
+        let identity = text.say(Cli::MetadataIdentity {
+            version: metadata.raw_version,
+            layout: term(lang, &metadata.layout),
+        });
+        let _ = writeln!(text, "  {identity}");
+        let capabilities = &metadata.capabilities;
+        for line in [
+            Cli::SeededTokens {
+                value: capabilities.seeded_method_tokens,
+            },
+            Cli::StructuralTokens {
+                value: capabilities.structural_method_tokens,
+            },
+            Cli::MethodIndexRestore {
+                value: capabilities.method_index_restore,
+                context: capabilities.method_index_requires_context,
+            },
+        ] {
+            let line = text.say(line);
+            let _ = writeln!(text, "    {line}");
+        }
     }
     if let Some(container) = &input.container {
-        let _ = writeln!(
-            text,
-            "  container: {} · {} entries · {} manifests",
-            container.kind,
-            container.entry_count,
-            container.manifests.len()
-        );
+        let line = text.say(Cli::Container {
+            kind: container.kind.clone(),
+            entries: container.entry_count,
+            manifests: container.manifests.len(),
+        });
+        let _ = writeln!(text, "  {line}");
         for manifest in &container.manifests {
-            let _ = writeln!(
-                text,
-                "    manifest {} → {} {}",
-                manifest.source,
-                manifest.package.as_deref().unwrap_or("<unnamed>"),
-                manifest.version.as_deref().unwrap_or("")
-            );
+            let line = text.say(Cli::Manifest {
+                source: manifest.source.clone(),
+                package: manifest
+                    .package
+                    .clone()
+                    .unwrap_or_else(|| text.say(Cli::Unnamed)),
+                version: manifest.version.clone().unwrap_or_default(),
+            });
+            let _ = writeln!(text, "    {line}");
         }
         for entry in &container.candidate_entries {
-            let _ = writeln!(text, "    candidate: {entry}");
+            let line = text.say(Cli::Candidate {
+                entry: entry.clone(),
+            });
+            let _ = writeln!(text, "    {line}");
         }
     }
     if let Some(research) = &input.android_research {
         render_android(&mut text, "  ", research);
     }
     if let Some(research) = &input.metadata_research {
-        let _ = writeln!(
-            text,
-            "  {}:",
-            palette.paint(Tone::Heading, "metadata transform evidence")
-        );
+        let heading = text.say(Cli::MetadataEvidence);
+        let _ = writeln!(text, "  {}:", palette.paint(Tone::Heading, heading));
         render_tree(&mut text, "    ", research);
     }
     for entry in &input.entries {
+        let line = text.say(Cli::Entry {
+            name: palette.paint(Tone::Label, &entry.name).to_string(),
+            status: term_status(&text, &entry.status),
+        });
         let _ = writeln!(
             text,
-            "  entry {}: {}{}",
-            palette.paint(Tone::Label, &entry.name),
-            status(palette, &entry.status),
+            "  {line}{}",
             entry
                 .output
                 .as_ref()
@@ -295,90 +382,102 @@ pub(super) fn render_input(input: &InputReport, palette: Palette) -> String {
                 .unwrap_or_default()
         );
         if entry.analysis_incomplete {
-            let _ = writeln!(
-                text,
-                "    {}: requested entry analysis could not finish",
-                palette.paint(Tone::Error, "analysis incomplete")
+            let line = format!(
+                "    {}: {}",
+                palette.paint(Tone::Error, text.say(Cli::AnalysisIncomplete)),
+                text.say(Cli::AnalysisIncompleteEntry)
             );
+            let _ = writeln!(text, "{line}");
         }
         if let Some(layout) = entry.layout {
-            let _ = writeln!(text, "    route: {}", label(&layout));
+            let line = text.say(Cli::EntryRoute {
+                route: term(lang, &layout),
+            });
+            let _ = writeln!(text, "    {line}");
         }
         if let Some(version) = entry.metadata_version {
-            let _ = writeln!(text, "    metadata version: {version}");
+            let line = text.say(Cli::EntryMetadataVersion { version });
+            let _ = writeln!(text, "    {line}");
         }
         if let Some(remapped) = entry.remapped {
-            let _ = writeln!(text, "    remapped method fields: {remapped}");
+            let line = text.say(Cli::EntryRemapped { remapped });
+            let _ = writeln!(text, "    {line}");
         }
         for source in &entry.provenance {
-            let _ = writeln!(text, "    module context source: {source}");
+            let line = text.say(Cli::ModuleContextSource {
+                source: source.clone(),
+            });
+            let _ = writeln!(text, "    {line}");
         }
         for message in &entry.warnings {
-            diagnostic(&mut text, "    ", "warning", message);
+            finding(&mut text, "    ", Finding::Warning, message);
         }
         for message in &entry.errors {
-            diagnostic(&mut text, "    ", "error", message);
+            finding(&mut text, "    ", Finding::Error, message);
         }
         if let Some(research) = &entry.android_research {
             render_android(&mut text, "    ", research);
         }
         if let Some(research) = &entry.metadata_research {
-            let _ = writeln!(
-                text,
-                "    {}:",
-                palette.paint(Tone::Heading, "metadata transform evidence")
-            );
+            let heading = text.say(Cli::MetadataEvidence);
+            let _ = writeln!(text, "    {}:", palette.paint(Tone::Heading, heading));
             render_tree(&mut text, "      ", research);
         }
     }
     for source in &input.provenance {
-        let _ = writeln!(text, "  module context source: {source}");
+        let line = text.say(Cli::ModuleContextSource {
+            source: source.clone(),
+        });
+        let _ = writeln!(text, "  {line}");
     }
     for stage in &input.stages {
+        let line = text.say(Cli::StageLine {
+            stage: palette
+                .paint(Tone::Label, term(lang, &stage.stage))
+                .to_string(),
+            status: term_status(&text, &stage.status),
+        });
         let _ = writeln!(
             text,
-            "  stage {}: {}{}",
-            palette.paint(Tone::Label, label(&stage.stage)),
-            status(palette, &stage.status),
+            "  {line}{}",
             stage
                 .duration_ms
                 .map(|elapsed| format!(" · {elapsed} ms"))
                 .unwrap_or_default()
         );
         if let Some(detail) = &stage.detail {
-            diagnostic(&mut text, "    ", "detail", detail);
+            finding(&mut text, "    ", Finding::Detail, detail);
         }
     }
+    // The profile repeats input-level findings; each is shown once.
     let mut seen = std::collections::BTreeSet::new();
-    for (kind, messages) in [("warning", &input.warnings), ("error", &input.errors)] {
-        for message in messages {
-            if seen.insert((kind, message.as_str())) {
-                diagnostic(&mut text, "  ", kind, message);
-            }
-        }
-    }
+    let mut findings = vec![
+        (Finding::Warning, &input.warnings),
+        (Finding::Error, &input.errors),
+    ];
     if let Some(profile) = &input.profile {
-        for (kind, messages) in [("warning", &profile.warnings), ("error", &profile.errors)] {
-            for message in messages {
-                if seen.insert((kind, message.as_str())) {
-                    diagnostic(&mut text, "  ", kind, message);
-                }
+        findings.push((Finding::Warning, &profile.warnings));
+        findings.push((Finding::Error, &profile.errors));
+    }
+    for (kind, messages) in findings {
+        for message in messages {
+            if seen.insert((kind, message.text())) {
+                finding(&mut text, "  ", kind, message);
             }
         }
     }
     if let Some(recovered) = &input.recovered {
-        let _ = writeln!(
-            text,
-            "  recovered: {} bytes · SHA-256 {}",
-            recovered.size, recovered.sha256
-        );
+        let line = text.say(Cli::Recovered {
+            size: recovered.size,
+            sha256: recovered.sha256.clone(),
+        });
+        let _ = writeln!(text, "  {line}");
     }
-    let _ = writeln!(
-        text,
-        "  inspection status: {} · {} ms",
-        status(palette, &input.status),
-        input.duration_ms
-    );
+    let line = text.say(Cli::InspectionStatus {
+        status: term_status(&text, &input.status),
+        ms: input.duration_ms,
+    });
+    let _ = writeln!(text, "  {line}");
     text.contents
 }
 
@@ -921,8 +1020,8 @@ mod tests {
             StageReport::new(Stage::Recovery, StageStatus::Failed)
                 .detail("parameters were unavailable"),
         );
-        let text = render_input(&input, Palette::plain());
-        let colored = render_input(&input, Palette::colored());
+        let text = render_input(&input, Palette::plain(), Lang::En);
+        let colored = render_input(&input, Palette::colored(), Lang::En);
         assert!(colored.contains('\x1b'));
         assert_eq!(strip_styles(&colored), text);
         for fact in [
@@ -991,8 +1090,8 @@ mod tests {
         });
         input.metadata_research =
             Some(serde_json::json!({"tried_seeds": [0x5678], "route": "seeded"}));
-        let text = render_input(&input, Palette::plain());
-        let colored = render_input(&input, Palette::colored());
+        let text = render_input(&input, Palette::plain(), Lang::En);
+        let colored = render_input(&input, Palette::colored(), Lang::En);
         assert!(colored.contains('\x1b'));
         assert_eq!(strip_styles(&colored), text);
         for fact in [

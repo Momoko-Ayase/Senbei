@@ -16,8 +16,12 @@ pub fn maybe_pause(force_skip: bool) {
     if force_skip || !should_pause() {
         return;
     }
+    use senbei_i18n::Localize;
     use std::io::Write;
-    eprint!("\nPress Enter to exit…");
+    eprint!(
+        "{}",
+        senbei_i18n::Cli::PressEnter.localize(senbei_i18n::current())
+    );
     let _ = std::io::stderr().flush();
     let mut buf = String::new();
     let _ = std::io::stdin().read_line(&mut buf);

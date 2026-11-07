@@ -426,6 +426,7 @@ version = "1.3.4"
 dependencies = [
  "anyhow",
  "senbei-engine",
+ "senbei-i18n",
  "senbei-io",
  "senbei-metadata",
  "serde",
@@ -457,6 +458,7 @@ dependencies = [
  "memmap2",
  "senbei-crypto",
  "senbei-elf",
+ "senbei-i18n",
  "senbei-pe",
  "serde",
  "serde_json",
@@ -485,6 +487,7 @@ dependencies = [
  "senbei-crypto",
  "senbei-elf",
  "senbei-engine",
+ "senbei-i18n",
  "senbei-metadata",
  "senbei-pe",
  "serde",

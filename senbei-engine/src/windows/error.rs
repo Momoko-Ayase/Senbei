@@ -1,4 +1,5 @@
 pub use senbei_crypto::{BufferOperation, DecompressionFailure};
+use senbei_i18n::{Message, Msg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecompressionStage {
@@ -225,7 +226,7 @@ pub enum UnpackError {
     },
 
     #[error("structurally invalid layout candidate: {}", issues.join("; "))]
-    InvalidLayoutCandidate { issues: Vec<String> },
+    InvalidLayoutCandidate { issues: Vec<Message> },
 
     #[error(
         "PE32 second-stage range is invalid (offset {offset}, size {size}, image length {image_len})"
@@ -252,6 +253,45 @@ pub enum UnpackError {
         line: u32,
         column: u32,
     },
+}
+
+impl UnpackError {
+    /// This error as a report message: the English it displays, with the
+    /// catalog entry a front end translates.
+    ///
+    /// Errors a user can act on have their own entry. Internal decode
+    /// failures share one summary entry and keep their specific English as
+    /// the recorded text.
+    pub fn message(&self) -> Message {
+        let msg = match self {
+            Self::CompanionMissing => Msg::CompanionMissing,
+            Self::CompanionMismatch => Msg::CompanionMismatch,
+            Self::InputTooShort { actual, required } => Msg::InputTooShort {
+                actual: *actual,
+                required: *required,
+            },
+            Self::NotCrackProof => Msg::NotProtected,
+            Self::InvalidPeOffset { offset, input_len } => Msg::InvalidPeOffset {
+                offset: *offset,
+                input_len: *input_len,
+            },
+            Self::UnsupportedDllPeMagic { found } => Msg::DllNeedsPe32Plus { found: *found },
+            Self::Stage5MarkerNotFound => Msg::LayoutUnsupported,
+            Self::InternalPanic {
+                message,
+                file,
+                line,
+                column,
+            } => Msg::InternalPanic {
+                file: file.clone(),
+                line: *line,
+                column: *column,
+                message: message.clone(),
+            },
+            _ => Msg::DecodeFailed,
+        };
+        Message::with_text(msg, self.to_string())
+    }
 }
 
 impl From<senbei_crypto::Error> for UnpackError {

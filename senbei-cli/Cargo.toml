@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 senbei-io.workspace = true
 senbei-engine.workspace = true
+senbei-i18n.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
