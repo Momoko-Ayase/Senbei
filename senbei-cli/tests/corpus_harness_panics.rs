@@ -56,7 +56,7 @@ fn classifier_detects_direct_and_nested_internal_panics() {
 fn classifier_leaves_ordinary_restore_errors_alone() {
     assert!(!harness::surfaced_internal_panic(&stage5_not_found()));
     let ordinary_fallback = senbei_engine::UnpackError::PipelineFallbackFailed {
-        dll: Box::new(senbei_engine::UnpackError::NotCrackproof),
+        dll: Box::new(senbei_engine::UnpackError::NotCrackProof),
         exe: Box::new(stage5_not_found()),
     };
     assert!(!harness::surfaced_internal_panic(&ordinary_fallback));

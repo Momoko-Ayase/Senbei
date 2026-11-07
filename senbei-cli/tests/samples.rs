@@ -1,6 +1,6 @@
 //! Corpus test over the user-managed `senbei/samples` folder.
 //!
-//! Drop real Crackproof `*.exe` / `*.dll` inputs in there (and/or il2cpp
+//! Drop real CrackProof `*.exe` / `*.dll` inputs in there (and/or il2cpp
 //! `*.dat` metadata blobs), optionally alongside a byte-exact golden named
 //! `<base>.golden.<ext>`. Each input is processed and classified:
 //!

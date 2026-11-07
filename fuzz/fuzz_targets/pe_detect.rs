@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Crackproof PE detection over bounded, attacker-shaped bytes.
+//! CrackProof PE detection over bounded, attacker-shaped bytes.
 //!
 //! Ceilings: input is capped by the harness (`-max_len`, see run.sh) and the
 //! detector itself reads only fixed header offsets. This target asserts the

@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        For a new Crackproof layout, attaching a sample protected file helps
+        For a new CrackProof layout, attaching a sample protected file helps
         us better understand the request. Please only attach files you are
         authorized to share.
   - type: textarea

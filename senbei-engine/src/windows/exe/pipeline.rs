@@ -432,7 +432,7 @@ impl<'a> Unpacker<'a> {
             return u.run_pe32(pe_off, table, verbose);
         }
 
-        // The config block layout in the decrypted region varies between Crackproof
+        // The config block layout in the decrypted region varies between CrackProof
         // versions. Find the anchor field — a dword equal to info[3], immediately
         // followed by 0x28 and then info[6]-0x200 — and derive every other field
         // offset relative to it. Observed anchor positions: +6728 (older EXE
@@ -565,7 +565,7 @@ impl<'a> Unpacker<'a> {
             println!("  stage1 key = xor 0x{xor_acc:08X} ^ chk 0x{chk1:08X} ^ val 0x{v:08X}");
         }
 
-        // Field offsets inside stage1 vary between Crackproof versions. Locate
+        // Field offsets inside stage1 vary between CrackProof versions. Locate
         // stage2 (the only 16-byte entry where dword[0]==dword[2], dword[1] is the
         // large encrypted size and dword[3] is a smaller decompressed size), then
         // derive every other field as fixed offsets from there. Observed
@@ -660,7 +660,7 @@ impl<'a> Unpacker<'a> {
             println!("  stage2 key = 0x{key2:08X}");
         }
 
-        // The stage2 head/walk2 tables shift between Crackproof versions. The 4-entry
+        // The stage2 head/walk2 tables shift between CrackProof versions. The 4-entry
         // table starts with a `kind=1, 0, info[3], 0` 16-byte entry; head is two
         // entries (32 bytes) past that, walk2 sits 88 bytes before head. Observed
         // table_start: 9136 (older EXE builds) and 9216 (another old-layout build
@@ -1599,7 +1599,7 @@ impl<'a> Unpacker<'a> {
                 }
             }
         }
-        // EP/DD layout in info[3] varies between Crackproof versions. Old
+        // EP/DD layout in info[3] varies between CrackProof versions. Old
         // layout: EP at info[3]+64, ImageBase at info[3]+68, DD[0..15] at
         // info[3]+80..info[3]+208 — total 144 bytes encrypted starting at +64.
         // New layout: everything shifts 32 bytes earlier — EP at info[3]+32,
@@ -1791,7 +1791,7 @@ impl<'a> Unpacker<'a> {
 
         // Old-layout managed (CLR) restore: same verbatim regions as the
         // new-layout restore above (COR20 header + BSJB MetaData stream) plus
-        // the COR20 resources blob. Crackproof preserves only these regions
+        // the COR20 resources blob. CrackProof preserves only these regions
         // verbatim in the protected file — the IL method bodies between the
         // COR20 header and the resources ARE packer-encrypted and arrive via
         // the section-block pass, so copying the whole section's raw data (as
@@ -1844,7 +1844,7 @@ impl<'a> Unpacker<'a> {
             }
         }
 
-        // The payload's TLS directory (DD[9]) arrives blanked: Crackproof strips
+        // The payload's TLS directory (DD[9]) arrives blanked: CrackProof strips
         // the struct and re-installs TLS itself when it maps the module. Prefer
         // recovering the real one from the stub's plaintext `.rdata` — dropping
         // DD[9] leaves `_tls_index` unwritten, so every `thread_local` access
@@ -2176,7 +2176,7 @@ impl<'a> Unpacker<'a> {
     /// Restore the genuine `IMAGE_TLS_DIRECTORY32` — and the raw-data template
     /// it points at — from the loader stub.
     ///
-    /// Crackproof zeroes the TLS directory struct inside the encrypted payload
+    /// CrackProof zeroes the TLS directory struct inside the encrypted payload
     /// and re-installs TLS itself when it maps the module, so a statically
     /// unpacked image reaches the ordinary Windows loader with a blank struct.
     /// Synthesizing a placeholder (empty template, index/callbacks aimed at

@@ -289,12 +289,12 @@ test('buildFileReport prefers the profile verdict over row findings', () => {
 test('buildFileReport keeps the failure profile and error for a failed row', () => {
   const report = buildFileReport('bad.dll', {
     state: 'err',
-    error: 'not a Crackproof-protected file',
+    error: 'not a CrackProof-protected file',
     findings: [{ severity: 'fatal', message: 'unmapped entry point' }],
     profile: { format_version: 1, recovery: 'failed', errors: ['boom'] },
   });
   assert.equal(report.status, 'failed');
-  assert.equal(report.error, 'not a Crackproof-protected file');
+  assert.equal(report.error, 'not a CrackProof-protected file');
   assert.equal(report.integrity.status, 'not_run');
   assert.equal(report.integrity.findings[0].severity, 'fatal');
   assert.equal(report.profile.recovery, 'failed');
@@ -369,7 +369,7 @@ test('describeObserved never claims protection from a metadata magic match', () 
     recognition: 'recognized',
   });
   assert.equal(text, 'v31 · format only, not a protection verdict');
-  assert.doesNotMatch(text, /protected|recognized|Crackproof|CrackProof/);
+  assert.doesNotMatch(text, /protected|recognized|CrackProof/);
 });
 
 test('describeObserved lists PE target facts and evidence', () => {

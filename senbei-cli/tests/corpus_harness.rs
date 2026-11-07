@@ -1,7 +1,7 @@
 //! Integration tests for the manifest-driven corpus harness.
 //!
 //! These exercise the harness itself with generated fixtures only: a
-//! Crackproof-shaped PE, synthetic v31 metadata, an ELF probe, and a small app
+//! CrackProof-shaped PE, synthetic v31 metadata, an ELF probe, and a small app
 //! tree. No real corpus, product name, or golden binary is involved.
 //!
 //! Run just this file with:

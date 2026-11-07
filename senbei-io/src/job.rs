@@ -76,7 +76,7 @@ pub fn default_out_root_for_file(input: &Path) -> PathBuf {
     parent.join("unpack")
 }
 
-/// Unpack all Crackproof-protected files under `root`, writing results into
+/// Unpack all CrackProof-protected files under `root`, writing results into
 /// a mirrored subtree under `out_dir` (or `root/unpack` if None).
 ///
 /// Each file is processed independently: a panic or error in one file is
@@ -215,7 +215,7 @@ fn run_folder_inner(
         log.step(&format!("out {}", out_root.display()));
         Some(log)
     };
-    // Single merged directory walk: returns Crackproof unpack candidates, il2cpp
+    // Single merged directory walk: returns CrackProof unpack candidates, il2cpp
     // metadata blobs, and Android targets from one traversal (see
     // [`crate::scan::find_targets_opts`]). Files the free directory metadata
     // already rules out are never opened — on asset-heavy trees the per-file
@@ -1264,7 +1264,7 @@ fn unsupported_version(e: &anyhow::Error) -> Option<u32> {
 
 /// De-obfuscate an il2cpp `global-metadata.dat` to `dest`.
 ///
-/// Crackproof's `-GMD` option scrambles each `Il2CppMethodDefinition`'s token
+/// CrackProof's `-GMD` option scrambles each `Il2CppMethodDefinition`'s token
 /// into a sparse, original-metadata-style value; il2cpp expects the contiguous
 /// per-module index it indexes its codegen tables with, so a statically-unpacked
 /// il2cpp game assembly reads garbage and crashes during init. This rewrites

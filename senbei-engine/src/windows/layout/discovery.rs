@@ -372,7 +372,7 @@ pub struct EighthSlots {
 
 /// Marker-independent eighthStage slot discovery (PE32+ branch).
 ///
-/// Newer Crackproof builds (e.g. some native/managed DLLs) omit the
+/// Newer CrackProof builds (e.g. some native/managed DLLs) omit the
 /// `pm\0\0cm\0\0` and `00 00 00 40 01 00 00 00` markers that the older layout's
 /// walk3/walk4/walk5 slot derivation relies on. Instead this discovers the
 /// slots structurally:

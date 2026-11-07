@@ -128,8 +128,8 @@ pub enum UnpackError {
     #[error("stage5 marker not found — this build's layout is not supported by this unpacker")]
     Stage5MarkerNotFound,
 
-    #[error("not a Crackproof-protected file")]
-    NotCrackproof,
+    #[error("not a CrackProof-protected file")]
+    NotCrackProof,
 
     #[error("invalid PE header offset {offset} for {input_len}-byte input")]
     InvalidPeOffset { offset: i64, input_len: usize },

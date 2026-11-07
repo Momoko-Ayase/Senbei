@@ -544,7 +544,7 @@ function applyReply(entry, r) {
     entry.error = r.message ?? r.error ?? 'unpack failed';
     entry.findings = [];
     entry.note = r.trap
-      ? 'unpack failed (internal trap) — this Crackproof layout may be unsupported'
+      ? 'unpack failed (internal trap) — this CrackProof layout may be unsupported'
       : entry.error;
     return false;
   }
@@ -630,7 +630,7 @@ unpackBtn.addEventListener('click', async () => {
 
       if (entry.kind === undefined) {
         entry.state = 'err';
-        entry.error = 'not recognized as Crackproof-protected — skipped';
+        entry.error = 'not recognized as CrackProof-protected — skipped';
         entry.note = entry.error;
         render();
         continue;

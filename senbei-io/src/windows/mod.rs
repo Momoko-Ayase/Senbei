@@ -44,7 +44,7 @@ pub(crate) fn is_reparse_point(_entry: &walkdir::DirEntry) -> bool {
     false
 }
 
-/// Crackproof header key table lives at this fixed file offset. For the
+/// CrackProof header key table lives at this fixed file offset. For the
 /// external-companion layout, the companion payload aligns to the stub here.
 const HEADER_OFF: usize = 4096;
 
@@ -54,10 +54,10 @@ const HEADER_OFF: usize = 4096;
 /// In that layout a protected module is split into a thin on-disk loader stub
 /// (`Foo.dll`, whose code sections are stripped to one page) plus an encrypted
 /// `Foo.dll._` companion holding the real payload. The companion is byte-for-byte
-/// the stub's payload region starting at the Crackproof header (offset 4096), so
+/// the stub's payload region starting at the CrackProof header (offset 4096), so
 /// `stub[..4096] ++ companion` reconstructs the ordinary embedded-payload file
 /// the existing pipelines already unpack. The runtime loader does exactly this:
-/// it maps `Foo.dll._` and feeds it through the standard Crackproof unpack.
+/// it maps `Foo.dll._` and feeds it through the standard CrackProof unpack.
 ///
 /// The splice fires only when a sibling `<input>._` exists *and* its first 32
 /// bytes equal the stub's header at offset 4096 — a precise signal that the
@@ -107,7 +107,7 @@ pub(crate) fn read_unpacker_input(input: &Path) -> anyhow::Result<UnpackerInput>
 
 /// The bytes fed to the unpacker, plus the original loader stub when the input
 /// was reconstructed from an external companion. The stub is retained because
-/// the crackproof loader rebuilds the PE export table at runtime from data kept
+/// the CrackProof loader rebuilds the PE export table at runtime from data kept
 /// in the stub — that table is *not* present in the encrypted companion, so the
 /// unpacked image needs it overlaid from the stub afterwards
 /// (see [`overlay_exports_from_stub`]).
@@ -120,7 +120,7 @@ pub(crate) struct UnpackerInput {
 /// `out`, for the external-companion layout.
 ///
 /// In that layout the encrypted companion carries the real `.text`/`il2cpp`
-/// payload but **not** a usable export directory: the crackproof loader rebuilds
+/// payload but **not** a usable export directory: the CrackProof loader rebuilds
 /// exports at runtime from the plaintext copy retained in the stub's `.rdata`.
 /// Statically, the spliced input therefore decrypts to a garbage export
 /// directory (`NumberOfFunctions` etc. are ciphertext), which makes downstream
@@ -245,7 +245,7 @@ fn restore_managed_from_stub(out: &mut [u8], stub: &[u8]) -> Result<(), unpacker
 /// Restore the TLS directory from the loader `stub` onto the unpacked image
 /// `out`, for the external-companion layout.
 ///
-/// Crackproof strips the whole `IMAGE_TLS_DIRECTORY` from the encrypted payload
+/// CrackProof strips the whole `IMAGE_TLS_DIRECTORY` from the encrypted payload
 /// — the data-directory entry, the directory struct, the raw-data template, and
 /// the base relocations for the struct's four 64-bit pointer fields — and
 /// re-installs TLS itself from data kept in the stub when it loads the module.
@@ -419,7 +419,7 @@ fn write_u32_at(buf: &mut [u8], off: usize, val: u32) {
 /// Splice a stub and its external-companion payload into the embedded-payload
 /// form the pipelines expect, or `None` if `comp` is not this stub's payload.
 ///
-/// The companion is byte-for-byte the stub's payload region from the Crackproof
+/// The companion is byte-for-byte the stub's payload region from the CrackProof
 /// header (offset 4096) onward, so the result is `stub[..4096] ++ comp`. The
 /// splice fires only when the first 32 bytes of `comp` equal the stub's header
 /// at offset 4096 — a 32-byte match on the key-table/magic region that confirms
@@ -450,7 +450,7 @@ pub(crate) fn unpack_spliced_or_auto(
     verbose: bool,
 ) -> Result<(unpacker::Kind, Vec<u8>), unpacker::UnpackError> {
     if spliced || force_exe {
-        let detected = unpacker::detect(bytes).ok_or(unpacker::UnpackError::NotCrackproof)?;
+        let detected = unpacker::detect(bytes).ok_or(unpacker::UnpackError::NotCrackProof)?;
         let out = unpacker::unpack_exe_v(bytes, verbose)?;
         return Ok((detected.kind, out));
     }
@@ -631,7 +631,7 @@ fn unpack_bytes_profiled_impl(
     let kind = match profile.observed.kind {
         Some(kind) => kind,
         None => {
-            let error = unpacker::UnpackError::NotCrackproof;
+            let error = unpacker::UnpackError::NotCrackProof;
             profile.push_error(error.to_string());
             return (profile, Err(error));
         }
@@ -660,7 +660,7 @@ pub fn unpack_one_v(
     // the encrypted companion does not carry (the loader rebuilds it at runtime).
     if let Some(stub) = stub {
         overlay_exports_from_stub(&mut out, &stub);
-        // ...and the TLS directory, which Crackproof strips from the payload and
+        // ...and the TLS directory, which CrackProof strips from the payload and
         // re-installs at runtime; the ordinary loader needs it or thread_local
         // access crashes (see [`restore_tls_from_stub`]).
         restore_tls_from_stub(&mut out, &stub);
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn profiled_unknown_input_is_not_recognized() {
         let (profile, result) = unpack_bytes_profiled(&[], None);
-        assert!(matches!(result, Err(unpacker::UnpackError::NotCrackproof)));
+        assert!(matches!(result, Err(unpacker::UnpackError::NotCrackProof)));
         assert_eq!(
             profile.recognition,
             unpacker::RecognitionStatus::NotRecognized

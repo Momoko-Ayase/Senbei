@@ -140,7 +140,7 @@ fn types_offset() -> usize {
     0x100 + 2 * IMAGE_STRIDE
 }
 
-/// Build a PE that the Crackproof detector classifies.
+/// Build a PE that the CrackProof detector classifies.
 ///
 /// Only the fields the detector reads are populated: the DOS/PE headers, the
 /// COFF characteristics word, the optional-header magic, the CLR directory,

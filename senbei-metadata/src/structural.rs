@@ -1,6 +1,6 @@
 //! il2cpp `global-metadata.dat` de-obfuscation.
 //!
-//! Crackproof's `-GMD` option obfuscates the **method-token** field of every
+//! CrackProof's `-GMD` option obfuscates the **method-token** field of every
 //! `Il2CppMethodDefinition` in `global-metadata.dat`. il2cpp resolves a method's
 //! compiled function/invoker by indexing the per-module
 //! `Il2CppCodeGenModule.methodPointers` / `invokerIndices` tables — which are
@@ -8,9 +8,9 @@
 //! only works when each module's method tokens are the **contiguous** range
 //! `1..=methodPointerCount`. `-GMD` replaces them with sparse, original-metadata-style
 //! tokens (e.g. mscorlib rows reach ~55k for only ~14k compiled methods) and the
-//! running game's Crackproof loader remaps them back at load time.
+//! running game's CrackProof loader remaps them back at load time.
 //!
-//! A statically-unpacked il2cpp game assembly run without Crackproof reads the
+//! A statically-unpacked il2cpp game assembly run without CrackProof reads the
 //! tokens raw, so `(token_row - 1)` runs off the end of those tables — an
 //! out-of-bounds read that crashes deep in il2cpp init (first hit:
 //! `System.Array`'s interface method setup). See the project notes for the full

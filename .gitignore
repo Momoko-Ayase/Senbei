@@ -146,7 +146,7 @@ target/
 .ionide
 
 ### senbei test corpus ###
-# The samples folder holds local-only Crackproof binaries; only its README is
+# The samples folder holds local-only CrackProof binaries; only its README is
 # tracked. Ignore the folder's contents (not the folder itself, or git won't
 # descend into it to find the re-included README). See senbei/samples/README.md.
 /samples/*

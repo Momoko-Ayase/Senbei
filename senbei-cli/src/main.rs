@@ -433,7 +433,7 @@ fn print_help() {
     );
     println!(
         "  <file|folder>\n\
-         \x20              a Crackproof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
+         \x20              a CrackProof PE (.exe/.dll), an il2cpp global-metadata.dat,\n\
          \x20              a protected Android AArch64 library (.so), an Android app\n\
          \x20              package (.apk/.apks/.xapk), or a folder containing any of\n\
          \x20              these. The bare form is the same as 'unpack'."
