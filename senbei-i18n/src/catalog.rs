@@ -445,6 +445,8 @@ pub enum Cli {
         depth: usize,
     },
     HelpExitCodes,
+    /// `SENBEI_LANG`: the display language and what stays English.
+    HelpLanguage,
     // -- text report ------------------------------------------------------
     ReportScanHeading,
     ReportScan {

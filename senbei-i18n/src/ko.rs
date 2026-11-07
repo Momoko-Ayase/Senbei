@@ -374,6 +374,10 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 제한은 추출/할당 전에 확인되며 최대 RSS 상한선이 아닙니다."
         )
         .into(),
+        Cli::HelpLanguage => "  SENBEI_LANG  표시 언어: en, zh-CN, zh-TW, ja 또는 ko. 설정하지 않으면\n\
+             \x20              시스템 언어를 사용합니다. JSON 및 저장된 로그는 영어로\n\
+             \x20              유지됩니다."
+            .into(),
         Cli::HelpExitCodes => "  종료 코드: 0 성공, 1 대상 실패 (--strict-integrity 사용 시 의심됨 포함),\n\
              \x20 2 명령줄이 거부됨."
             .into(),

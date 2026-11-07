@@ -248,6 +248,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 上限は展開・割り当て前に検査されます。ピークRSSの上限ではありません。"
         )
         .into(),
+        Cli::HelpLanguage => "  SENBEI_LANG  表示言語: en、zh-CN、zh-TW、ja、またはko。未設定時は\n\
+             \x20              システムの言語を使用します。JSONと保存されるログは常に英語です。"
+            .into(),
         Cli::HelpExitCodes => "  終了コード: 0 成功、1 対象の失敗 (--strict-integrity時の要注意を含む)、\n\
              \x20 2 コマンドライン引数の却下。"
             .into(),

@@ -246,6 +246,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 提取或分配前会检查限制；这些限制不是内存使用峰值的上限。"
         )
         .into(),
+        Cli::HelpLanguage => "  SENBEI_LANG  显示语言：en、zh-CN、zh-TW、ja 或 ko。未设置时使用系统\n\
+             \x20              语言。JSON 与保存的日志始终使用英文。"
+            .into(),
         Cli::HelpExitCodes => "  退出代码：0 成功，1 有目标失败（或启用 --strict-integrity 时存在可疑\n\
              \x20 项），2 命令行参数被拒绝。"
             .into(),

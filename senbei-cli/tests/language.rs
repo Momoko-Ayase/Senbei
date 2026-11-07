@@ -65,6 +65,20 @@ fn usage_errors_and_help_follow_the_language() {
 }
 
 #[test]
+fn help_documents_the_language_variable_in_every_language() {
+    for lang in Lang::ALL {
+        let output = senbei(lang.tag()).arg("--help").output().unwrap();
+        assert!(output.status.success());
+        let help = text(&output.stdout);
+        assert!(
+            help.contains(&*Cli::HelpLanguage.localize(lang)),
+            "{lang:?}"
+        );
+        assert!(help.contains("SENBEI_LANG"), "{lang:?}");
+    }
+}
+
+#[test]
 fn an_unknown_language_falls_back_to_english() {
     for value in ["fr", "C", "x-unknown"] {
         let output = senbei(value).arg("--bogus").output().unwrap();

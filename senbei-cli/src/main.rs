@@ -466,6 +466,7 @@ fn print_help() {
             entries: defaults.max_entries,
             depth: defaults.max_depth,
         },
+        Cli::HelpLanguage,
         Cli::HelpExitCodes,
     ] {
         println!("{}", block.localize(lang));

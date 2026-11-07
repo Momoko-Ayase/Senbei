@@ -249,6 +249,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 Limits are checked before extraction/allocation; they are not a peak-RSS cap."
         )
         .into(),
+        Cli::HelpLanguage => "  SENBEI_LANG  display language: en, zh-CN, zh-TW, ja, or ko. Unset, the\n\
+             \x20              system language is used. JSON and saved logs stay English."
+            .into(),
         Cli::HelpExitCodes => "  Exit codes: 0 success, 1 a target failed (or a suspect with\n\
              \x20 --strict-integrity), 2 the command line was rejected."
             .into(),

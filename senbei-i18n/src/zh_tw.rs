@@ -244,6 +244,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 系統會在解壓縮或配置記憶體前檢查限制；這些限制並非尖峰記憶體使用量上限。"
         )
         .into(),
+        Cli::HelpLanguage => "  SENBEI_LANG  顯示語言：en、zh-CN、zh-TW、ja 或 ko。未設定時會使用\n\
+             \x20              系統語言。JSON 與儲存的記錄檔維持英文。"
+            .into(),
         Cli::HelpExitCodes => "  結束代碼：0 成功，1 目標失敗（或啟用 --strict-integrity 時有可疑項），\n\
              \x20 2 命令列參數遭拒。"
             .into(),
