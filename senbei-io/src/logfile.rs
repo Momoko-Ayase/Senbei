@@ -56,6 +56,15 @@ pub fn local_stamp_display() -> String {
     )
 }
 
+/// Local wall-clock `HH:MM:SS.mmm`, for the lines of a live run view.
+pub fn local_clock() -> String {
+    let t = local_parts();
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        t.hour, t.minute, t.second, t.millisecond
+    )
+}
+
 struct LocalParts {
     year: u32,
     month: u32,
@@ -63,6 +72,7 @@ struct LocalParts {
     hour: u32,
     minute: u32,
     second: u32,
+    millisecond: u32,
 }
 
 fn local_parts() -> LocalParts {
@@ -77,16 +87,17 @@ fn local_parts() -> LocalParts {
             hour: st.wHour as u32,
             minute: st.wMinute as u32,
             second: st.wSecond as u32,
+            millisecond: st.wMilliseconds as u32,
         }
     }
     #[cfg(all(not(windows), not(target_arch = "wasm32")))]
     {
         // Local wall clock via POSIX localtime_r — same semantics as Windows GetLocalTime.
         use std::time::{SystemTime, UNIX_EPOCH};
-        let secs_u = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .unwrap_or_default();
+        let secs_u = now.as_secs();
         let t: libc::time_t = secs_u as libc::time_t;
         let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
         let ok = unsafe { libc::localtime_r(&t, &mut tm) };
@@ -100,6 +111,7 @@ fn local_parts() -> LocalParts {
             hour: tm.tm_hour as u32,
             minute: tm.tm_min as u32,
             second: tm.tm_sec as u32,
+            millisecond: now.subsec_millis(),
         }
     }
     #[cfg(all(not(windows), target_arch = "wasm32"))]
@@ -134,6 +146,7 @@ fn utc_parts(secs: u64) -> LocalParts {
         hour: time_of_day / 3600,
         minute: (time_of_day % 3600) / 60,
         second: time_of_day % 60,
+        millisecond: 0,
     }
 }
 

@@ -22,6 +22,12 @@ pub trait RunObserver: Send + Sync {
     /// the run was started with `verbose`.
     fn progress(&self, _event: &senbei_engine::progress::Event) {}
 
+    /// One input finished, as recorded before a dry run or an inspection
+    /// drops its outputs. The files named by `outputs` and by each entry's
+    /// `output` exist for the duration of this call; a dry run or an
+    /// inspection deletes them when the run ends.
+    fn produced(&self, _input: &InputReport) {}
+
     /// One input finished. This is the report the run keeps for it.
     fn input_finished(&self, _input: &InputReport) {}
 }

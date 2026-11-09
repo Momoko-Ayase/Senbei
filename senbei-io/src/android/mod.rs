@@ -204,6 +204,66 @@ pub fn inspect_package(package: &Path, limits: &ResourceLimits) -> Result<Contai
     })
 }
 
+/// The bytes of one package entry, named by its report label.
+///
+/// `label` is an entry name as a package report writes it: `<package>::<entry>`
+/// for an APK, `<package>\<nested.apk>::<entry>` inside a bundle. Only the
+/// named entry (and, in a bundle, the nested APK holding it) is extracted, under
+/// the same archive ceilings as a restore.
+pub fn read_package_entry(package: &Path, label: &str, limits: &ResourceLimits) -> Result<Vec<u8>> {
+    let (outer, inner) = label
+        .rsplit_once("::")
+        .with_context(|| format!("`{label}` names no package entry"))?;
+    let bundle = package
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("apks") || value.eq_ignore_ascii_case("xapk")
+        });
+    let temporary = tempfile::tempdir().context("create entry workspace")?;
+    let mut budget = archive_limits::ArchiveBudget::from_limits(limits);
+    let mut archive = budget.open_archive(package)?;
+    let entry_index = |archive: &mut ZipArchive<archive_limits::ArchiveReader>,
+                       wanted: &dyn Fn(&Path) -> bool|
+     -> Result<Option<(usize, PathBuf)>> {
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index)?;
+            if entry.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.enclosed_name()
+                && wanted(&name)
+            {
+                return Ok(Some((index, name)));
+            }
+        }
+        Ok(None)
+    };
+    let names = |name: &Path, label: &str| name.display().to_string() == label;
+    let path = if bundle {
+        // The nested APK is the top-level entry the label's package part ends with.
+        let (index, name) = entry_index(&mut archive, &|name: &Path| {
+            let name = name.display().to_string();
+            outer.ends_with(&name) && outer[..outer.len() - name.len()].ends_with(['\\', '/'])
+        })?
+        .with_context(|| format!("`{outer}` is not in `{}`", package.display()))?;
+        limits.check_depth(1)?;
+        let nested_path = extract_entry(&mut archive, index, &temporary, &name, &mut budget)
+            .with_context(|| format!("extract `{}`", name.display()))?;
+        let mut nested = budget.open_archive(&nested_path)?;
+        let (index, name) = entry_index(&mut nested, &|name: &Path| names(name, inner))?
+            .with_context(|| format!("`{inner}` is not in `{outer}`"))?;
+        extract_entry(&mut nested, index, &temporary, &name, &mut budget)
+            .with_context(|| format!("extract `{label}`"))?
+    } else {
+        let (index, name) = entry_index(&mut archive, &|name: &Path| names(name, inner))?
+            .with_context(|| format!("`{inner}` is not in `{}`", package.display()))?;
+        extract_entry(&mut archive, index, &temporary, &name, &mut budget)
+            .with_context(|| format!("extract `{label}`"))?
+    };
+    std::fs::read(&path).with_context(|| format!("read extracted `{label}`"))
+}
+
 fn manifest_report(source: &str, inventory: &context::PackageInventory) -> ManifestReport {
     let (package, version) = match &inventory.key {
         context::AppKey::Manifest {

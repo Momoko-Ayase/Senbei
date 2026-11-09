@@ -634,6 +634,9 @@ impl Collector {
             input.analysis_incomplete = true;
             input.status = InputStatus::Error;
         }
+        if let Some(observer) = &self.observer {
+            observer.produced(&input);
+        }
         if matches!(self.mode, Mode::DryRun | Mode::Inspect) {
             // Research inspection and dry runs keep their actual recovery
             // outcomes, but never advertise temporary artifacts as outputs.

@@ -1,6 +1,7 @@
 use senbei_engine::detect;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 /// Bytes read per file for content detection. `detect` inspects the DOS/PE
@@ -126,6 +127,26 @@ pub fn find_targets_with_limits(
     scan_all: bool,
     limits: &senbei_engine::android::ResourceLimits,
 ) -> ScanResult {
+    find_targets_inner(root, scan_all, limits, None)
+}
+
+/// [`find_targets_with_limits`], counting targets into `found` as the content
+/// probe classifies them, so a front end can show the scan's progress.
+pub fn find_targets_counted(
+    root: &Path,
+    scan_all: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+    found: &AtomicUsize,
+) -> ScanResult {
+    find_targets_inner(root, scan_all, limits, Some(found))
+}
+
+fn find_targets_inner(
+    root: &Path,
+    scan_all: bool,
+    limits: &senbei_engine::android::ResourceLimits,
+    found: Option<&AtomicUsize>,
+) -> ScanResult {
     // Phase 1: serial traversal collecting regular-file paths only. No file is
     // opened here; `readdir` is fast relative to the content probe that follows,
     // and `entry.metadata()` is served from the directory entry on Windows, so
@@ -190,17 +211,27 @@ pub fn find_targets_with_limits(
     let n = paths.len();
     let mut class: Vec<Option<Class>> = vec![Some(Class::None); n];
     let workers = senbei_engine::thread_cap().clamp(1, n.max(1));
+    let classify_counted = |path: &Path| {
+        let class = classify(path, limits);
+        if let Some(found) = found
+            && matches!(class, Some(c) if c != Class::None)
+        {
+            found.fetch_add(1, Ordering::Relaxed);
+        }
+        class
+    };
     if workers <= 1 {
         for (p, c) in paths.iter().zip(class.iter_mut()) {
-            *c = classify(p, limits);
+            *c = classify_counted(p);
         }
     } else {
         let chunk = n.div_ceil(workers);
+        let classify_counted = &classify_counted;
         std::thread::scope(|scope| {
             for (pc, cc) in paths.chunks(chunk).zip(class.chunks_mut(chunk)) {
                 scope.spawn(move || {
                     for (p, c) in pc.iter().zip(cc.iter_mut()) {
-                        *c = classify(p, limits);
+                        *c = classify_counted(p);
                     }
                 });
             }
@@ -275,6 +306,55 @@ fn classify(path: &Path, limits: &senbei_engine::android::ResourceLimits) -> Opt
         Class::None
     }));
     r.ok()
+}
+
+/// What one input is, judged the way a single-file run dispatches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputClass {
+    /// An il2cpp metadata blob, recognized by its magic.
+    Metadata,
+    /// A protected AArch64 shared library.
+    AndroidLibrary,
+    /// An Android app package (`.apk`/`.apks`/`.xapk`).
+    AndroidPackage,
+    /// A CrackProof-protected PE.
+    Windows,
+    /// None of these. A single-file run reports it as not protected.
+    NotTarget,
+}
+
+/// Classify one input the way a single-file run would dispatch it, reading its
+/// first 8 KiB (and, for an AArch64 ELF, the section table the probe needs).
+///
+/// Unlike a folder scan, a single-file run is not bound to target filenames: a
+/// metadata blob is recognized by its magic, whatever it is called.
+pub fn classify_input(
+    path: &Path,
+    limits: &senbei_engine::android::ResourceLimits,
+) -> std::io::Result<InputClass> {
+    let file = std::fs::File::open(path)?;
+    let mut head = Vec::with_capacity(DETECT_PREFIX as usize);
+    file.take(DETECT_PREFIX).read_to_end(&mut head)?;
+    let class = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if senbei_metadata::is_metadata(&head) {
+            return InputClass::Metadata;
+        }
+        if crate::android::is_elf64_aarch64(&head) {
+            return if crate::android::probe_so_file_with_limits(path, limits).unwrap_or(true) {
+                InputClass::AndroidLibrary
+            } else {
+                InputClass::NotTarget
+            };
+        }
+        if crate::android::is_app_package(path, &head) {
+            return InputClass::AndroidPackage;
+        }
+        if detect(&head).is_some() {
+            return InputClass::Windows;
+        }
+        InputClass::NotTarget
+    }));
+    Ok(class.unwrap_or(InputClass::NotTarget))
 }
 
 /// Read up to `max` bytes from the start of `path`. Returns `None` on any I/O

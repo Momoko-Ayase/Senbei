@@ -424,7 +424,7 @@ fn write_u32_at(buf: &mut [u8], off: usize, val: u32) {
 /// splice fires only when the first 32 bytes of `comp` equal the stub's header
 /// at offset 4096 — a 32-byte match on the key-table/magic region that confirms
 /// the pairing and leaves ordinary (non-companion) inputs untouched.
-pub(crate) fn splice_companion(stub: &[u8], comp: &[u8]) -> Option<Vec<u8>> {
+pub fn splice_companion(stub: &[u8], comp: &[u8]) -> Option<Vec<u8>> {
     let hdr_end = HEADER_OFF + 32;
     if stub.len() >= hdr_end && comp.len() >= 32 && stub[HEADER_OFF..hdr_end] == comp[..32] {
         let mut spliced = Vec::with_capacity(HEADER_OFF + comp.len());
