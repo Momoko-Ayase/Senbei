@@ -2248,6 +2248,10 @@ fn android_library_input_with_error(
     let mut entry = InputReport::new(input, Role::Content);
     entry.status = status;
     entry.analysis_incomplete = error.is_some_and(analysis_incomplete);
+    // The failure profile below takes its detail from the first error.
+    if let Some(error) = error {
+        entry.error(of_error(error));
+    }
     match status {
         InputStatus::Ok => {
             entry.profile = Some(crate::report::android_recovered_profile());
@@ -2945,6 +2949,28 @@ mod incomplete_analysis_tests {
         let reported = inspect_status(complete);
         assert_eq!(reported.status, InputStatus::Recognized);
         assert!(!reported.analysis_incomplete);
+    }
+
+    /// A loose library that failed keeps its error, in the report and as the
+    /// failure profile's detail.
+    #[test]
+    fn a_failed_android_library_reports_its_error() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("libil2cpp.so");
+        std::fs::write(&path, b"not really an ELF").unwrap();
+        let error = anyhow::anyhow!("6 unresolved slots").context("restore protected library");
+        let reported = android_library_input_with_error(
+            &path,
+            InputStatus::Error,
+            &path,
+            Instant::now(),
+            Some(&error),
+        );
+        let texts: Vec<&str> = reported.errors.iter().map(Message::text).collect();
+        assert_eq!(texts, ["restore protected library: 6 unresolved slots"]);
+        let profile = reported.profile.expect("a failure profile");
+        let detail: Vec<&str> = profile.errors.iter().map(Message::text).collect();
+        assert_eq!(detail, texts);
     }
 
     /// A container whose entry hit a ceiling is incomplete as a whole.
