@@ -1625,7 +1625,8 @@ fn restore_package_entry<R: Read + Seek, T: context::LibraryRestorer>(
                                 status: EntryStatus::Restored,
                                 provenance: Vec::new(),
                                 layout: None,
-                                metadata_version: None,
+                                metadata_version: senbei_metadata::identify(blob)
+                                    .map(|identity| identity.raw_version),
                                 validation: None,
                                 research: None,
                                 metadata_research: None,
