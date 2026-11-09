@@ -4,6 +4,7 @@ members = [
     "senbei-crypto",
     "senbei-elf",
     "senbei-engine",
+    "senbei-gui",
     "senbei-i18n",
     "senbei-io",
     "senbei-metadata",
@@ -25,11 +26,28 @@ license = "AGPL-3.0-only"
 [workspace.dependencies]
 aes = "0.9"
 anyhow = "1"
+# The GUI renders with wgpu (Direct3D 12 or Vulkan); no OpenGL dependency.
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "links",
+    "persistence",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+egui = "0.37"
+egui_extras = { version = "0.37", default-features = false }
+egui_system_font_provider = "0.37"
+fontique = "0.11"
 goblin = "0.10"
 indicatif = "0.18"
 libc = "0.2"
 memmap2 = "0.9"
 owo-colors = "4"
+png = "0.18"
+rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

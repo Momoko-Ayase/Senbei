@@ -1,0 +1,35 @@
+[package]
+name = "senbei-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native desktop front end for Senbei"
+
+[[bin]]
+name = "senbei-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+senbei-engine.workspace = true
+senbei-i18n.workspace = true
+senbei-io.workspace = true
+senbei-metadata.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# The native shell: window, renderer, file dialogs, system fonts. The UI layer
+# above it only uses egui, so it also builds for wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe.workspace = true
+egui_system_font_provider.workspace = true
+fontique.workspace = true
+png.workspace = true
+rfd.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
