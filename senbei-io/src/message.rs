@@ -1,8 +1,9 @@
 //! Translatable messages for errors that reach the I/O layer.
 //!
-//! Reports, logs, and `--json` keep an error's English exactly as `{error:#}`
-//! prints its chain. A front end showing another language translates the first
-//! cause in the chain that has a message code, and keeps the English as detail.
+//! Reports and `--json` keep an error's English as `{error:#}` prints its
+//! chain, less any link that only repeats the one before it. A front end
+//! showing another language translates the first cause in the chain that has a
+//! message code, and keeps the English as detail.
 
 use std::fmt;
 
@@ -44,11 +45,25 @@ impl std::error::Error for Coded {}
 /// The message for `error`: its English chain, translated through the first
 /// cause that has a message code.
 pub fn of_error(error: &anyhow::Error) -> Message {
-    let text = format!("{error:#}");
+    let text = chain_text(error);
     match error.chain().find_map(code) {
         Some(msg) => Message::with_text(msg, text),
         None => Message::raw(text),
     }
+}
+
+/// `{error:#}`, without a link that only repeats the one before it: a wrapper
+/// that shows its inner error's message and also returns that error as its
+/// source would otherwise print the message twice.
+fn chain_text(error: &anyhow::Error) -> String {
+    let mut links: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if links.last() != Some(&text) {
+            links.push(text);
+        }
+    }
+    links.join(": ")
 }
 
 fn code(cause: &(dyn std::error::Error + 'static)) -> Option<Msg> {
@@ -167,6 +182,33 @@ mod tests {
         assert_eq!(
             of_error(&metadata).msg(),
             Some(&Msg::UnsupportedMetadataVersion { version: 27 })
+        );
+    }
+
+    #[test]
+    fn a_wrapper_that_repeats_its_source_is_printed_once() {
+        // Shows its inner error's message and returns that error as its source.
+        #[derive(Debug)]
+        struct Wrapper(anyhow::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.0.as_ref())
+            }
+        }
+        let inner = anyhow::anyhow!("6 unresolved slots").context("restore library");
+        let error = anyhow::Error::new(Wrapper(inner));
+        assert_eq!(
+            format!("{error:#}"),
+            "restore library: restore library: 6 unresolved slots"
+        );
+        assert_eq!(
+            of_error(&error).text(),
+            "restore library: 6 unresolved slots"
         );
     }
 }
