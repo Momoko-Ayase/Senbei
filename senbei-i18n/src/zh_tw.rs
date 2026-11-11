@@ -6,7 +6,7 @@ use crate::{Cli, Msg, Step, Term};
 
 pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
     match msg {
-        Msg::CompanionMissing => "缺少伴生檔案？此載入器需要相符的 <input>._ 載荷。請將它放在輸入檔案旁並再試一次。".into(),
+        Msg::CompanionMissing => "缺少伴生檔案：此載入器需要相符的 <input>._ 載荷。請將它放在輸入檔案所在的資料夾中，再試一次。瀏覽器版需同時加入這兩個檔案。".into(),
         Msg::CompanionMismatch => "伴生檔案不相符：所提供的 ._ 載荷過短，或其標頭與載入器不同。請使用來自同一組建的伴生檔案；兩個檔案其中之一可能已損毀。".into(),
         Msg::InputTooShort { actual, required } => format!("輸入過短（至少需要 {required} 位元組，實際為 {actual} 位元組）").into(),
         Msg::NotProtected => "不是受 CrackProof 保護的檔案".into(),
@@ -71,7 +71,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
     match step {
         Step::DecryptHeader => "解密檔案標頭...".into(),
         Step::DecryptPayload => "解密載荷...".into(),
-        Step::LocateConfig => "定位組態配置...".into(),
+        Step::LocateConfig => "尋找設定結構...".into(),
         Step::DecryptStage2 => "解密 stage2...".into(),
         Step::DecryptStages3To5 => "解密階段 3-5...".into(),
         Step::DecryptSections => "解密節區資料...".into(),
@@ -79,9 +79,9 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::LoadSections => "載入並解壓縮節區...".into(),
         Step::DecryptImports => "解密匯入字串...".into(),
         Step::RebuildHeaders => "重建 PE 標頭...".into(),
-        Step::Pe32LocateConfig => "定位組態配置 (PE32)...".into(),
+        Step::Pe32LocateConfig => "尋找設定結構 (PE32)...".into(),
         Step::Pe32Stages => "解密各階段 (PE32)...".into(),
-        Step::Pe32EighthStage => "解密 eighthStage (PE32)...".into(),
+        Step::Pe32EighthStage => "解密第八階段 (PE32)...".into(),
         Step::Pe32Load => "載入並解壓縮檔案資料 (PE32)...".into(),
         Step::Pe32Text { formula } => format!("解密 .text (PE32 dd8, formula={formula})...").into(),
         Step::Pe32TextSkip => "略過 .text dd8（已為明文）...".into(),
@@ -97,7 +97,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::DllSections => "解密並解壓縮節區...".into(),
         Step::FixHeaders => "修補 PE 標頭與節區表...".into(),
         Step::AndroidPrimary => "解碼主要 0x9D 目標映像容器...".into(),
-        Step::AndroidAuxiliary => "解碼輔助 0x9D ELF 實體化容器...".into(),
+        Step::AndroidAuxiliary => "解碼輔助 0x9D ELF 容器...".into(),
         Step::AndroidTables => "重建靜態 ELF 動態連結器表...".into(),
         Step::WriteTo { dest } => format!("寫入至 {dest}").into(),
     }
@@ -121,7 +121,7 @@ pub(crate) fn term(term: &Term) -> Cow<'static, str> {
         Term::NotAttempted => "未嘗試",
         Term::Succeeded => "成功",
         Term::Rejected => "已拒絕",
-        Term::Clean => "乾淨",
+        Term::Clean => "通過",
         Term::Warnings => "警告",
         Term::NotRun => "未執行",
         Term::Absent => "無",
@@ -136,9 +136,9 @@ pub(crate) fn term(term: &Term) -> Cow<'static, str> {
         Term::OutputWrite => "輸出寫入",
         Term::SharedLibrary => "共用程式庫",
         Term::Metadata => "中繼資料",
-        Term::ExeStyle => "EXE 風格",
-        Term::Dll => "DLL",
-        Term::AndroidStaged => "Android 分階段",
+        Term::ExeStyle => "EXE 風格載入器",
+        Term::Dll => "DLL 載入器",
+        Term::AndroidStaged => "Android 分階段載入器",
         Term::MetadataSeeded => "基於種子的中繼資料",
         Term::MetadataStructural => "結構化中繼資料",
         Term::MetadataMethodIndices => "中繼資料方法索引",
@@ -186,9 +186,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::UnknownOption { option } => format!("未知的選項 '{option}'").into(),
         Cli::MultipleInputs { first, second } => format!("指定了多個輸入路徑（'{first}' 與 '{second}'）").into(),
         Cli::SubcommandNeedsPath { subcommand } => format!("'{subcommand}' 需要指定輸入路徑").into(),
-        Cli::InspectNoDryRun => "'inspect' 不會寫入任何內容；請移除 --dry-run".into(),
-        Cli::InspectNoOut => "'inspect' 不會寫入任何內容；不允許使用 --out".into(),
-        Cli::DryRunNoOut => "--dry-run 不會寫入任何輸出；不允許使用 --out".into(),
+        Cli::InspectNoDryRun => "'inspect' 不儲存輸出檔案；無須指定 --dry-run".into(),
+        Cli::InspectNoOut => "'inspect' 不儲存輸出檔案；不可與 --out 同時使用".into(),
+        Cli::DryRunNoOut => "--dry-run 不儲存輸出檔案；不可與 --out 同時使用".into(),
         Cli::ColorRequiresMode => "--color 需要指定 auto、always 或 never".into(),
         Cli::ThreadsRequiresInteger => "--threads 需要指定正整數引數".into(),
         Cli::LimitRequiresInteger { flag } => format!("{flag} 需要指定無號整數引數").into(),
@@ -202,20 +202,18 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              上述項目的資料夾。省略子命令時等同於 'unpack'。"
             .into(),
         Cli::HelpInspect => "  inspect PATH\n\
-             \x20              執行研究用的真實靜態恢復流程，並回報觀測到的一切：\n\
-             \x20              識別依據、嘗試過的各條路線及其遭拒原因、選用的路線、\n\
-             \x20              靜態檢查的判定結果，以及引擎本身的結構依據（保護標頭\n\
-             \x20              欄位、種子、模組記錄、恢復映像資訊）。不會保留任何\n\
-             \x20              內容：無輸出檔案、無記錄檔、無暫存目錄，且絕不執行\n\
-             \x20              輸入項。"
+             \x20              執行完整的靜態復原並輸出詳細分析報告：識別依據、嘗試過\n\
+             \x20              的各復原方案及排除原因、最終選用的方案、靜態驗證結果，\n\
+             \x20              以及保護標頭欄位、種子、模組記錄與復原映像結構資料。\n\
+             \x20              不儲存復原後的輸出檔案或記錄檔，自動清理暫存目錄，且絕\n\
+             \x20              不執行輸入檔案。"
             .into(),
         Cli::HelpUnpack => "  unpack PATH  偵測並恢復；將結果寫入輸出（預設動作）。".into(),
         Cli::HelpJson => "  --json       將單一含版本資訊的機器可讀報告寫入 stdout，不輸出其他\n\
              \x20              內容。隱含安靜模式與 --no-log。"
             .into(),
-        Cli::HelpDryRun => "  --dry-run    執行真實恢復流程但不保留任何內容：無輸出目錄，亦無\n\
-             \x20              記錄檔。Android 提取仍會使用其專屬的暫存工作區，完成後\n\
-             \x20              即會捨棄。"
+        Cli::HelpDryRun => "  --dry-run    執行完整的復原流程，但不儲存輸出檔案與記錄檔。Android\n\
+             \x20              提取期間使用的暫存工作區會在完成後自動清理。"
             .into(),
         Cli::HelpThreads => "  --threads N  此次執行的工作執行緒正整數上限。會覆寫 SENBEI_THREADS；\n\
              \x20              設為 1 會使用循序執行路徑。環境變數本身不會變更。"
@@ -262,14 +260,14 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::KindUnavailable => "種類不適用或無法使用".into(),
         Cli::ProtectionRecognition { status } => format!("保護識別: {status}").into(),
         Cli::Evidence { evidence } => format!("依據: {evidence}").into(),
-        Cli::Route { route, outcome } => format!("路線 {route}: {outcome}").into(),
-        Cli::SelectedRoute { route } => format!("已選用路線: {route}").into(),
+        Cli::Route { route, outcome } => format!("方案 {route}: {outcome}").into(),
+        Cli::SelectedRoute { route } => format!("已選用方案: {route}").into(),
         Cli::StaticRecovery { status } => format!("靜態恢復: {status}").into(),
         Cli::OutputValidation { status } => format!("輸出靜態驗證: {status}").into(),
         Cli::Companion { state } => format!("伴生檔案: {state}").into(),
         Cli::CompanionIdentity { size, sha256 } => format!("{size} 位元組 · SHA-256 {sha256}").into(),
         Cli::InputView { view } => format!("分析輸入檢視: {view}").into(),
-        Cli::InputViewSplicedNote => "低於 0x1000 的檔案偏移定址載入器存根；自 0x1000 起的偏移定址伴生檔案偏移（檔案偏移 - 0x1000）".into(),
+        Cli::InputViewSplicedNote => "小於 0x1000 的檔案偏移對應載入器存根；從 0x1000 起的偏移對應伴生檔案中的 (檔案偏移 - 0x1000)".into(),
         Cli::MetadataIdentity { version, layout } => format!("IL2CPP 中繼資料版本: {version} · 結構配置定義 {layout}").into(),
         Cli::SeededTokens { value } => format!("基於種子的方法權杖: {}", yes_no(*value)).into(),
         Cli::StructuralTokens { value } => format!("結構化方法權杖: {}", yes_no(*value)).into(),
@@ -280,7 +278,7 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::Candidate { entry } => format!("候選: {entry}").into(),
         Cli::MetadataEvidence => "中繼資料轉換依據".into(),
         Cli::Entry { name, status } => format!("條目 {name}: {status}").into(),
-        Cli::EntryRoute { route } => format!("路線: {route}").into(),
+        Cli::EntryRoute { route } => format!("方案: {route}").into(),
         Cli::EntryMetadataVersion { version } => format!("中繼資料版本: {version}").into(),
         Cli::EntryRemapped { remapped } => format!("已重新映射的方法欄位: {remapped}").into(),
         Cli::ModuleContextSource { source } => format!("模組上下文來源: {source}").into(),

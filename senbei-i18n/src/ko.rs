@@ -6,7 +6,7 @@ use crate::{Cli, Msg, Step, Term};
 
 pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
     match msg {
-        Msg::CompanionMissing => "컴패니언 파일이 누락되었습니까? 이 로더는 일치하는 <input>._ 페이로드를 필요로 합니다. 입력 파일 옆에 두고 다시 시도하십시오.".into(),
+        Msg::CompanionMissing => "컴패니언 파일이 없습니다. 이 로더에는 대응하는 <input>._ 페이로드가 필요합니다. 입력 파일과 같은 폴더에 두고(브라우저에서는 두 파일을 모두 추가하고) 다시 시도하십시오.".into(),
         Msg::CompanionMismatch => "컴패니언 파일이 일치하지 않습니다: 제공된 ._ 페이로드가 너무 짧거나 헤더가 로더의 헤더와 다릅니다. 동일한 빌드의 컴패니언 파일을 사용하십시오. 두 파일 중 하나가 손상되었을 수 있습니다.".into(),
         Msg::InputTooShort { actual, required } => format!(
             "입력이 너무 짧습니다 (최소 {required}바이트 필요, 실제 {actual}바이트)"
@@ -110,7 +110,7 @@ pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
             "섹션 #{index} 원시 데이터 [0x{start:X}..0x{end:X}]이(가) 파일 크기 0x{file_len:X}을(를) 초과합니다"
         )
         .into(),
-        Msg::NoBaseRelocations => "네이티브 DLL에 기준 재배치 테이블이 없습니다 (DD[5]가 0임) — 기본 주소가 아닌 위치에 로드될 때 충돌합니다".into(),
+        Msg::NoBaseRelocations => "네이티브 DLL에 베이스 재배치 테이블이 없습니다 (DD[5]가 0임) — 기본 ImageBase가 아닌 주소에 로드되면 크래시합니다".into(),
         Msg::ZeroEntryPoint => "엔트리 포인트 RVA가 0입니다".into(),
         Msg::EntryUnmapped { rva } => {
             format!("엔트리 포인트 RVA 0x{rva:X}이(가) 어느 섹션에도 매핑되지 않습니다").into()
@@ -132,7 +132,7 @@ pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
         )
         .into(),
         Msg::ImportNameUnreadable { index, rva } => format!(
-            "RVA 0x{rva:X}에 있는 임포트 디스크립터 {index}의 DLL 이름이 읽을 수 있는 ASCII가 아닙니다 (임포트가 암호화된 채로 남았습니까?)"
+            "임포트 디스크립터 {index}의 DLL 이름(RVA 0x{rva:X})이 읽을 수 있는 ASCII가 아닙니다 (임포트가 복호화되지 않았을 수 있음)"
         )
         .into(),
         Msg::ClrDirectoryUnmapped { rva } => {
@@ -146,7 +146,7 @@ pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
             format!("CLR MetaData RVA 0x{rva:X}이(가) 어느 섹션에도 매핑되지 않습니다").into()
         }
         Msg::ClrMetadataNoBsjb { rva } => format!(
-            "RVA 0x{rva:X}의 CLR MetaData에 'BSJB' 서명이 없습니다 (메타데이터 손상 — 관리되는 이미지가 로드되지 않습니다)"
+            "RVA 0x{rva:X}의 CLR MetaData에 'BSJB' 서명이 없습니다 (메타데이터 손상 — 관리형 이미지가 로드되지 않습니다)"
         )
         .into(),
     }
@@ -184,7 +184,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::DllSections => "섹션 복호화 및 압축 해제 중...".into(),
         Step::FixHeaders => "PE 헤더 및 섹션 테이블 보정 중...".into(),
         Step::AndroidPrimary => "기본 0x9D 대상 이미지 컨테이너 디코딩 중...".into(),
-        Step::AndroidAuxiliary => "보조 0x9D ELF 구체화 컨테이너 디코딩 중...".into(),
+        Step::AndroidAuxiliary => "보조 0x9D ELF 재구성 컨테이너 디코딩 중...".into(),
         Step::AndroidTables => "정적 ELF 동적 링커 테이블 재구성 중...".into(),
         Step::WriteTo { dest } => format!("{dest}(으)로 기록").into(),
     }
@@ -193,20 +193,20 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
 pub(crate) fn term(term: &Term) -> Cow<'static, str> {
     match term {
         Term::Ok => "정상",
-        Term::Suspect => "의심됨",
+        Term::Suspect => "주의 필요",
         Term::Recognized => "인식됨",
         Term::NotRecognized => "인식되지 않음",
         Term::Skipped => "건너뜀",
         Term::Error => "오류",
         Term::Restored => "복원됨",
         Term::Duplicate => "중복",
-        Term::NotTarget => "비대상",
+        Term::NotTarget => "대상 아님",
         Term::Unchanged => "변경 없음",
-        Term::Inventoried => "목록화됨",
-        Term::Failed => "실패함",
+        Term::Inventoried => "목록 확인됨",
+        Term::Failed => "실패",
         Term::Blocked => "차단됨",
         Term::NotAttempted => "시도 안 함",
-        Term::Succeeded => "성공함",
+        Term::Succeeded => "성공",
         Term::Rejected => "거부됨",
         Term::Clean => "정상",
         Term::Warnings => "경고",
@@ -216,7 +216,7 @@ pub(crate) fn term(term: &Term) -> Cow<'static, str> {
         Term::Unmatched => "일치하지 않음",
         Term::Unreadable => "읽을 수 없음",
         Term::Detection => "탐지",
-        Term::ManifestInventory => "매니페스트 목록화",
+        Term::ManifestInventory => "매니페스트 목록 확인",
         Term::EntryProbe => "항목 프로브",
         Term::Recovery => "복원",
         Term::StaticValidation => "정적 검증",
@@ -267,7 +267,7 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
             suspect,
             metadata,
         } => format!(
-            "언패킹 {unpacked} · 건너뜀 {skipped} · 오류 {errors} · 의심됨 {suspect} · 메타데이터 {metadata}"
+            "언패킹 {unpacked} · 건너뜀 {skipped} · 오류 {errors} · 주의 필요 {suspect} · 메타데이터 {metadata}"
         )
         .into(),
         Cli::SummaryPackages { packages } => format!(" · 패키지 {packages}").into(),
@@ -301,12 +301,12 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
             format!("'{subcommand}'에는 입력 경로가 필요합니다").into()
         }
         Cli::InspectNoDryRun => {
-            "'inspect'는 아무것도 기록하지 않습니다. --dry-run을 제거하십시오".into()
+            "'inspect'는 출력 파일을 저장하지 않으므로 --dry-run은 불필요합니다".into()
         }
         Cli::InspectNoOut => {
-            "'inspect'는 아무것도 기록하지 않습니다. --out은 허용되지 않습니다".into()
+            "'inspect'는 출력 파일을 저장하지 않으므로 --out을 사용할 수 없습니다".into()
         }
-        Cli::DryRunNoOut => "--dry-run은 출력을 기록하지 않습니다. --out은 허용되지 않습니다".into(),
+        Cli::DryRunNoOut => "--dry-run은 출력 파일을 저장하지 않으므로 --out을 사용할 수 없습니다".into(),
         Cli::ColorRequiresMode => "--color에는 auto, always 또는 never가 필요합니다".into(),
         Cli::ThreadsRequiresInteger => "--threads에는 양의 정수 인수가 필요합니다".into(),
         Cli::LimitRequiresInteger { flag } => {
@@ -349,16 +349,16 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              always/never는 이 변수들보다 우선합니다. JSON 및 저장된 로그는\n\
              \x20              일반 텍스트로 유지됩니다."
             .into(),
-        Cli::HelpScanAll => "  --scan-all   최소 크기 기준 미만인 지정된 .exe/.dll/.so/메타데이터 이름을\n\
+        Cli::HelpScanAll => "  --scan-all   최소 크기 기준 미만인 대상 파일(.exe/.dll/.so/메타데이터)도\n\
              \x20              프로브합니다. 다른 파일 이름은 계속 제외됩니다."
             .into(),
         Cli::HelpStrictIntegrity => "  --strict-integrity\n\
-             \x20              출력이 정적 무결성 검사에 실패하거나 (의심됨) 파일에 오류가\n\
+             \x20              출력이 정적 무결성 검사에 실패하거나 (주의 필요) 파일에 오류가\n\
              \x20              발생하면 0이 아닌 코드로 종료합니다. 기본값은 해제 상태이며,\n\
-             \x20              의심됨 항목도 파일로 기록되고 파일 오류가 없는 한 프로세스는\n\
+             \x20              주의 필요 항목도 파일로 저장되고 파일 오류가 없는 한 프로세스는\n\
              \x20              0으로 종료합니다. quiet 수준은 변경되지 않습니다.\n\
-             \x20              'inspect'와 함께 사용하면 연구를 위해 실제로 복원된 이미지에\n\
-             \x20              검사가 적용되며 출력 파일은 유지되지 않습니다."
+             \x20              'inspect'와 함께 사용하면 분석을 위해 실제로 복원된 이미지에\n\
+             \x20              검사가 적용되며 출력 파일은 저장되지 않습니다."
             .into(),
         Cli::HelpLimits {
             entry_mib,
@@ -378,15 +378,15 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              시스템 언어를 사용합니다. JSON 및 저장된 로그는 영어로\n\
              \x20              유지됩니다."
             .into(),
-        Cli::HelpExitCodes => "  종료 코드: 0 성공, 1 대상 실패 (--strict-integrity 사용 시 의심됨 포함),\n\
-             \x20 2 명령줄이 거부됨."
+        Cli::HelpExitCodes => "  종료 코드: 0 성공, 1 대상 실패 (--strict-integrity 사용 시 주의 필요 포함),\n\
+             \x20 2 명령줄 인수가 거부됨."
             .into(),
         Cli::ReportScanHeading => "스캔".into(),
         Cli::ReportScan {
             skipped,
             walk_errors,
             probe_errors,
-        } => format!("프로브한 비대상 {skipped} · 탐색 오류 {walk_errors} · 프로브 오류 {probe_errors}").into(),
+        } => format!("비대상 (프로브됨) {skipped} · 탐색 오류 {walk_errors} · 프로브 오류 {probe_errors}").into(),
         Cli::ReportScanIncomplete => {
             "분석이 불완전합니다: 일부 디렉터리 항목 또는 선택한 파일을 조사할 수 없었습니다".into()
         }

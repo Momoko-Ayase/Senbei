@@ -670,7 +670,10 @@ impl Workbench {
             self.view.select(Sel::Item(*first));
         }
         if !identify.is_empty() {
-            self.backend.send(Request::Identify(identify));
+            self.backend.send(Request::Identify {
+                items: identify,
+                limits: self.settings.limits(),
+            });
         }
     }
 
@@ -1724,4 +1727,75 @@ fn finish_log(log: &mut Vec<LogLine>, report: &InputReport, at: &str) {
             duration: report.duration_ms,
         },
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    struct RecordingBackend(Rc<RefCell<Vec<Request>>>);
+
+    impl Backend for RecordingBackend {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                folders: true,
+                unpack: true,
+                reveal: true,
+            }
+        }
+
+        fn send(&self, request: Request) {
+            self.0.borrow_mut().push(request);
+        }
+
+        fn poll(&self) -> Option<Event> {
+            None
+        }
+    }
+
+    #[test]
+    fn file_identification_uses_current_resource_limits() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let settings = Settings {
+            max_entry_mib: 1,
+            max_total_mib: 3,
+            max_entries: 7,
+            max_depth: 2,
+            ..Settings::default()
+        };
+        let mut workbench = Workbench::new(
+            Box::new(RecordingBackend(requests.clone())),
+            settings,
+            Lang::En,
+            None,
+            Vec::new(),
+            None,
+        );
+        let first = PathBuf::from("identification-limit-first.apk");
+        let first_limits = workbench.settings.limits();
+        workbench.add_paths(vec![first.clone()]);
+
+        workbench.settings.max_entry_mib = 5;
+        workbench.settings.max_entries = 11;
+        let second = PathBuf::from("identification-limit-second.apk");
+        let second_limits = workbench.settings.limits();
+        workbench.add_paths(vec![second.clone()]);
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        for (request, path, expected_limits) in [
+            (&requests[0], first, first_limits),
+            (&requests[1], second, second_limits),
+        ] {
+            let Request::Identify { items, limits } = request else {
+                panic!("expected an identification request");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].1, path);
+            assert_eq!(*limits, expected_limits);
+        }
+    }
 }

@@ -82,7 +82,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::RebuildHeaders => "Reconstructing PE headers...".into(),
         Step::Pe32LocateConfig => "Locating config layout (PE32)...".into(),
         Step::Pe32Stages => "Decrypting stages (PE32)...".into(),
-        Step::Pe32EighthStage => "Decrypting eighthStage (PE32)...".into(),
+        Step::Pe32EighthStage => "Decrypting stage 8 (PE32)...".into(),
         Step::Pe32Load => "Loading and decompressing file data (PE32)...".into(),
         Step::Pe32Text { formula } => {
             format!("Decrypting .text (PE32 dd8, formula={formula})...").into()
@@ -189,9 +189,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::UnknownOption { option } => format!("unknown option '{option}'").into(),
         Cli::MultipleInputs { first, second } => format!("multiple input paths given ('{first}' and '{second}')").into(),
         Cli::SubcommandNeedsPath { subcommand } => format!("'{subcommand}' requires an input path").into(),
-        Cli::InspectNoDryRun => "'inspect' writes nothing; drop --dry-run".into(),
-        Cli::InspectNoOut => "'inspect' writes nothing; --out is not allowed".into(),
-        Cli::DryRunNoOut => "--dry-run writes no output; --out is not allowed".into(),
+        Cli::InspectNoDryRun => "'inspect' does not save output files; omit --dry-run".into(),
+        Cli::InspectNoOut => "'inspect' does not save output files; --out is not allowed".into(),
+        Cli::DryRunNoOut => "--dry-run does not save output files; --out is not allowed".into(),
         Cli::ColorRequiresMode => "--color requires auto, always, or never".into(),
         Cli::ThreadsRequiresInteger => "--threads requires a positive integer argument".into(),
         Cli::LimitRequiresInteger { flag } => format!("{flag} requires an unsigned integer argument").into(),
@@ -205,21 +205,20 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              these. The bare form is the same as 'unpack'."
             .into(),
         Cli::HelpInspect => "  inspect PATH\n\
-             \x20              run the real static recovery for research, and report\n\
-             \x20              everything observed: recognition evidence, each route\n\
-             \x20              tried and why it was rejected, the route selected, the\n\
-             \x20              static check's verdict, and the engines' own structural\n\
-             \x20              evidence (protected-header fields, seeds, module records,\n\
-             \x20              restored-image facts). Nothing is kept: no output file,\n\
-             \x20              no log, no temporary tree, and the input is never run."
+             \x20              run static recovery for research and report all collected\n\
+             \x20              evidence: recognition evidence, candidate routes tried and\n\
+             \x20              rejection reasons, the selected route, static validation\n\
+             \x20              verdict, and structural evidence (protected-header fields,\n\
+             \x20              seeds, module records, and restored-image details). Saves\n\
+             \x20              no output files or logs, removes temporary workspaces,\n\
+             \x20              and never executes the input."
             .into(),
         Cli::HelpUnpack => "  unpack PATH  detection and recovery; writes outputs (the default).".into(),
         Cli::HelpJson => "  --json       write one versioned machine-readable report to stdout and\n\
              \x20              nothing else. Implies quiet and --no-log."
             .into(),
-        Cli::HelpDryRun => "  --dry-run    run the real recovery but keep nothing: no output tree and\n\
-             \x20              no log. Android extraction still uses its own temporary\n\
-             \x20              workspace, which is discarded."
+        Cli::HelpDryRun => "  --dry-run    run recovery without saving output files or logs.\n\
+             \x20              Temporary extraction workspaces are removed after the run."
             .into(),
         Cli::HelpThreads => "  --threads N  positive worker cap for this run. Overrides SENBEI_THREADS;\n\
              \x20              1 selects the sequential path. The environment is unchanged."
@@ -233,12 +232,12 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              size floor; other filenames remain excluded."
             .into(),
         Cli::HelpStrictIntegrity => "  --strict-integrity\n\
-             \x20              exit non-zero when any output fails the static integrity\n\
-             \x20              check (a suspect) or a file errors. Off by default: a\n\
-             \x20              suspect is still written and the process exits 0 unless\n\
-             \x20              a file errors. Quiet levels are unchanged.\n\
-             \x20              With 'inspect', the check applies to the image actually\n\
-             \x20              recovered for research; no output file is retained."
+             \x20              exit non-zero when any output fails static validation\n\
+             \x20              (suspect) or a file errors. Off by default: suspect files\n\
+             \x20              are still written and the process exits 0 unless a file\n\
+             \x20              errors. Quiet levels are unchanged.\n\
+             \x20              With 'inspect', the check applies to the recovered image;\n\
+             \x20              no output file is saved."
             .into(),
         Cli::HelpLimits { entry_mib, total_mib, entries, depth } => format!(
             "  Android resource limits (MiB = 1048576 bytes):\n\

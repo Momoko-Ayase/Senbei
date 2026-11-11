@@ -59,13 +59,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: senbei.exe
+            gui_bin: senbei-gui.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: senbei
+            gui_bin: senbei-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked -p senbei-cli -p senbei-gui
       - name: Package senbei-<version>-<target>
         shell: bash
         run: |
@@ -74,7 +76,9 @@ jobs:
           name="senbei-$version-${{ matrix.target }}"
           mkdir -p "stage/$name"
           cp "target/release/${{ matrix.bin }}" "stage/$name/"
-          cp LICENSE "stage/$name/"
+          cp "target/release/${{ matrix.gui_bin }}" "stage/$name/"
+          cp LICENSE README.md "stage/$name/"
+          cp senbei-gui/assets/fonts/OFL.txt "stage/$name/ASUL-OFL.txt"
           awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
             README.md > "stage/$name/LEGAL-NOTICE.md"
           echo "package=$name" >> "$GITHUB_ENV"
@@ -85,6 +89,7 @@ jobs:
         with:
           name: ${{ env.package }}
           path: stage/
+          if-no-files-found: error
           retention-days: 14
 
   web:

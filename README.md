@@ -15,6 +15,14 @@ senbei "C:\Games\MyGame"
 
 Outputs are written below an `unpack` directory unless `--out` is supplied.
 
+Launch the native desktop app:
+
+```cmd
+cargo run --release -p senbei-gui
+```
+
+The native release workflow packages the CLI and desktop app together for Windows and Linux. The desktop app supports files and folders, Android libraries and app packages, inspection, hex views, and report export.
+
 Full documentation: <https://xn--ri8h.gitbook.io/crackproof-research/senbei>
 
 ## Legal notice and intended use

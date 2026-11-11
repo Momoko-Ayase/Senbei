@@ -168,7 +168,10 @@ pub enum Pick {
 /// What the window asks of the backend.
 #[derive(Debug, Clone)]
 pub enum Request {
-    Identify(Vec<(ItemId, PathBuf)>),
+    Identify {
+        items: Vec<(ItemId, PathBuf)>,
+        limits: ResourceLimits,
+    },
     Scan {
         group: GroupId,
         root: PathBuf,

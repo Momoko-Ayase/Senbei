@@ -6,7 +6,7 @@ use crate::{Cli, Msg, Step, Term};
 
 pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
     match msg {
-        Msg::CompanionMissing => "缺少伴生文件？此加载器需要匹配的 <input>._ 载荷。请将其放在输入文件旁并重试。".into(),
+        Msg::CompanionMissing => "缺少伴生文件：此加载器需要匹配的 <input>._ 载荷。请将它放在输入文件所在的文件夹中，然后重试。浏览器版需同时添加这两个文件。".into(),
         Msg::CompanionMismatch => "伴生文件不匹配：提供的 ._ 载荷过短，或其头部与加载器不一致。请使用来自同一构建版本的伴生文件；其中任一文件都可能已损坏。".into(),
         Msg::InputTooShort { actual, required } => format!("输入过短（至少需要 {required} 字节，实际为 {actual} 字节）").into(),
         Msg::NotProtected => "不是受 CrackProof 保护的文件".into(),
@@ -81,7 +81,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::RebuildHeaders => "正在重建 PE 头部...".into(),
         Step::Pe32LocateConfig => "正在定位配置布局 (PE32)...".into(),
         Step::Pe32Stages => "正在解密各阶段 (PE32)...".into(),
-        Step::Pe32EighthStage => "正在解密 eighthStage (PE32)...".into(),
+        Step::Pe32EighthStage => "正在解密第八阶段 (PE32)...".into(),
         Step::Pe32Load => "正在加载并解压文件数据 (PE32)...".into(),
         Step::Pe32Text { formula } => {
             format!("正在解密 .text (PE32 dd8, formula={formula})...").into()
@@ -99,7 +99,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::DllSections => "正在解密并解压各节...".into(),
         Step::FixHeaders => "正在修正 PE 头部与节表...".into(),
         Step::AndroidPrimary => "正在解码主 0x9D 目标映像容器...".into(),
-        Step::AndroidAuxiliary => "正在解码辅助 0x9D ELF 物化容器...".into(),
+        Step::AndroidAuxiliary => "正在解码辅助 0x9D ELF 容器...".into(),
         Step::AndroidTables => "正在重建静态 ELF 动态链接器表...".into(),
         Step::WriteTo { dest } => format!("写入 {dest}").into(),
     }
@@ -123,7 +123,7 @@ pub(crate) fn term(term: &Term) -> Cow<'static, str> {
         Term::NotAttempted => "未尝试",
         Term::Succeeded => "成功",
         Term::Rejected => "已拒绝",
-        Term::Clean => "干净",
+        Term::Clean => "通过",
         Term::Warnings => "警告",
         Term::NotRun => "未运行",
         Term::Absent => "无",
@@ -188,9 +188,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::UnknownOption { option } => format!("未知选项 '{option}'").into(),
         Cli::MultipleInputs { first, second } => format!("指定了多个输入路径（'{first}' 与 '{second}'）").into(),
         Cli::SubcommandNeedsPath { subcommand } => format!("'{subcommand}' 需要输入路径").into(),
-        Cli::InspectNoDryRun => "'inspect' 不写出任何内容；请移除 --dry-run".into(),
-        Cli::InspectNoOut => "'inspect' 不写出任何内容；不允许使用 --out".into(),
-        Cli::DryRunNoOut => "--dry-run 不写出输出；不允许使用 --out".into(),
+        Cli::InspectNoDryRun => "'inspect' 不保存输出文件；无需指定 --dry-run".into(),
+        Cli::InspectNoOut => "'inspect' 不保存输出文件；不能与 --out 同时使用".into(),
+        Cli::DryRunNoOut => "--dry-run 不保存输出文件；不能与 --out 同时使用".into(),
         Cli::ColorRequiresMode => "--color 需要 auto、always 或 never".into(),
         Cli::ThreadsRequiresInteger => "--threads 需要正整数参数".into(),
         Cli::LimitRequiresInteger { flag } => format!("{flag} 需要无符号整数参数").into(),
@@ -204,20 +204,18 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              文件夹。省略子命令时等同于 'unpack'。"
             .into(),
         Cli::HelpInspect => "  inspect PATH\n\
-             \x20              执行实际的静态恢复以供研究，并报告观察到的全部内容：\n\
-             \x20              识别依据、尝试过的每条路线及其被拒绝的原因、最终选用的\n\
-             \x20              路线、静态检查的结论，以及各引擎自身的结构化依据（保护\n\
-             \x20              头部字段、种子、模块记录、恢复映像信息）。不保留任何\n\
-             \x20              内容：不写输出文件、不写日志、不留临时目录，且绝不执行\n\
-             \x20              输入项。"
+             \x20              执行完整的静态恢复并输出详细分析报告：识别依据、尝试过\n\
+             \x20              的各恢复方案及排除原因、最终选用的方案、静态验证结论，\n\
+             \x20              以及保护头部字段、种子、模块记录与恢复映像结构数据。\n\
+             \x20              不保存恢复后的输出文件或日志，自动清理临时目录，且绝不\n\
+             \x20              执行输入文件。"
             .into(),
         Cli::HelpUnpack => "  unpack PATH  检测并恢复；写出输出（默认）。".into(),
         Cli::HelpJson => "  --json       向标准输出写出单份带版本号的机器可读报告，不输出其他\n\
              \x20              内容。隐含静默模式与 --no-log。"
             .into(),
-        Cli::HelpDryRun => "  --dry-run    执行实际的恢复但不保留任何内容：不写输出目录，也不写\n\
-             \x20              日志。Android 提取仍会使用其自身的临时工作区，随后即被\n\
-             \x20              丢弃。"
+        Cli::HelpDryRun => "  --dry-run    执行完整的恢复流程，但不保存输出文件与日志。Android 提取\n\
+             \x20              期间使用的临时工作区会在完成后自动清理。"
             .into(),
         Cli::HelpThreads => "  --threads N  本次运行的工作线程数上限（正整数）。覆盖 SENBEI_THREADS；\n\
              \x20              设为 1 则使用顺序执行路径。环境变量保持不变。"
@@ -264,14 +262,14 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::KindUnavailable => "种类不适用或不可用".into(),
         Cli::ProtectionRecognition { status } => format!("保护识别: {status}").into(),
         Cli::Evidence { evidence } => format!("依据: {evidence}").into(),
-        Cli::Route { route, outcome } => format!("路线 {route}: {outcome}").into(),
-        Cli::SelectedRoute { route } => format!("已选用路线: {route}").into(),
+        Cli::Route { route, outcome } => format!("方案 {route}: {outcome}").into(),
+        Cli::SelectedRoute { route } => format!("已选用方案: {route}").into(),
         Cli::StaticRecovery { status } => format!("静态恢复: {status}").into(),
         Cli::OutputValidation { status } => format!("输出静态验证: {status}").into(),
         Cli::Companion { state } => format!("伴生文件: {state}").into(),
         Cli::CompanionIdentity { size, sha256 } => format!("{size} 字节 · SHA-256 {sha256}").into(),
         Cli::InputView { view } => format!("分析输入视图: {view}").into(),
-        Cli::InputViewSplicedNote => "低于 0x1000 的文件偏移针对存根寻址；自 0x1000 起的偏移针对伴生文件偏移（文件偏移 - 0x1000）寻址".into(),
+        Cli::InputViewSplicedNote => "小于 0x1000 的文件偏移对应加载器存根；0x1000 及以上的偏移对应伴生文件中的 (文件偏移 - 0x1000)".into(),
         Cli::MetadataIdentity { version, layout } => format!("IL2CPP 元数据版本: {version} · 布局定义 {layout}").into(),
         Cli::SeededTokens { value } => format!("基于种子的方法令牌: {}", yes_no(*value)).into(),
         Cli::StructuralTokens { value } => format!("结构化方法令牌: {}", yes_no(*value)).into(),
@@ -282,7 +280,7 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::Candidate { entry } => format!("候选: {entry}").into(),
         Cli::MetadataEvidence => "元数据变换依据".into(),
         Cli::Entry { name, status } => format!("条目 {name}: {status}").into(),
-        Cli::EntryRoute { route } => format!("路线: {route}").into(),
+        Cli::EntryRoute { route } => format!("方案: {route}").into(),
         Cli::EntryMetadataVersion { version } => format!("元数据版本: {version}").into(),
         Cli::EntryRemapped { remapped } => format!("已重映射方法字段: {remapped}").into(),
         Cli::ModuleContextSource { source } => format!("模块上下文来源: {source}").into(),

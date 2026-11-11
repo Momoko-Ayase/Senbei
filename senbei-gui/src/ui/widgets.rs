@@ -194,18 +194,15 @@ pub fn chip(ui: &mut Ui, label: &str, count: usize, on: bool) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A filled amber button for the main action.
+/// A filled amber button for the main action. Like egui's own buttons, it
+/// fills the width of a justified layout.
 pub fn primary_button(ui: &mut Ui, text: impl Into<String>, enabled: bool) -> Response {
     let text = text.into();
-    let font = theme::strong(13.5);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.clone(), font, theme::ACCENT_INK);
-    let padding = ui.spacing().button_padding;
-    let size = vec2(
-        galley.size().x + 2.0 * padding.x,
-        (galley.size().y + 2.0 * padding.y).max(ui.spacing().interact_size.y),
-    );
+    let galley = primary_galley(ui, &text);
+    let mut size = primary_size(ui, &galley);
+    if ui.layout().horizontal_justify() {
+        size.x = size.x.max(ui.available_width());
+    }
     let sense = if enabled {
         Sense::click()
     } else {
@@ -238,6 +235,24 @@ pub fn primary_button(ui: &mut Ui, text: impl Into<String>, enabled: bool) -> Re
     } else {
         response
     }
+}
+
+/// The width `primary_button` needs for `text` outside a justified layout.
+pub fn primary_button_width(ui: &Ui, text: &str) -> f32 {
+    primary_size(ui, &primary_galley(ui, text)).x
+}
+
+fn primary_galley(ui: &Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), theme::strong(13.5), theme::ACCENT_INK)
+}
+
+fn primary_size(ui: &Ui, galley: &egui::Galley) -> Vec2 {
+    let padding = ui.spacing().button_padding;
+    vec2(
+        galley.size().x + 2.0 * padding.x,
+        (galley.size().y + 2.0 * padding.y).max(ui.spacing().interact_size.y),
+    )
 }
 
 /// A frameless button that shows its frame on hover.

@@ -3045,7 +3045,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "senbei-cli"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "senbei-engine",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-crypto"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "aes",
  "thiserror 2.0.21",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-elf"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "goblin",
  "thiserror 2.0.21",
@@ -3076,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-engine"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "memmap2",
  "senbei-crypto",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-gui"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -3109,11 +3109,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
 name = "senbei-i18n"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3121,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-io"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "indicatif",
@@ -3145,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-metadata"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3154,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-pe"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "thiserror 2.0.21",
 ]

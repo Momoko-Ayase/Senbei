@@ -121,8 +121,7 @@ fn dispatch(incoming: Receiver<Request>, sink: Sink) {
                     current.cancel();
                 }
             }
-            Request::Identify(items) => spawn("senbei-identify", move || {
-                let limits = ResourceLimits::default();
+            Request::Identify { items, limits } => spawn("senbei-identify", move || {
                 for (id, path) in items {
                     sink.send(Event::Identified(id, Box::new(identify(&path, &limits))));
                 }
@@ -704,5 +703,74 @@ impl SystemFonts {
             strong: self.faces(&ui, fontique::FontWeight::SEMI_BOLD),
             mono: self.faces(&mono, fontique::FontWeight::NORMAL),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use zip::write::SimpleFileOptions;
+
+    use super::*;
+
+    #[test]
+    fn package_identification_honors_requested_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.apk");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("AndroidManifest.xml", options).unwrap();
+        archive
+            .write_all(br#"<manifest package="example.test" />"#)
+            .unwrap();
+        archive
+            .start_file("lib/arm64-v8a/libexample.so", options)
+            .unwrap();
+        archive.write_all(b"library").unwrap();
+        archive.finish().unwrap();
+
+        let backend = NativeBackend::new(egui::Context::default());
+        let receive = |id| {
+            let event = backend
+                .events
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("identification must finish");
+            let Event::Identified(actual, identity) = event else {
+                panic!("expected an identification result");
+            };
+            assert_eq!(actual, id);
+            let Identity::Package { container, .. } = *identity else {
+                panic!("expected an Android package");
+            };
+            container
+        };
+        backend.send(Request::Identify {
+            items: vec![(1, path.clone())],
+            limits: ResourceLimits {
+                max_entries: 1,
+                ..ResourceLimits::default()
+            },
+        });
+        let error = receive(1).expect_err("two entries must exceed the one-entry limit");
+        let expected = Message::new(Msg::LimitEntries {
+            requested: 2,
+            limit: 1,
+        });
+        assert!(error.contains(expected.text()), "{error}");
+
+        backend.send(Request::Identify {
+            items: vec![(2, path)],
+            limits: ResourceLimits {
+                max_entries: 2,
+                ..ResourceLimits::default()
+            },
+        });
+        let report = receive(2).expect("raising the entry limit must allow identification");
+        assert_eq!(report.candidate_entries.len(), 1);
     }
 }

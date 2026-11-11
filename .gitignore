@@ -152,6 +152,9 @@ target/
 /samples/*
 !/samples/README.md
 
+### senbei native release staging ###
+/stage/
+
 ### senbei web build ###
 # The wasm crate builds out-of-workspace in senbei-wasm/ and wasm-pack emits
 # the JS/wasm package into web/pkg/ for the static frontend.

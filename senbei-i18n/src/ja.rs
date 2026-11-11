@@ -6,7 +6,7 @@ use crate::{Cli, Msg, Step, Term};
 
 pub(crate) fn msg(msg: &Msg) -> Cow<'static, str> {
     match msg {
-        Msg::CompanionMissing => "コンパニオンが見つからない可能性があります。このローダーには対応する<input>._ペイロードが必要です。入力ファイルの隣に配置して再試行してください。".into(),
+        Msg::CompanionMissing => "コンパニオンファイルが見つかりません。このローダーには対応する<input>._ペイロードが必要です。入力ファイルと同じフォルダーに配置（ブラウザ版では両方のファイルを追加）して再試行してください。".into(),
         Msg::CompanionMismatch => "コンパニオンが一致しません。指定された._ペイロードが短すぎるか、ヘッダーがローダーと異なります。同じビルドのコンパニオンを使用してください (いずれかのファイルが破損している可能性があります)。".into(),
         Msg::InputTooShort { actual, required } => format!("入力が短すぎます (最低{required}バイト必要ですが、{actual}バイトです)").into(),
         Msg::NotProtected => "CrackProofで保護されたファイルではありません".into(),
@@ -99,7 +99,7 @@ pub(crate) fn step(step: &Step) -> Cow<'static, str> {
         Step::DllSections => "セクションを復号・展開中...".into(),
         Step::FixHeaders => "PEヘッダーとセクションテーブルを修正中...".into(),
         Step::AndroidPrimary => "プライマリ0x9D対象イメージコンテナーをデコード中...".into(),
-        Step::AndroidAuxiliary => "補助0x9D ELF実体化コンテナーをデコード中...".into(),
+        Step::AndroidAuxiliary => "補助0x9D ELF再構築用コンテナーをデコード中...".into(),
         Step::AndroidTables => "静的ELF動的リンカーテーブルを再構築中...".into(),
         Step::WriteTo { dest } => format!("{dest}に書き込み").into(),
     }
@@ -188,9 +188,9 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
         Cli::UnknownOption { option } => format!("不明なオプション '{option}'").into(),
         Cli::MultipleInputs { first, second } => format!("複数の入力パスが指定されています ('{first}' と '{second}')").into(),
         Cli::SubcommandNeedsPath { subcommand } => format!("'{subcommand}' には入力パスが必要です").into(),
-        Cli::InspectNoDryRun => "'inspect' は何も書き込まないため、--dry-runは不要です".into(),
-        Cli::InspectNoOut => "'inspect' は何も書き込まないため、--outは指定できません".into(),
-        Cli::DryRunNoOut => "--dry-runは何も出力しないため、--outは指定できません".into(),
+        Cli::InspectNoDryRun => "'inspect' は出力ファイルを保存しないため、--dry-runは不要です".into(),
+        Cli::InspectNoOut => "'inspect' は出力ファイルを保存しないため、--outは指定できません".into(),
+        Cli::DryRunNoOut => "--dry-runは出力ファイルを保存しないため、--outは指定できません".into(),
         Cli::ColorRequiresMode => "--colorにはauto、always、またはneverが必要です".into(),
         Cli::ThreadsRequiresInteger => "--threadsには正の整数引数が必要です".into(),
         Cli::LimitRequiresInteger { flag } => format!("{flag}には符号なし整数引数が必要です").into(),
@@ -228,7 +228,7 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20              always/neverはこれらの変数を上書きします。JSONと保存される\n\
              \x20              ログは常にプレーンテキストのままです。"
             .into(),
-        Cli::HelpScanAll => "  --scan-all   サイズ下限未満の対象名 (.exe/.dll/.so/メタデータ) も\n\
+        Cli::HelpScanAll => "  --scan-all   最小サイズ未満の対象ファイル (.exe/.dll/.so/メタデータ) も\n\
              \x20              プローブします。それ以外のファイル名は引き続き除外されます。"
             .into(),
         Cli::HelpStrictIntegrity => "  --strict-integrity\n\
@@ -255,7 +255,7 @@ pub(crate) fn cli(cli: &Cli) -> Cow<'static, str> {
              \x20 2 コマンドライン引数の却下。"
             .into(),
         Cli::ReportScanHeading => "スキャン".into(),
-        Cli::ReportScan { skipped, walk_errors, probe_errors } => format!("プローブした対象外 {skipped} · 走査エラー {walk_errors} · プローブエラー {probe_errors}").into(),
+        Cli::ReportScan { skipped, walk_errors, probe_errors } => format!("対象外 (プローブ済み) {skipped} · 走査エラー {walk_errors} · プローブエラー {probe_errors}").into(),
         Cli::ReportScanIncomplete => "解析が不完全です。一部のディレクトリ項目または選択したファイルを調査できませんでした".into(),
         Cli::AnalysisIncomplete => "解析不完全".into(),
         Cli::AnalysisIncompleteInput => "I/O、リソース上限、または基盤の問題により要求された処理を完了できませんでした".into(),

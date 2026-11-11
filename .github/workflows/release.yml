@@ -1,9 +1,9 @@
 name: Release
 
 # Publishing a GitHub release:
-#  - cli-assets builds the Windows and Linux CLI binaries and attaches
-#    senbei-<version>-<target>.zip (binary + LICENSE + the legal
-#    notice extracted from README.md) to the release.
+#  - cli-assets builds the Windows and Linux CLI and desktop GUI and attaches
+#    senbei-<version>-<target>.zip (both binaries, README, LICENSE, the Asul
+#    font license, and the legal notice extracted from README.md).
 #  - deploy-web rebuilds the browser app and pushes it to Cloudflare Pages
 #    (https://senbei.pages.dev). Requires two repository secrets:
 #    CLOUDFLARE_API_TOKEN (Pages:Edit) and CLOUDFLARE_ACCOUNT_ID. The Pages
@@ -27,13 +27,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: senbei.exe
+            gui_bin: senbei-gui.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: senbei
+            gui_bin: senbei-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked -p senbei-cli -p senbei-gui
       - name: Package senbei-<version>-<target>
         shell: bash
         run: |
@@ -42,7 +44,9 @@ jobs:
           name="senbei-$version-${{ matrix.target }}"
           mkdir -p "stage/$name"
           cp "target/release/${{ matrix.bin }}" "stage/$name/"
-          cp LICENSE "stage/$name/"
+          cp "target/release/${{ matrix.gui_bin }}" "stage/$name/"
+          cp LICENSE README.md "stage/$name/"
+          cp senbei-gui/assets/fonts/OFL.txt "stage/$name/ASUL-OFL.txt"
           awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
             README.md > "stage/$name/LEGAL-NOTICE.md"
           # Release assets are served as-is (unlike CI artifacts, which the

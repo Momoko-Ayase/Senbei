@@ -764,6 +764,13 @@ fn next_actions(
             false,
         ),
     ];
+    // The buttons share one column, at least 110 points and as wide as the
+    // widest label needs, so all three line up in every language. Measuring in
+    // the primary button's semibold font also covers the regular ones.
+    let column = choices
+        .iter()
+        .map(|(_, label, ..)| widgets::primary_button_width(ui, &t(label.clone())))
+        .fold(110.0, f32::max);
     for (index, (mode, label, desc, primary)) in choices.into_iter().enumerate() {
         if index > 0 {
             widgets::rule(ui);
@@ -774,15 +781,15 @@ fn next_actions(
             let enabled = !not_protected && (mode != Mode::Unpack || can_unpack);
             let clicked = ui
                 .allocate_ui_with_layout(
-                    vec2(110.0, 24.0),
-                    Layout::top_down_justified(Align::Min),
+                    vec2(column, 24.0),
+                    Layout::top_down_justified(Align::Center),
                     |ui| {
                         if primary {
                             widgets::primary_button(ui, t(label), enabled).clicked()
                         } else {
                             ui.add_enabled(
                                 enabled,
-                                egui::Button::new(t(label)).min_size(vec2(110.0, 24.0)),
+                                egui::Button::new(t(label)).min_size(vec2(column, 24.0)),
                             )
                             .clicked()
                         }

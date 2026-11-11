@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-crypto"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "aes",
  "thiserror",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-elf"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "goblin",
  "thiserror",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-engine"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "memmap2",
  "senbei-crypto",
@@ -464,14 +464,14 @@ dependencies = [
 
 [[package]]
 name = "senbei-i18n"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "senbei-io"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "indicatif",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "senbei-metadata"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -503,14 +503,14 @@ dependencies = [
 
 [[package]]
 name = "senbei-pe"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "senbei-wasm"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "console_error_panic_hook",
  "senbei-engine",
