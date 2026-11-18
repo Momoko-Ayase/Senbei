@@ -141,12 +141,10 @@ pub fn select_dd8_formula_pe32(data: &[u8], text_off: u32, text_size: u32) -> Op
 // bare 0xCC count, which a wrong candidate inflates for free (~255 coincidences
 // per page at p=1/256).
 //
-// When no candidate produces any RET-anchored padding (sampled pages with
-// dense code and no padded epilogues), the fingerprint is silent, so the
-// decision falls back to the older mutated-position 0xCC count. Both signals
-// use the same decision rule: a candidate must beat the no-dd8 baseline by a
-// clear margin AND an absolute floor, otherwise dd8 is skipped — a wrongly
-// applied dd8 scrambles ~1 byte per 16 with no error surfaced downstream.
+// When none of the sampled pages contains RET-anchored padding under any
+// candidate, score the complete .text pages for each candidate. The fallback
+// requires at least twice the no-dd8 padding score and an absolute floor;
+// with no evidence, skip dd8 rather than risking silent .text corruption.
 // ---------------------------------------------------------------------------
 pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, info3: u32) -> u32 {
     if let Some((shift, scores)) = select_dd8_by_entry_stub(data, text_va, text_size, info3) {
@@ -194,27 +192,7 @@ pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, info3: u32) -
     }
 
     let abs_base = text_va >> 12;
-    // Require a clear 2x margin over the already-plaintext baseline AND an
-    // absolute floor. The 2x test alone trips on noise when the counts are
-    // tiny: an external-companion DLL whose .text is already plaintext scores
-    // s15=4 vs none=1 — a spurious 4x — and gets dd8 wrongly applied,
-    // corrupting ~1 byte per 16. The floor rejects that noise while sitting
-    // far below every genuinely-encrypted build's score.
-    const MIN_DD8_HITS: u32 = 8;
-    let margin_pick = |none: u32, s0: u32, s15: u32| -> u32 {
-        let mut best_score = none;
-        let mut best_shift = 99u32; // 99 == skip dd8
-        for (shift, hits) in [(0u32, s0), (15u32, s15)] {
-            if hits > best_score {
-                best_score = hits;
-                best_shift = shift;
-            }
-        }
-        if best_shift != 99 && (best_score < none * 2 || best_score < MIN_DD8_HITS) {
-            best_shift = 99;
-        }
-        best_shift
-    };
+    const MIN_DD8_PADDING_BYTES: u32 = 8;
 
     // Primary: RET+int3 padding fingerprint. The fingerprint is diluted across
     // the whole page (dd8 touches only 255 of 4096 bytes, so even an encrypted
@@ -223,16 +201,17 @@ pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, info3: u32) -
     // already-plaintext .text each wrong shift destroys runs (scores below the
     // baseline), while the correct shift on an encrypted page restores them
     // (scores above it). The floor on the delta rejects noise-level gains.
-    let r_none = fingerprint_score(data, text_off, abs_base, &sample_pages, None);
-    let r0 = fingerprint_score(data, text_off, abs_base, &sample_pages, Some(0));
-    let r15 = fingerprint_score(data, text_off, abs_base, &sample_pages, Some(15));
-    // Fallback: mutated-position 0xCC count, for pages whose code has no
-    // RET-anchored padding at all (the fingerprint is silent there).
-    let (none_hits, s0, s15);
+    let [r_none, r0, r15] = [None, Some(0), Some(15)].map(|shift| {
+        fingerprint_score(
+            data,
+            text_off,
+            abs_base,
+            sample_pages.iter().copied(),
+            shift,
+        )
+    });
+    let mut fallback = None;
     let best_shift = if r_none != 0 || r0 != 0 || r15 != 0 {
-        none_hits = 0;
-        s0 = 0;
-        s15 = 0;
         let mut best_score = r_none;
         let mut shift = 99u32;
         for (s, score) in [(0u32, r0), (15u32, r15)] {
@@ -241,20 +220,36 @@ pub fn select_dd8_shift(data: &[u8], text_va: u32, text_size: u32, info3: u32) -
                 shift = s;
             }
         }
-        if shift != 99 && best_score.saturating_sub(r_none) < MIN_DD8_HITS {
+        if shift != 99 && best_score.saturating_sub(r_none) < MIN_DD8_PADDING_BYTES {
             shift = 99;
         }
         shift
     } else {
-        none_hits = score_dd8_baseline(data, text_off, &sample_pages);
-        s0 = score_dd8_shift(data, text_off, text_va, &sample_pages, 0);
-        s15 = score_dd8_shift(data, text_off, text_va, &sample_pages, 15);
-        margin_pick(none_hits, s0, s15)
+        // The sample scored zero under every candidate. Look for padding in
+        // the rest of .text instead of using isolated INT3 bytes as evidence.
+        let available_pages = data.len().saturating_sub(text_off) / 0x1000;
+        let page_count = (num_pages_total as usize).min(available_pages) as u32;
+        let scores = [None, Some(0), Some(15)]
+            .map(|shift| fingerprint_score(data, text_off, abs_base, 0..page_count, shift));
+        fallback = Some(scores);
+        let [none, s0, s15] = scores;
+        let mut best_score = none;
+        let mut best_shift = 99u32;
+        for (shift, score) in [(0u32, s0), (15u32, s15)] {
+            if score > best_score {
+                best_score = score;
+                best_shift = shift;
+            }
+        }
+        // Divide rather than double the baseline: full-text scores can be large.
+        if best_score / 2 < none || best_score < MIN_DD8_PADDING_BYTES {
+            best_shift = 99;
+        }
+        best_shift
     };
     if std::env::var("SEL_DIAG").is_ok() {
         eprintln!(
-            "SEL dd8 best_shift={} fp=({},{},{}) cc=({},{},{}) samples={:?}",
-            best_shift, r_none, r0, r15, none_hits, s0, s15, sample_pages
+            "SEL dd8 best_shift={best_shift} fp=({r_none},{r0},{r15}) padding={fallback:?} samples={sample_pages:?}"
         );
     }
     best_shift
@@ -302,17 +297,17 @@ fn dd8_apply(buf: &mut [u8; 0x1000], abs_page: u32, shift: u32) {
     }
 }
 
-/// Sum the RET+int3 fingerprint over the sample pages for one candidate
+/// Sum the RET+int3 fingerprint over the supplied pages for one candidate
 /// (`None` = the no-dd8 baseline, page as-is).
 fn fingerprint_score(
     data: &[u8],
     text_off: usize,
     abs_base: u32,
-    sample_pages: &[u32],
+    pages: impl IntoIterator<Item = u32>,
     shift: Option<u32>,
 ) -> u32 {
     let mut total = 0u32;
-    for &sp in sample_pages {
+    for sp in pages {
         let pg_off = text_off + (sp as usize) * 0x1000;
         if pg_off + 0x1000 > data.len() {
             continue;
@@ -444,60 +439,6 @@ fn read_u32(data: &[u8], offset: u32) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-// Baseline: count int3 pads already present at the first byte of each 16-byte
-// block, i.e. the positions dd8 would target if its in-block offset were 0.
-fn score_dd8_baseline(data: &[u8], text_off: usize, sample_pages: &[u32]) -> u32 {
-    let mut hits = 0u32;
-    for &sp in sample_pages {
-        let pg_off = text_off + (sp as usize) * 0x1000;
-        if pg_off + 0x1000 > data.len() {
-            continue;
-        }
-        for bi in 1..256usize {
-            if data[pg_off + bi * 16] == 0xCC {
-                hits += 1;
-            }
-        }
-    }
-    hits
-}
-
-// Replay decrypt_data8 on each sample page under `shift` and count how many of
-// the 255 mutated positions decode to 0xCC.
-fn score_dd8_shift(
-    data: &[u8],
-    text_off: usize,
-    text_va: u32,
-    sample_pages: &[u32],
-    shift: u32,
-) -> u32 {
-    let abs_base = text_va >> 12;
-    let mut hits = 0u32;
-    for &sp in sample_pages {
-        let pg_off = text_off + (sp as usize) * 0x1000;
-        if pg_off + 0x1000 > data.len() {
-            continue;
-        }
-        let abs_page = abs_base.wrapping_add(sp);
-        let mut key = abs_page << shift;
-        for bi in 0..256u32 {
-            let mixed = key.rotate_right(15).wrapping_add(bi);
-            key = mixed.wrapping_add(bi);
-            if bi == 0 {
-                continue;
-            }
-            let tidx = (bi.wrapping_mul(16).wrapping_add(mixed & 0xF)) as usize;
-            if tidx < 0x1000 {
-                let mutated = data[pg_off + tidx] ^ (key as u8);
-                if mutated == 0xCC {
-                    hits += 1;
-                }
-            }
-        }
-    }
-    hits
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +477,42 @@ mod tests {
             apply_dd8_page(&mut encrypted, 0x1000, expected);
             assert_eq!(select_dd8_shift(&encrypted, 0x1000, 0x4000, 0), expected);
         }
+    }
+
+    #[test]
+    fn full_text_padding_selects_both_shifts_when_sample_pages_are_silent() {
+        let text_va = 0x1000;
+        let text_size = 8 * 0x1000;
+        let mut plain = vec![0; (text_va + text_size) as usize];
+        // With eight pages, the fingerprint only samples pages 1 through 4.
+        let padded_page = text_va + 6 * 0x1000;
+        let (blocks, _) = plain[padded_page as usize..][..0x1000].as_chunks_mut::<32>();
+        for block in blocks {
+            block[0] = 0xC3;
+            block[1..].fill(0xCC);
+        }
+        assert_eq!(select_dd8_shift(&plain, text_va, text_size, 0), 99);
+        for shift in [0, 15] {
+            let mut encrypted = plain.clone();
+            apply_dd8_page(&mut encrypted, padded_page, shift);
+            assert_eq!(select_dd8_shift(&encrypted, text_va, text_size, 0), shift);
+        }
+    }
+
+    #[test]
+    fn isolated_int3_bytes_do_not_justify_dd8() {
+        let text_va = 0x1000;
+        let text_size = 4 * 0x1000;
+        let text_end = text_va + text_size;
+        let mut data = vec![0; text_end as usize];
+        let (blocks, _) = data[text_va as usize..].as_chunks_mut::<16>();
+        for block in blocks {
+            block[8] = 0xCC;
+        }
+        for page in (text_va..text_end).step_by(0x1000) {
+            apply_dd8_page(&mut data, page, 0);
+        }
+        assert_eq!(select_dd8_shift(&data, text_va, text_size, 0), 99);
     }
 
     /// Seed the first `count` dd8-targeted positions of each sampled page with

@@ -1719,9 +1719,8 @@ impl<'a> Unpacker<'a> {
         let mut restored_clr = false;
 
         // Deferred .text dd8 for the new layout (dd8 is the final .text step).
-        // The shift/formula is re-selected here over the now-fully-restored
-        // .text so the 0xCC-padding heuristic scores the real post-restore
-        // bytes. Only run dd8 when the entry point falls inside .text.
+        // Select the shift using the post-restore .text bytes. Only run dd8
+        // when the entry point falls inside .text.
         if new_layout {
             let ep_final = get_u32(&u.decompressed, pe_off2.wrapping_add(40));
             let ep_in_text = text_size > 0
