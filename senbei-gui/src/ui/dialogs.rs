@@ -465,6 +465,82 @@ pub struct Overlays<'a> {
     pub detected: Lang,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    Settings,
+    Legal { reviewing: bool },
+}
+
+impl Dialog {
+    fn requested(view: &ViewState, legal_pending: bool) -> Option<Self> {
+        if legal_pending || view.legal_open {
+            Some(Self::Legal {
+                reviewing: !legal_pending,
+            })
+        } else {
+            view.settings_open.then_some(Self::Settings)
+        }
+    }
+}
+
+struct VisibleDialog {
+    kind: Dialog,
+    opacity: f32,
+    active: bool,
+}
+
+impl VisibleDialog {
+    /// Keep the outgoing dialog modal until transparent. A replacement starts
+    /// only then, so two backdrops never darken the workbench at once.
+    fn animate(ctx: &Context, requested: Option<Dialog>) -> Option<Self> {
+        let slot = Id::unique("workbench-dialog");
+        let fade = slot.with("opacity");
+        let duration = ctx.global_style().animation_time;
+        let mut kind = match ctx.data(|data| data.get_temp::<Dialog>(slot)) {
+            Some(shown) => shown,
+            None => {
+                let next = requested?;
+                ctx.animate_value_with_time(fade, 0.0, 0.0);
+                next
+            }
+        };
+        let mut active = requested == Some(kind);
+        let mut opacity =
+            ctx.animate_value_with_time(fade, if active { 1.0 } else { 0.0 }, duration);
+        if !active && opacity == 0.0 {
+            ctx.data_mut(|data| data.remove::<Dialog>(slot));
+            kind = requested?;
+            active = true;
+            opacity = ctx.animate_value_with_time(fade, 1.0, duration);
+        }
+        ctx.data_mut(|data| data.insert_temp(slot, kind));
+        Some(Self {
+            kind,
+            opacity,
+            active,
+        })
+    }
+
+    fn show(self, ctx: &Context, content: impl FnOnce(&mut Ui)) -> egui::ModalResponse<()> {
+        let id = Id::unique(match self.kind {
+            Dialog::Settings => "settings",
+            Dialog::Legal { .. } => "legal",
+        });
+        Modal::new(id)
+            .area(Modal::default_area(id).fade_in(false))
+            .frame(modal_frame().multiply_with_opacity(self.opacity))
+            .backdrop_color(theme::backdrop().gamma_multiply(self.opacity))
+            .show(ctx, |ui| {
+                if !self.active {
+                    ui.disable();
+                }
+                // Disable input on exit without applying the disabled fade twice.
+                ui.set_opacity(self.opacity);
+                content(ui);
+            })
+    }
+}
+
 pub fn overlays(
     ctx: &Context,
     draw: &mut Draw<'_>,
@@ -472,17 +548,27 @@ pub fn overlays(
     settings: &mut Settings,
     overlays: Overlays<'_>,
 ) {
-    if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
+    let requested = Dialog::requested(view, overlays.legal_pending);
+    let shown = VisibleDialog::animate(ctx, requested);
+    if shown.is_none() && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
         drop_overlay(ctx);
     }
-    if view.settings_open {
-        settings_modal(ctx, draw, view, settings, &overlays);
-    }
+    let legal = match shown {
+        Some(dialog) if dialog.kind == Dialog::Settings => {
+            settings_modal(ctx, dialog, draw, view, settings, &overlays);
+            None
+        }
+        other => other,
+    };
     if view.close_confirm {
         close_modal(ctx, draw, view);
     }
-    if overlays.legal_pending || view.legal_open {
-        legal_modal(ctx, draw, view, settings, &overlays);
+    if let Some(dialog) = legal {
+        legal_modal(ctx, dialog, draw, view, settings, &overlays);
+    }
+    // A button can change the requested dialog after this frame's animation.
+    if Dialog::requested(view, !settings.legal_accepted) != requested {
+        ctx.request_repaint();
     }
 }
 
@@ -543,73 +629,74 @@ fn language_combo(ui: &mut Ui, id: &str, settings: &mut Settings, detected: Lang
 
 fn legal_modal(
     ctx: &Context,
+    dialog: VisibleDialog,
     draw: &mut Draw<'_>,
     view: &mut ViewState,
     settings: &mut Settings,
     overlays: &Overlays<'_>,
 ) {
-    Modal::new(Id::unique("legal"))
-        .frame(modal_frame())
-        .backdrop_color(theme::backdrop())
-        .show(ctx, |ui| {
-            ui.set_width(620.0_f32.min(ctx.content_rect().width() - 40.0));
-            ui.spacing_mut().item_spacing.y = 0.0;
-            modal_section(ui, Margin::symmetric(16, 12), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    if let Some(image) = icon_image(overlays.icon, 24.0) {
-                        ui.add(image);
-                    }
-                    ui.label(RichText::new(t(Text::LegalTitle)).font(theme::title(17.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        language_combo(ui, "legal-language", settings, overlays.detected);
-                    });
+    let reviewing = matches!(dialog.kind, Dialog::Legal { reviewing: true });
+    dialog.show(ctx, |ui| {
+        ui.set_width(620.0_f32.min(ctx.content_rect().width() - 40.0));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        modal_section(ui, Margin::symmetric(16, 12), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if let Some(image) = icon_image(overlays.icon, 24.0) {
+                    ui.add(image);
+                }
+                ui.label(RichText::new(t(Text::LegalTitle)).font(theme::title(17.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    language_combo(ui, "legal-language", settings, overlays.detected);
                 });
             });
-            widgets::rule(ui);
-            modal_section(ui, Margin::symmetric(16, 14), |ui| {
-                ui.spacing_mut().item_spacing.y = 10.0;
-                for text in [Text::LegalP1, Text::LegalP2, Text::LegalP3, Text::LegalP4] {
-                    let text = t(text);
-                    let mut job = LayoutJob::default();
-                    for (strong, run) in strong_runs(&text) {
-                        job.append(
-                            run,
-                            0.0,
-                            TextFormat {
-                                font_id: if strong {
-                                    theme::strong(13.5)
-                                } else {
-                                    theme::body()
-                                },
-                                color: if strong { theme::TEXT } else { theme::DIM },
-                                ..Default::default()
+        });
+        widgets::rule(ui);
+        modal_section(ui, Margin::symmetric(16, 14), |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            for text in [Text::LegalP1, Text::LegalP2, Text::LegalP3, Text::LegalP4] {
+                let text = t(text);
+                let mut job = LayoutJob::default();
+                for (strong, run) in strong_runs(&text) {
+                    job.append(
+                        run,
+                        0.0,
+                        TextFormat {
+                            font_id: if strong {
+                                theme::strong(13.5)
+                            } else {
+                                theme::body()
                             },
-                        );
-                    }
-                    job.wrap.max_width = ui.available_width();
-                    ui.add(egui::Label::new(job).wrap());
+                            color: if strong { theme::TEXT } else { theme::DIM },
+                            ..Default::default()
+                        },
+                    );
                 }
-            });
-            widgets::rule(ui);
-            modal_section(ui, Margin::symmetric(16, 10), |ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
+                job.wrap.max_width = ui.available_width();
+                ui.add(egui::Label::new(job).wrap());
+            }
+        });
+        widgets::rule(ui);
+        modal_section(ui, Margin::symmetric(16, 10), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if reviewing {
+                    if widgets::primary_button(ui, t(Text::SettingsDone), true).clicked() {
+                        view.legal_open = false;
+                    }
+                } else {
                     if widgets::primary_button(ui, t(Text::LegalAccept), true).clicked() {
                         draw.act(Action::AcceptLegal);
                         settings.legal_accepted = true;
                         view.legal_open = false;
                     }
                     if ui.button(t(Text::LegalQuit)).clicked() {
-                        if overlays.legal_pending {
-                            draw.act(Action::Quit);
-                        } else {
-                            view.legal_open = false;
-                        }
+                        draw.act(Action::Quit);
                     }
-                });
+                }
             });
         });
+    });
 }
 
 fn close_modal(ctx: &Context, draw: &mut Draw<'_>, view: &mut ViewState) {
@@ -691,79 +778,74 @@ fn mib(ui: &mut Ui, value: &mut u64) -> Response {
 
 fn settings_modal(
     ctx: &Context,
+    dialog: VisibleDialog,
     draw: &mut Draw<'_>,
     view: &mut ViewState,
     settings: &mut Settings,
     overlays: &Overlays<'_>,
 ) {
-    let response = Modal::new(Id::unique("settings"))
-        .frame(modal_frame())
-        .backdrop_color(theme::backdrop())
-        .show(ctx, |ui| {
-            ui.set_width(760.0_f32.min(ctx.content_rect().width() - 40.0));
-            ui.spacing_mut().item_spacing.y = 0.0;
-            modal_section(ui, Margin::symmetric(16, 12), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(t(Text::SettingsTitle)).font(theme::title(17.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::ghost_button(ui, "✕").clicked() {
-                            view.settings_open = false;
-                        }
-                    });
-                });
-            });
-            widgets::rule(ui);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.allocate_ui_with_layout(
-                    vec2(160.0, 380.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.set_min_size(vec2(160.0, 380.0));
-                        modal_section(ui, Margin::symmetric(6, 8), |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            for (tab, text) in [
-                                (SettingsTab::General, Text::SettingsTabGeneral),
-                                (SettingsTab::Processing, Text::SettingsTabProcessing),
-                                (SettingsTab::Android, Text::SettingsTabAndroid),
-                                (SettingsTab::Memory, Text::SettingsTabMemory),
-                                (SettingsTab::About, Text::SettingsTabAbout),
-                            ] {
-                                if nav_item(ui, &t(text), view.settings_tab == tab) {
-                                    view.settings_tab = tab;
-                                }
-                            }
-                        });
-                    },
-                );
-                let line = ui.available_rect_before_wrap();
-                ui.painter().vline(
-                    line.left(),
-                    line.top()..=line.top() + 380.0,
-                    Stroke::new(1.0, theme::BORDER),
-                );
-                ui.vertical(|ui| {
-                    modal_section(ui, Margin::symmetric(16, 12), |ui| {
-                        ui.spacing_mut().item_spacing.y = 12.0;
-                        settings_pane(ui, draw, view, settings, overlays);
-                    });
-                });
-            });
-            widgets::rule(ui);
-            modal_section(ui, Margin::symmetric(16, 10), |ui| {
-                ui.horizontal(|ui| {
-                    if widgets::ghost_button(ui, t(Text::SettingsReset)).clicked() {
-                        settings.reset();
+    let active = dialog.active;
+    let response = dialog.show(ctx, |ui| {
+        ui.set_width(760.0_f32.min(ctx.content_rect().width() - 40.0));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        modal_section(ui, Margin::symmetric(16, 12), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t(Text::SettingsTitle)).font(theme::title(17.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::ghost_button(ui, "✕").clicked() {
+                        view.settings_open = false;
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::primary_button(ui, t(Text::SettingsDone), true).clicked() {
-                            view.settings_open = false;
-                        }
-                    });
                 });
             });
         });
-    if response.should_close() {
+        widgets::rule(ui);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.allocate_ui_with_layout(vec2(160.0, 380.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_min_size(vec2(160.0, 380.0));
+                modal_section(ui, Margin::symmetric(6, 8), |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (tab, text) in [
+                        (SettingsTab::General, Text::SettingsTabGeneral),
+                        (SettingsTab::Processing, Text::SettingsTabProcessing),
+                        (SettingsTab::Android, Text::SettingsTabAndroid),
+                        (SettingsTab::Memory, Text::SettingsTabMemory),
+                        (SettingsTab::About, Text::SettingsTabAbout),
+                    ] {
+                        if nav_item(ui, &t(text), view.settings_tab == tab) {
+                            view.settings_tab = tab;
+                        }
+                    }
+                });
+            });
+            let line = ui.available_rect_before_wrap();
+            ui.painter().vline(
+                line.left(),
+                line.top()..=line.top() + 380.0,
+                Stroke::new(1.0, theme::BORDER),
+            );
+            ui.vertical(|ui| {
+                modal_section(ui, Margin::symmetric(16, 12), |ui| {
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    settings_pane(ui, draw, view, settings, overlays);
+                });
+            });
+        });
+        widgets::rule(ui);
+        modal_section(ui, Margin::symmetric(16, 10), |ui| {
+            ui.horizontal(|ui| {
+                if widgets::ghost_button(ui, t(Text::SettingsReset)).clicked() {
+                    settings.reset();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::primary_button(ui, t(Text::SettingsDone), true).clicked() {
+                        view.settings_open = false;
+                    }
+                });
+            });
+        });
+    });
+    if active && response.should_close() {
         view.settings_open = false;
     }
 }
@@ -940,11 +1022,27 @@ fn about(ui: &mut Ui, view: &mut ViewState, overlays: &Overlays<'_>) {
         if let Some(image) = icon_image(overlays.icon, 72.0) {
             ui.add(image);
         }
-        ui.vertical(|ui| {
-            ui.label(RichText::new("Senbei").font(theme::title(22.0)));
-            ui.label(widgets::dim(t(Text::AboutVersion {
+        let title =
+            ui.painter()
+                .layout_no_wrap("Senbei".to_owned(), theme::title(22.0), theme::TEXT);
+        let version = ui.painter().layout_no_wrap(
+            t(Text::AboutVersion {
                 v: env!("CARGO_PKG_VERSION").to_owned(),
-            })));
+            })
+            .into_owned(),
+            theme::body(),
+            theme::DIM,
+        );
+        // Give the row the text block's measured height so it centers the
+        // block beside the logo rather than starting it at the logo's top.
+        let size = vec2(
+            title.size().x.max(version.size().x),
+            title.size().y + version.size().y,
+        );
+        ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(title);
+            ui.label(version);
         });
     });
     ui.add(egui::Label::new(widgets::dim(t(Text::AboutDesc))).wrap());
@@ -960,5 +1058,65 @@ fn about(ui: &mut Ui, view: &mut ViewState, overlays: &Overlays<'_>) {
     if ui.button(t(Text::AboutLegal)).clicked() {
         view.settings_open = false;
         view.legal_open = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &Context, time: f64, requested: Option<Dialog>) -> Option<VisibleDialog> {
+        let mut visible = None;
+        let input = egui::RawInput {
+            time: Some(time),
+            ..Default::default()
+        };
+        let _ = ctx.run_pass(input, |ctx| {
+            visible = VisibleDialog::animate(ctx, requested)
+        });
+        visible
+    }
+
+    #[test]
+    fn startup_legal_fades_both_ways_and_keeps_its_content_on_exit() {
+        let ctx = Context::default();
+        let view = ViewState::default();
+        let pending = Dialog::requested(&view, true);
+        assert!(matches!(pending, Some(Dialog::Legal { reviewing: false })));
+        assert_eq!(frame(&ctx, 0.0, pending).unwrap().opacity, 0.0);
+        assert!((0.0..1.0).contains(&frame(&ctx, 0.1, pending).unwrap().opacity));
+        assert_eq!(frame(&ctx, 0.3, pending).unwrap().opacity, 1.0);
+
+        let accepted = Dialog::requested(&view, false);
+        frame(&ctx, 0.4, accepted).unwrap();
+        let outgoing = frame(&ctx, 0.5, accepted).unwrap();
+        assert!(Some(outgoing.kind) == pending);
+        assert!(!outgoing.active);
+        assert!((0.0..1.0).contains(&outgoing.opacity));
+        assert!(frame(&ctx, 0.7, accepted).is_none());
+    }
+
+    #[test]
+    fn opening_legal_from_settings_fades_one_dialog_at_a_time() {
+        let ctx = Context::default();
+        let settings = Some(Dialog::Settings);
+        let view = ViewState {
+            legal_open: true,
+            ..Default::default()
+        };
+        let review = Dialog::requested(&view, false);
+        assert!(matches!(review, Some(Dialog::Legal { reviewing: true })));
+        frame(&ctx, 0.0, settings).unwrap();
+        frame(&ctx, 0.3, settings).unwrap();
+        frame(&ctx, 0.4, review).unwrap();
+        let outgoing = frame(&ctx, 0.5, review).unwrap();
+        assert!(outgoing.kind == Dialog::Settings);
+        assert!(!outgoing.active);
+
+        let incoming = frame(&ctx, 0.7, review).unwrap();
+        assert!(Some(incoming.kind) == review);
+        assert!(incoming.active);
+        assert_eq!(incoming.opacity, 0.0);
+        assert_eq!(frame(&ctx, 1.0, review).unwrap().opacity, 1.0);
     }
 }

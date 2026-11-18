@@ -563,7 +563,15 @@ impl Workbench {
 
     // ------------------------------------------------------------ input
 
+    /// Keep workbench-level input out of a modal, including while it fades out.
+    fn modal_blocks_input(&self, ctx: &Context) -> bool {
+        !self.settings.legal_accepted || ctx.memory(|memory| memory.top_modal_layer().is_some())
+    }
+
     fn take_drops(&mut self, ctx: &Context) {
+        if self.modal_blocks_input(ctx) {
+            return;
+        }
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -572,13 +580,13 @@ impl Workbench {
                 .map(|file| file.path().to_path_buf())
                 .collect()
         });
-        if !dropped.is_empty() && self.settings.legal_accepted {
+        if !dropped.is_empty() {
             self.add_paths(dropped);
         }
     }
 
     fn shortcuts(&mut self, ctx: &Context) {
-        if !self.settings.legal_accepted {
+        if self.modal_blocks_input(ctx) {
             return;
         }
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);

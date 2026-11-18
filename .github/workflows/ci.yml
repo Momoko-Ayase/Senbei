@@ -114,14 +114,11 @@ jobs:
         run: cargo test --release -p senbei-cli --test wasm_parity
         env:
           SENBEI_WASM_PARITY: '1'
+      - name: Stage static site
+        run: node web/tools/stage.mjs dist
       - uses: actions/upload-artifact@v4
         with:
           name: senbei-web
-          path: |
-            web/index.html
-            web/app.js
-            web/report.js
-            web/worker.js
-            web/style.css
-            web/pkg/
+          path: dist/
+          if-no-files-found: error
           retention-days: 14

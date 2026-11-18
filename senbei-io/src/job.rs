@@ -2320,35 +2320,6 @@ fn apply_android_validation(
     report.stages.push(stage);
 }
 
-/// Profile for a metadata blob whose transform ran, validated, and needed no
-/// change.
-///
-/// The route was really taken and the bytes really validated, so the attempt is
-/// recorded — but a clean blob is no protection evidence, so recognition stays
-/// `not_recognized` and no protection verdict is claimed. Without this an
-/// inspection of an already-clean blob would say `not_attempted` while the
-/// research section next to it showed the route and its report.
-fn metadata_validated_unchanged_profile(
-    identity: Option<senbei_metadata::MetadataIdentity>,
-    route: senbei_engine::LayoutKind,
-) -> senbei_engine::ProtectionProfile {
-    use senbei_engine::{AttemptOutcome, LayoutAttempt, ProtectionProfile};
-    let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::metadata(
-        identity.map(|identity| identity.raw_version),
-    ));
-    profile.candidates = vec![LayoutAttempt {
-        layout: route,
-        outcome: AttemptOutcome::Succeeded,
-        warnings: Vec::new(),
-        errors: Vec::new(),
-    }];
-    profile.selected = Some(route);
-    profile.recovery = senbei_engine::RecoveryStatus::Succeeded;
-    profile.static_validation = senbei_engine::ValidationStatus::NotRun;
-    profile.recognition = senbei_engine::RecognitionStatus::NotRecognized;
-    profile
-}
-
 /// Input report for one loose il2cpp metadata blob.
 fn metadata_input(
     input: &Path,
@@ -2380,7 +2351,7 @@ fn metadata_input(
         // even though the status stays "nothing needed".
         entry.status = InputStatus::Skipped;
         entry.profile = Some(match report.research {
-            Some(_) => metadata_validated_unchanged_profile(identity, report.layout),
+            Some(_) => crate::report::metadata_validated_unchanged_profile(identity, report.layout),
             None => crate::report::metadata_unchanged_profile(identity),
         });
         entry.stages.push(
@@ -2412,7 +2383,7 @@ fn single_metadata_input(
     entry.profile = Some(match (dest.is_some(), research) {
         (true, _) => crate::report::metadata_recovered_profile(identity, layout),
         // The transform ran and validated; only the rewrite was unnecessary.
-        (false, true) => metadata_validated_unchanged_profile(identity, layout),
+        (false, true) => crate::report::metadata_validated_unchanged_profile(identity, layout),
         (false, false) => crate::report::metadata_unchanged_profile(identity),
     });
     entry.outputs = dest

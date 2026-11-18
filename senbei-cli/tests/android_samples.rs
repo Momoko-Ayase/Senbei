@@ -229,3 +229,79 @@ fn android_samples_restore_against_goldens() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The byte-level restore the browser binding uses must produce the bytes the
+/// path-based driver writes: the same image, the same embedded metadata, and a
+/// failure for the same inputs.
+#[test]
+fn android_samples_restore_identically_in_memory() {
+    let root = corpus_dir();
+    if !root.is_dir() {
+        eprintln!(
+            "android samples: {} does not exist, nothing to test",
+            root.display()
+        );
+        return;
+    }
+    let limits = senbei_engine::android::ResourceLimits::default();
+    let mut compared = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for app in app_dirs(&root) {
+        let mut so_files = Vec::new();
+        collect_so_files(&app, &mut so_files);
+        for input in so_files {
+            let name = input.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&input).expect("read sample");
+            let on_disk_protected = android::is_protected_so_file(&input);
+            let (profile, outcome) = android::restore_library_bytes(&bytes, false, &limits);
+            if !on_disk_protected {
+                if !matches!(outcome, android::LibraryOutcome::NotProtected) {
+                    failures.push(format!(
+                        "{name}: the file probe says unprotected, the byte probe disagrees"
+                    ));
+                }
+                continue;
+            }
+            let temp = tempfile::tempdir().expect("tempdir");
+            let dest = temp.path().join("restored.so");
+            let on_disk = android::restore_so_file(&input, &dest, false);
+            compared += 1;
+            match (on_disk, outcome) {
+                (Ok(embedded), android::LibraryOutcome::Restored(restored)) => {
+                    let written = std::fs::read(&dest).expect("read restored output");
+                    if written != restored.image {
+                        failures.push(format!(
+                            "{name}: in-memory image differs from the written file\n  file   sha256 {}\n  memory sha256 {}",
+                            sha256_hex(&written),
+                            sha256_hex(&restored.image)
+                        ));
+                    }
+                    if embedded != restored.embedded_metadata {
+                        failures.push(format!("{name}: embedded metadata differs"));
+                    }
+                    if profile.recovery != senbei_engine::RecoveryStatus::Succeeded {
+                        failures.push(format!("{name}: restored without a recovered profile"));
+                    }
+                }
+                (Err(_), android::LibraryOutcome::Failed(_)) => {}
+                (Ok(_), android::LibraryOutcome::Failed(detail)) => failures.push(format!(
+                    "{name}: the file restore succeeded, the byte restore failed: {}",
+                    detail.text()
+                )),
+                (Ok(_), _) => failures.push(format!(
+                    "{name}: the file restore succeeded, the byte probe did not match"
+                )),
+                (Err(error), _) => failures.push(format!(
+                    "{name}: the file restore failed ({error:#}), the byte restore did not"
+                )),
+            }
+        }
+    }
+
+    eprintln!(
+        "android samples: {compared} protected libraries compared, {} difference(s)",
+        failures.len()
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

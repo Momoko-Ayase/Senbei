@@ -513,7 +513,9 @@ name = "senbei-wasm"
 version = "1.4.0"
 dependencies = [
  "console_error_panic_hook",
+ "js-sys",
  "senbei-engine",
+ "senbei-i18n",
  "senbei-io",
  "senbei-metadata",
  "serde_json",

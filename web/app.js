@@ -1,723 +1,963 @@
-import init, { detect, inspect_profile_json } from './pkg/senbei_wasm.js';
+// The page: adding inputs, scanning folders, and handing results back. What is
+// shown is in `view.js` and `detail.js`, what is held is in `state.js`, and
+// running the recoveries is in `run.js`.
+
+import { LANGUAGES, language, loadLanguage, t } from './i18n.js';
 import {
-  DEFAULT_INPUT_LIMIT_BYTES,
-  MAX_INPUT_LIMIT_MIB,
-  MIN_INPUT_LIMIT_MIB,
-  buildReport,
-  describeFindings,
-  describeObserved,
-  describeStages,
-  formatBytes,
+  VERSION,
+  allItems,
+  allOutputs,
+  find,
+  fullPath,
+  isBusy,
+  makeEntries,
+  makeGroup,
+  makeItem,
+  onChange,
+  outputBusy,
+  state,
+  targets,
+} from './state.js';
+import * as view from './view.js';
+import { shownPath } from './ui.js';
+import {
+  DEFAULT_LIMIT_MIB,
+  MIN_SIZE,
+  PREFIX_SIZE,
+  baseName,
+  candidateKind,
+  isCompanionName,
+  languageFor,
   parseLimitMiB,
-  planReadBudget,
-  reportFileName,
-  serializeReport,
-} from './report.js';
+  sniff,
+} from './model.js';
+import { Prober, loadEngine } from './engine.js';
+import { downloadArchive } from './output.js';
+import { collect, fileListRoot, walkEntry, walkFileList } from './scan.js';
+import { buildReport, reportFileName, serializeReport } from './report.js';
+import { cancelRun, pageError, saveAll, startRun } from './run.js';
 
-const dropzone = document.getElementById('dropzone');
-const picker = document.getElementById('picker');
-const fileList = document.getElementById('files');
-const actions = document.getElementById('actions');
-const unpackBtn = document.getElementById('unpack-btn');
-const clearBtn = document.getElementById('clear-btn');
-const exportBtn = document.getElementById('export-btn');
-const limitInput = document.getElementById('limit-mib');
-const limitHint = document.getElementById('limit-hint');
-const legalOverlay = document.getElementById('legal-overlay');
-const legalAccept = document.getElementById('legal-accept');
-const legalLink = document.getElementById('legal-link');
-
-await init();
-
-// --- Legal gate: the page is unusable until the notice is acknowledged. ---
-legalAccept.addEventListener('click', () => legalOverlay.remove());
-legalLink.addEventListener('click', (e) => {
-  e.preventDefault();
-  if (!document.getElementById('legal-overlay')) {
-    document.body.appendChild(legalOverlay);
-  }
-});
-
-// --- File list: one row per module. Companions (`X._`) never get their own ---
-// --- row once their base module `X` is present — they show as a badge on   ---
-// --- the base row. Rows are black while staged, show an animated blue      ---
-// --- progress bar while unpacking, and turn green (success) or red         ---
-// --- (failure) at the end; success rows gain a download button.            ---
-
-// --- Row DOM is updated INCREMENTALLY: rows are created once and patched  ---
-// --- in place. Rebuilding the list on every change would restart the      ---
-// --- entrance animation of every row and reset the unpack shimmer.        ---
-
-/** name -> {
- *   file: File,
- *   kind: string|undefined,   // detect() result; undefined for `._` files
- *   state: 'staged'|'working'|'ok'|'err'|'blocked',
- *   bytes: Uint8Array|null,   // unpacked output (state 'ok')
- *   note: string,             // status line (kind, suspect issues, error)
- *   suspect: boolean,
- *   findings: Array<{severity,message}>,  // integrity defects
- *   profile: object|null,     // post-recovery profile (or the failure profile)
- *   preRecoveryProfile: object|null,      // inspect_profile_json() result
- *   retried: boolean,         // forced-EXE retry ran
- *   companionUsed: boolean,   // output was spliced from a `._` payload
- *   error: string|null,
- * } */
-const files = new Map();
-
-/** name -> row <li> element (companions merged into their base have none) */
-const rowEls = new Map();
-
-const KIND_LABEL = {
-  'native-exe': 'protected native EXE',
-  'managed-exe': 'protected managed EXE',
-  'native-dll': 'protected native DLL',
-  'managed-dll': 'protected managed DLL',
-  metadata: 'il2cpp metadata',
-  'android-package':
-    'Android app package — the web build cannot unpack these yet; use the senbei CLI',
-  'android-so':
-    'Android AArch64 library — the web build cannot unpack these yet; use the senbei CLI',
+const $ = (id) => document.getElementById(id);
+const el = {
+  topbar: $('topbar'),
+  main: $('main'),
+  inputs: $('inputs'),
+  detail: $('detail'),
+  status: $('status'),
+  cancel: $('cancel'),
+  menu: $('menu'),
+  dragover: $('dragover'),
+  legal: $('legal'),
+  settings: $('settings'),
+  pickFiles: $('pick-files'),
+  pickFolder: $('pick-folder'),
+  chips: null,
+  list: null,
+  search: null,
+  clear: null,
 };
 
-// Android targets are recognized by extension so the row can explain the
-// situation instead of reporting a protected file as unrecognized: the
-// Android pipeline is filesystem orchestration (senbei-io) with no wasm
-// build, so these files need the CLI. The pseudo-kinds are labels only —
-// they never reach the worker.
-const ANDROID_KIND = {
-  apk: 'android-package',
-  apks: 'android-package',
-  xapk: 'android-package',
-  so: 'android-so',
-};
+// ---------- settings that outlive the tab ----------
 
-const COMPANION_SVG =
-  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
-  '<path d="M6.5 9.5a3 3 0 0 0 4.24 0l2-2a3 3 0 1 0-4.24-4.24l-1 1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' +
-  '<path d="M9.5 6.5a3 3 0 0 0-4.24 0l-2 2a3 3 0 1 0 4.24 4.24l1-1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+const STORE = { language: 'senbei.language', limit: 'senbei.limit-mib', legal: 'senbei.legal-accepted' };
 
-const DOWNLOAD_SVG =
-  '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">' +
-  '<path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 12.5V14h12v-1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-
-dropzone.addEventListener('click', () => picker.click());
-dropzone.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ') picker.click();
-});
-picker.addEventListener('change', () => {
-  stageFiles(picker.files);
-  picker.value = '';
-});
-dropzone.addEventListener('dragover', (e) => {
-  e.preventDefault();
-  dropzone.classList.add('over');
-});
-dropzone.addEventListener('dragleave', () => dropzone.classList.remove('over'));
-dropzone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dropzone.classList.remove('over');
-  stageFiles(e.dataTransfer.files);
-});
-
-// --- Input budget ---------------------------------------------------------
-//
-// Every read is guarded from `File.size` BEFORE `arrayBuffer()` runs, so an
-// oversized input never becomes a large allocation in the first place. The
-// limit is a practical guard, not a memory measurement: see the warning text.
-
-let limitBytes = DEFAULT_INPUT_LIMIT_BYTES;
-
-limitInput.min = String(MIN_INPUT_LIMIT_MIB);
-limitInput.max = String(MAX_INPUT_LIMIT_MIB);
-
-/** Static explanation shown when no staged input needs attention. */
-const LIMIT_BASE_HINT =
-  `Modules above the limit are skipped before their bytes are read. ` +
-  'Unpacking keeps the input, the recovered image, and pipeline buffers in ' +
-  'memory together, so it needs several times the file size.';
-
-function applyLimit() {
-  limitBytes = parseLimitMiB(limitInput.value, limitBytes);
-  render();
-}
-
-limitInput.addEventListener('change', () => {
-  limitInput.value = String(Math.round(limitBytes / (1024 * 1024)));
-  applyLimit();
-});
-limitInput.addEventListener('input', () => {
-  // Only react to a value that is actually usable, so typing never flips the
-  // budget on a partial number.
-  if (parseLimitMiB(limitInput.value, null) !== null) applyLimit();
-});
-
-/** Latest budget plan for the staged set (recomputed by render()). */
-let budgetPlan = null;
-
-/** Entries measured for the budget: base module + its `._` companion. */
-function stagedSizes() {
-  return [...files].map(([name, entry]) => ({ name, size: entry.file.size }));
-}
-
-/** True when `name` must be skipped under the current budget. */
-function isBlocked(name) {
-  if (!budgetPlan) return false;
-  return budgetPlan.blocked.includes(name);
-}
-
-async function stageFiles(list) {
-  // Snapshot synchronously: `picker.files` and `dataTransfer.files` are LIVE
-  // lists — clearing the picker or returning from the drop event empties
-  // them, so an await before this point silently drops every file after the
-  // first.
-  const snapshot = [...list];
-  for (const file of snapshot) {
-    // Detection only needs the file header (key table at offset 4096 plus
-    // the PE header fields); read a small slice, not the whole file.
-    const head = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
-    // Companions are ciphertext fragments; detect() only makes sense on the
-    // base module, so skip it for `._` files. Android targets short-circuit
-    // detect() as well: an ELF/zip never classifies as a protected PE, and
-    // the row must carry the android pseudo-kind for its status line.
-    const ext = file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase();
-    const kind = file.name.endsWith('._')
-      ? undefined
-      : (ANDROID_KIND[ext] ?? detect(head));
-    const old = files.get(file.name);
-    files.set(file.name, {
-      file,
-      kind,
-      state: 'staged',
-      bytes: null,
-      note: '',
-      suspect: false,
-      findings: [],
-      profile: null,
-      preRecoveryProfile: readPreRecoveryProfile(file.name.endsWith('._') ? undefined : head),
-      retried: false,
-      companionUsed: false,
-      error: null,
-    }); // same name re-dropped: replace
-    // A re-dropped file restarts as staged; drop any stale row/output.
-    if (old) removeRow(file.name, true);
-  }
-  render();
-}
-
-/**
- * Pre-recovery profile from the header slice.
- *
- * This is pure presentation: it reports the observed target (`PE32+ · native
- * DLL · header magic`) and never turns a metadata magic match into a
- * protection claim. Returns `null` for companions and for anything the core
- * cannot describe.
- */
-function readPreRecoveryProfile(head) {
-  if (!head) return null;
+function stored(key) {
   try {
-    const parsed = JSON.parse(inspect_profile_json(head));
-    return parsed && typeof parsed === 'object' ? parsed : null;
+    return localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-/** Insert `.unpack` before the final extension: `app.exe` -> `app.unpack.exe`. */
-function outName(name) {
-  const dot = name.lastIndexOf('.');
-  return dot > 0 ? `${name.slice(0, dot)}.unpack${name.slice(dot)}` : `${name}.unpack`;
-}
-
-/**
- * Staged status line: the observed header facts, which is what the profile can
- * say before any recovery runs. The kind label is only a fallback, because
- * `describeObserved` already names the format and kind.
- */
-function stagedStatus(entry) {
-  const label = KIND_LABEL[entry.kind] ?? entry.kind;
-  if (entry.kind === 'metadata') {
-    // The kind label names the file type; `observed` carries the version and
-    // the format-only disclaimer.
-    const observed = describeObserved(entry.preRecoveryProfile);
-    return observed ? `${label} — ${observed}` : label;
-  }
-  // A PE profile already names the format and kind, so dropping the kind from
-  // it avoids "protected native DLL — PE32+ · native DLL".
-  const observed = describeObserved(entry.preRecoveryProfile, { includeKind: false });
-  return observed ? `${label} — ${observed}` : label;
-}
-
-function statusText(name, entry) {
-  if (name.endsWith('._')) {
-    return `companion — needs ${name.slice(0, -2)}`;
-  }
-  switch (entry.state) {
-    case 'staged':
-      if (entry.kind === undefined) return 'not recognized — will be skipped';
-      if (isBlocked(name)) return 'above the input limit — will be skipped';
-      return stagedStatus(entry);
-    case 'working':
-      return entry.kind === 'metadata' ? 'de-obfuscating…' : 'unpacking…';
-    case 'ok':
-    case 'err':
-    case 'blocked':
-      return entry.note;
+function store(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    // Storage can be off; the setting then lasts for this visit.
   }
 }
 
-/**
- * Details block: profile stages and severity-labelled findings.
- *
- * The row's status line already carries the failure text, so the details list
- * it only when it adds something the summary does not.
- */
-function detailLines(entry) {
-  return [...describeStages(entry.profile), ...describeFindings(entry.findings)];
+let accepted = stored(STORE.legal) === '1';
+
+// ---------- rendering ----------
+
+const shown = new WeakMap();
+
+function focusKey(node) {
+  const { act, id } = node.dataset ?? {};
+  if (act) return `[data-act="${act}"]${id ? `[data-id="${CSS.escape(id)}"]` : ''}`;
+  return node.id ? `#${CSS.escape(node.id)}` : null;
 }
 
-function buildRow(name) {
-  const li = document.createElement('li');
-  li.className = 'file staged';
-  li.dataset.name = name;
-
-  const bar = document.createElement('div');
-  bar.className = 'bar';
-  li.appendChild(bar);
-
-  const row = document.createElement('div');
-  row.className = 'row';
-
-  const label = document.createElement('span');
-  label.className = 'name';
-  label.textContent = name;
-  row.appendChild(label);
-
-  const badge = document.createElement('span');
-  badge.className = 'badge companion';
-  badge.innerHTML = COMPANION_SVG;
-  badge.hidden = true;
-  row.appendChild(badge);
-
-  const status = document.createElement('span');
-  status.className = 'status';
-  row.appendChild(status);
-
-  const dl = document.createElement('a');
-  dl.className = 'dl';
-  dl.innerHTML = DOWNLOAD_SVG;
-  dl.hidden = true;
-  row.appendChild(dl);
-
-  const report = document.createElement('button');
-  report.type = 'button';
-  report.className = 'report';
-  report.textContent = '{}';
-  report.title = `Export a JSON report for ${name}`;
-  report.addEventListener('click', () => exportOne(name));
-  row.appendChild(report);
-
-  const rm = document.createElement('button');
-  rm.type = 'button';
-  rm.className = 'remove';
-  rm.textContent = '×';
-  rm.title = `Remove ${name}`;
-  rm.addEventListener('click', () => {
-    // A companion belongs to its base module: removing the base removes the
-    // companion too.
-    files.delete(name);
-    if (!name.endsWith('._')) files.delete(`${name}._`);
-    render();
-  });
-  row.appendChild(rm);
-
-  li.appendChild(row);
-
-  const details = document.createElement('ul');
-  details.className = 'details';
-  details.hidden = true;
-  li.appendChild(details);
-
-  return li;
-}
-
-function updateRow(li, name, entry) {
-  const isCompanion = name.endsWith('._');
-  li.className =
-    `file ${entry.state}` + (entry.suspect && entry.state === 'ok' ? ' suspect' : '');
-
-  const badge = li.querySelector('.badge');
-  const hasCompanion = isCompanion || files.has(`${name}._`);
-  badge.hidden = !hasCompanion;
-  if (hasCompanion) {
-    badge.title = isCompanion
-      ? 'external companion (._)'
-      : `companion loaded: ${name}._`;
-  }
-
-  li.querySelector('.status').textContent = statusText(name, entry);
-
-  const details = li.querySelector('.details');
-  const lines = detailLines(entry);
-  details.hidden = lines.length === 0;
-  if (lines.length > 0) {
-    // Rebuild only when the text actually changed: writing identical children
-    // every render would restart the row's entrance animation.
-    const key = lines.join('\n');
-    if (details.dataset.key !== key) {
-      details.replaceChildren(
-        ...lines.map((line) => {
-          const item = document.createElement('li');
-          item.textContent = line;
-          if (line.startsWith('fatal:')) item.className = 'fatal';
-          else if (line.startsWith('warning:')) item.className = 'warning';
-          return item;
-        }),
-      );
-      details.dataset.key = key;
-    }
-  }
-
-  const dl = li.querySelector('.dl');
-  const downloadable = entry.state === 'ok' && entry.bytes;
-  dl.hidden = !downloadable;
-  if (downloadable) {
-    if (dl._bytesFor !== entry.bytes) {
-      if (dl.href) URL.revokeObjectURL(dl.href);
-      dl.href = URL.createObjectURL(
-        new Blob([entry.bytes], { type: 'application/octet-stream' }),
-      );
-      dl._bytesFor = entry.bytes;
-    }
-    dl.download = entry.outputName ?? outName(name);
-    dl.title = `Download ${dl.download}`;
-  }
-}
-
-function removeRow(name, instant) {
-  const li = rowEls.get(name);
-  if (!li) return;
-  rowEls.delete(name);
-  // Release the download blob. Object URLs are roots: without this an unpacked
-  // 100 MB image stays resident for the life of the page every time a row is
-  // removed or the list is cleared.
-  const dl = li.querySelector('.dl');
-  if (dl?.href) {
-    URL.revokeObjectURL(dl.href);
-    dl.removeAttribute('href');
-    dl._bytesFor = null;
-  }
-  if (instant) {
-    li.remove();
-    return;
-  }
-  // Fade AND collapse: without the height/margin transition the rows below
-  // would hold position during the fade and then snap up on removal. The
-  // end state must be inline too — an inline start value would otherwise
-  // beat the stylesheet's `.leaving { max-height: 0 }`.
-  li.style.maxHeight = `${li.offsetHeight}px`;
-  void li.offsetHeight; // reflow: give the transition a concrete start value
-  li.classList.add('leaving');
-  li.style.maxHeight = '0px';
-  setTimeout(() => li.remove(), 230);
-}
-
-function render() {
-  budgetPlan = planReadBudget(stagedSizes(), limitBytes);
-
-  // Raising the limit must un-block rows the previous limit skipped: a
-  // `blocked` row is a budget verdict, not a result, so it returns to
-  // `staged` once it fits again and the user can press Unpack.
-  for (const [name, entry] of files) {
-    if (entry.state === 'blocked' && !isBlocked(name)) {
-      entry.state = 'staged';
-      entry.error = null;
-      entry.note = '';
-    }
-  }
-
-  // Create/update rows in Map order; companions whose base is staged merge
-  // into the base row (no row of their own).
-  const wanted = [];
-  for (const [name] of files) {
-    if (name.endsWith('._') && files.has(name.slice(0, -2))) continue;
-    wanted.push(name);
-  }
-  const wantedSet = new Set(wanted);
-
-  // Removals first: departed rows are marked leaving (and dropped from
-  // rowEls) BEFORE the ordering loop, so the loop treats them as transparent
-  // and never reorders siblings around them (that would snap, not slide).
-  for (const name of [...rowEls.keys()]) {
-    if (!wantedSet.has(name)) removeRow(name, false);
-  }
-
-  // In-place ordering: only rows that are out of position are moved, so
-  // running animations (entrance, shimmer) are never restarted by a render.
-  // Rows mid-leave-animation (no longer in rowEls) are skipped and keep
-  // their spot — reordering siblings around them would make them snap
-  // instead of slide with the collapse.
-  let cursor = fileList.firstChild;
-  for (const name of wanted) {
-    let li = rowEls.get(name);
-    if (!li) {
-      li = buildRow(name);
-      rowEls.set(name, li);
-    }
-    updateRow(li, name, files.get(name));
-    while (cursor && !rowEls.has(cursor.dataset.name)) {
-      cursor = cursor.nextSibling;
-    }
-    if (li === cursor) {
-      cursor = cursor.nextSibling;
-    } else {
-      fileList.insertBefore(li, cursor);
-    }
-  }
-
-  const unpackable = [...files].some(
-    ([name, e]) =>
-      !name.endsWith('._') &&
-      e.kind !== undefined &&
-      !e.kind.startsWith('android-') &&
-      e.state === 'staged',
-  );
-  unpackBtn.disabled = !unpackable;
-  actions.hidden = files.size === 0;
-
-  // The hint reflects the current staged set: the budget's own guidance when
-  // it has something to say, otherwise the standing explanation.
-  if (budgetPlan && budgetPlan.guidance.length > 0) {
-    limitHint.textContent = budgetPlan.guidance.join(' ');
-    limitHint.classList.toggle('warn', budgetPlan.blocked.length > 0);
-  } else {
-    limitHint.textContent = LIMIT_BASE_HINT;
-    limitHint.classList.remove('warn');
-  }
-}
-
-clearBtn.addEventListener('click', () => {
-  files.clear();
-  render();
-});
-
-/**
- * Run one job in a disposable Web Worker (fresh wasm instance per call — see
- * worker.js). Buffers are transferred, so the inputs are neutered on the main
- * thread afterwards; callers re-read from the File for a retry.
- *
- * `job` is read eagerly, but `read()` only runs after the caller has checked
- * the budget: no `arrayBuffer()` call happens here.
- */
-function runJob(job) {
-  return new Promise((resolve) => {
-    const w = new Worker('worker.js', { type: 'module' });
-    w.onmessage = (e) => {
-      w.terminate();
-      resolve(e.data);
-    };
-    w.onerror = (e) => {
-      w.terminate();
-      // A worker that fails to load (404, syntax error) reports no trap: the
-      // retry below must not rerun an identical broken job.
-      resolve({ ok: false, trap: false, message: e.message || 'worker error', profile: null });
-    };
-    const transfer = [job.input.buffer, ...(job.companion ? [job.companion.buffer] : [])];
-    w.postMessage(job, transfer);
-  });
-}
-
-/** Read a File only after the budget check has allowed it. */
-async function readFile(file) {
-  return new Uint8Array(await file.arrayBuffer());
-}
-
-/**
- * Apply one worker reply to a row, keeping the failure profile and error.
- *
- * The profile is stored even when the job failed: it names the route that ran
- * and why it was rejected, which is what the exported report needs.
- */
-function applyReply(entry, r) {
-  entry.profile = r.profile ?? entry.profile;
-  if (!r.ok) {
-    entry.state = 'err';
-    entry.error = r.message ?? r.error ?? 'unpack failed';
-    entry.findings = [];
-    entry.note = r.trap
-      ? 'unpack failed (internal trap) — this CrackProof layout may be unsupported'
-      : entry.error;
-    return false;
-  }
-  entry.findings = (r.issues ?? []).map((message, index) => ({
-    severity: r.severities?.[index] === 'fatal' ? 'fatal' : 'warning',
-    message,
-  }));
-  entry.suspect = r.suspect === true;
-  entry.companionUsed = r.companion === true;
-  entry.error = null;
+/** Set a region's HTML when it changed, keeping the focus where it was. */
+function put(node, html) {
+  if (shown.get(node) === html) return false;
+  const focus = node.contains(document.activeElement) ? focusKey(document.activeElement) : null;
+  node.innerHTML = html;
+  shown.set(node, html);
+  if (focus) node.querySelector(focus)?.focus();
   return true;
 }
 
-async function unpackModule(name, entry) {
-  const compEntry = files.get(`${name}._`);
+const listed = new WeakMap();
 
-  let input = await readFile(entry.file);
-  let comp = compEntry ? await readFile(compEntry.file) : undefined;
-  let r = await runJob({ mode: 'unpack', input, companion: comp ?? null, forceExe: false });
-  let retried = false;
-
-  const isExe = entry.kind === 'native-exe' || entry.kind === 'managed-exe';
-  if (!r.ok && r.trap && !isExe) {
-    // The DLL-routing probe trapped (panics can't be caught in wasm). Retry
-    // once with the forced-EXE pipeline in a fresh worker — this mirrors the
-    // CLI's dll-first/exe-fallback outcome for EXE-shell-layout DLLs.
-    input = await readFile(entry.file);
-    comp = compEntry ? await readFile(compEntry.file) : undefined;
-    r = await runJob({ mode: 'unpack', input, companion: comp ?? null, forceExe: true });
-    retried = true;
-  }
-  entry.retried = retried;
-
-  if (!applyReply(entry, r)) return;
-  entry.state = 'ok';
-  entry.bytes = r.bytes;
-  entry.outputBytes = r.bytes.byteLength;
-  entry.outputName = outName(name);
-  const parts = [];
-  if (r.companion || comp) parts.push('spliced from ._ companion');
-  parts.push(`kind: ${r.kind}`);
-  if (retried) parts.push('forced-EXE retry');
-  if (entry.suspect) {
-    // The per-finding text lives in the details list; the status line only
-    // has to say how serious it is.
-    const fatal = entry.findings.filter((finding) => finding.severity === 'fatal').length;
-    const warnings = entry.findings.length - fatal;
-    const counts = [
-      fatal > 0 ? `${fatal} fatal` : null,
-      warnings > 0 ? `${warnings} warning${warnings === 1 ? '' : 's'}` : null,
-    ].filter(Boolean).join(', ');
-    parts.push(`${r.fatal ? 'FAILED static check' : 'suspect'} (${counts})`);
-  }
-  entry.note = parts.join(' — ');
-}
-
-async function unpackMetadata(name, entry) {
-  const input = await readFile(entry.file);
-  const r = await runJob({ mode: 'metadata', input });
-  if (!applyReply(entry, r)) return;
-  const report = r.metadata ?? {};
-  if (report.remapped === 0) {
-    entry.state = 'err';
-    entry.error =
-      `metadata already clean (v${report.version}, ${report.methods} methods) — nothing to do`;
-    entry.note = entry.error;
+/**
+ * Set a list's rows, each `{ key, html }` with one element of HTML.
+ *
+ * While rows keep their places only the ones that changed are replaced, so a
+ * click on a row is not lost to a run that updates another row many times a
+ * second, and a long list is not rebuilt for one change.
+ */
+function putRows(node, rows) {
+  const before = listed.get(node);
+  listed.set(node, rows);
+  const kept =
+    before &&
+    before.length <= rows.length &&
+    node.childElementCount === before.length &&
+    before.every((row, index) => row.key === rows[index].key);
+  if (!kept) {
+    put(node, rows.map((row) => row.html).join(''));
     return;
   }
-  entry.state = 'ok';
-  entry.bytes = r.bytes;
-  entry.outputBytes = r.bytes.byteLength;
-  entry.outputName = outName(name);
-  entry.note =
-    `${report.remapped}/${report.methods} method tokens remapped across ${report.modules} modules`;
-}
-
-unpackBtn.addEventListener('click', async () => {
-  unpackBtn.disabled = true;
-  clearBtn.disabled = true;
-  try {
-    for (const [name, entry] of files) {
-      if (name.endsWith('._') || entry.state !== 'staged') continue;
-
-      if (entry.kind === undefined) {
-        entry.state = 'err';
-        entry.error = 'not recognized as CrackProof-protected — skipped';
-        entry.note = entry.error;
-        render();
-        continue;
-      }
-
-      // Android rows are informational only (no wasm pipeline); their staged
-      // status line already says to use the CLI.
-      if (entry.kind.startsWith('android-')) continue;
-
-      // Budget gate. Runs before any read of the module body: `entry.file`
-      // has not been touched for bytes yet. A blocked module keeps its
-      // companion paired; only its own read is skipped.
-      if (isBlocked(name)) {
-        entry.state = 'blocked';
-        entry.error =
-          `${name} is above the ${formatBytes(limitBytes)} input limit — raise the limit to unpack it`;
-        entry.note = entry.error;
-        render();
-        continue;
-      }
-
-      entry.state = 'working';
-      render();
-      entry.inputBytes = entry.file.size + (files.get(`${name}._`)?.file.size ?? 0);
-      try {
-        if (entry.kind === 'metadata') {
-          await unpackMetadata(name, entry);
-        } else {
-          await unpackModule(name, entry);
-        }
-      } catch (e) {
-        entry.state = 'err';
-        entry.error = e instanceof Error ? e.message : String(e);
-        entry.note = entry.error;
-      }
-      render();
+  let child = node.firstElementChild;
+  for (let index = 0; index < before.length; index += 1) {
+    const next = child.nextElementSibling;
+    if (before[index].html !== rows[index].html) {
+      const focused = child === document.activeElement;
+      child.insertAdjacentHTML('afterend', rows[index].html);
+      const fresh = child.nextElementSibling;
+      child.remove();
+      if (focused) fresh.focus();
     }
-  } finally {
-    clearBtn.disabled = false;
-    render();
+    child = next;
   }
-});
-
-// --- JSON export ----------------------------------------------------------
-
-function downloadJson(name, text) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  a.click();
-  // Revoke on the next task: revoking synchronously can cancel the download
-  // in some browsers.
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+  if (rows.length > before.length) {
+    node.insertAdjacentHTML('beforeend', rows.slice(before.length).map((row) => row.html).join(''));
+  }
+  shown.delete(node);
 }
 
-function generatedAt() {
-  return new Date().toISOString();
+const canPickFolder = () => typeof window.showDirectoryPicker === 'function';
+
+let frameLanguage = null;
+let detailKey = null;
+
+function render() {
+  put(el.topbar, view.topbar());
+  el.main.classList.toggle('blank', state.groups.length === 0);
+  el.main.classList.toggle('show-detail', state.showDetail);
+  if (frameLanguage !== language()) {
+    frameLanguage = language();
+    el.inputs.innerHTML = view.inputsFrame();
+    el.chips = $('chips');
+    el.list = $('list');
+    el.search = $('search');
+    el.clear = $('clear');
+    el.search.value = state.search;
+    listed.delete(el.list);
+  }
+  el.clear.disabled = outputBusy();
+  for (const control of el.settings.querySelectorAll('#set-output, [data-act="reset"]')) {
+    control.disabled = outputBusy();
+  }
+  put(el.chips, view.chips());
+  el.chips.hidden = el.chips.childElementCount === 0;
+  putRows(el.list, view.listRows());
+
+  // A re-render of the same view keeps its scroll position.
+  const key = `${state.selected}|${state.tab}`;
+  const top = key === detailKey ? (el.detail.querySelector('.scroll')?.scrollTop ?? 0) : 0;
+  if (put(el.detail, view.detail()) && top) {
+    const body = el.detail.querySelector('.scroll');
+    if (body) body.scrollTop = top;
+  }
+  detailKey = key;
+  renderStatus();
+  $('dragover-title').textContent = t('drag.title');
+}
+
+function renderStatus() {
+  put(el.status, view.status());
+  // The button stays in the document while the line beside it is redrawn, so
+  // a click on it always lands.
+  el.cancel.hidden = state.run === null;
+  el.cancel.disabled = state.run?.stopping === true;
+  el.cancel.textContent = t('run.cancel');
+}
+
+let scheduled = false;
+
+/** Render once, after the changes of this turn. */
+function invalidate() {
+  if (scheduled) return;
+  scheduled = true;
+  queueMicrotask(() => {
+    scheduled = false;
+    render();
+  });
+}
+
+onChange(invalidate);
+
+// The clock of a running input moves between the events that redraw the page.
+setInterval(() => {
+  if (state.run) renderStatus();
+}, 100);
+
+// ---------- adding inputs ----------
+
+const prober = new Prober();
+let scanChain = Promise.resolve();
+let packages = null;
+
+const packageModule = () => (packages ??= import('./package.js'));
+
+/** True for the picked-files group once it holds nothing a later file could use. */
+const isSpent = (group) =>
+  group.kind === 'files' && group.items.length === 0 && group.companions.size === 0 && !group.scanning;
+
+function filesGroup() {
+  let group = state.groups.find((candidate) => candidate.kind === 'files');
+  if (!group) {
+    group = makeGroup('files', '');
+    state.groups.unshift(group);
+  }
+  return group;
+}
+
+/** Where a module's header starts; a companion begins with a copy of it. */
+const HEADER_OFFSET = 4096;
+const HEADER_PROBE = 32;
+
+/**
+ * What the `._` file beside a module is to it: `{ state, name }`, with `state`
+ * one of `absent`, `spliced`, `unmatched`, `unreadable`. A companion is this
+ * module's payload when it starts with the module's own `header` bytes.
+ */
+async function companionOf(group, path, header) {
+  const name = `${baseName(path)}._`;
+  const open = group.companions.get(`${path}._`);
+  if (!open) return { state: 'absent', name };
+  try {
+    const file = await open();
+    const head = new Uint8Array(await file.slice(0, HEADER_PROBE).arrayBuffer());
+    const same =
+      head.length === HEADER_PROBE &&
+      header.length === HEADER_PROBE &&
+      head.every((byte, index) => byte === header[index]);
+    return { state: same ? 'spliced' : 'unmatched', name };
+  } catch {
+    return { state: 'unreadable', name };
+  }
 }
 
 /**
- * Per-row export: one file's report in the same envelope as the all-files
- * export, so a consumer parses one shape. The row's companion is included as
- * `companion_used` only — the companion has no report of its own.
+ * Decide what one file is.
+ *
+ * Returns `{ item }` for an input to list, `{ skipped: true }` for a file that
+ * was probed and is not a target, and `{}` for one too small to probe. A file
+ * the user picked is always listed, and is told by what it holds whatever its
+ * name; a file a folder scan found is listed only when it is a target.
  */
-function exportOne(name) {
-  const entry = files.get(name);
-  if (!entry) return;
-  const at = generatedAt();
-  downloadJson(
-    reportFileName(name, at),
-    serializeReport(buildReport(new Map([[name, entry]]), {
-      generatedAt: at,
-      limitBytes,
-      includeNotes: true,
-    })),
+async function classify(group, candidate, file, explicit) {
+  const item = makeItem(group, candidate, file.size);
+  // A file that is no target is known by its name and size alone.
+  const plain = () => {
+    item.kind = null;
+    item.notProtected = true;
+    return explicit ? { item } : { skipped: true };
+  };
+  if (file.size < MIN_SIZE && !explicit) return {};
+
+  const prefix = new Uint8Array(await file.slice(0, PREFIX_SIZE).arrayBuffer());
+  const magic = sniff(prefix);
+  const named = (kind) => explicit || candidate.kind === kind;
+
+  if (magic.zip && candidate.kind === 'package') {
+    // Every app package is listed; what it holds is known once it has run.
+    item.kind = 'package';
+    item.entries = [];
+    const { inventory, UnsafeEntry } = await packageModule();
+    try {
+      item.container = await inventory(
+        file,
+        candidate.path,
+        (bytes, truncated) => prober.manifest(bytes, truncated),
+        { maxNestedBytes: state.limitBytes * 4 },
+      );
+      item.entries = makeEntries(item);
+    } catch (error) {
+      item.identityError = error instanceof UnsafeEntry
+        ? await prober.unsafeEntry(shownPath(fullPath(item)), language())
+        : pageError('web.read_failed', null, error?.message ?? error);
+    }
+    return { item };
+  }
+  if (magic.metadata && named('metadata')) {
+    item.kind = 'metadata';
+    item.pre = (await prober.prefix(prefix)).profile;
+    item.metadataVersion = prefix.length >= 8 ? new DataView(prefix.buffer).getUint32(4, true) : null;
+    return { item };
+  }
+  if (magic.mz && named('pe')) {
+    const reply = await prober.prefix(prefix);
+    item.kind = 'pe';
+    item.pre = reply.profile;
+    item.peKind = reply.kind;
+    item.header = prefix.slice(HEADER_OFFSET, HEADER_OFFSET + HEADER_PROBE);
+    item.companion = await companionOf(group, candidate.path, item.header);
+    if (reply.kind) return { item };
+    // A module without the protection keeps what its header says it is.
+    item.notProtected = true;
+    return explicit ? { item } : { skipped: true };
+  }
+  if (magic.elf64Aarch64 && named('so')) {
+    item.kind = 'so';
+    // A library over the limit is not read here; it stays a candidate.
+    if (file.size > state.limitBytes) return { item };
+    item.pre = await prober.library(file, file.size);
+    if (item.pre?.recognition !== 'not_recognized') return { item };
+    item.pre = null;
+  }
+  return plain();
+}
+
+/** The identity of a picked file, by which the same file is not listed twice. */
+const fileKey = (file) => `${file.name}|${file.size}|${file.lastModified}`;
+
+async function runScan(scan, candidates, source) {
+  const { group } = scan;
+  const { signal } = scan.controller;
+  let list = candidates;
+  if (!list) {
+    const walk = source.walk(() => {
+      group.stats.walkErrors += 1;
+    });
+    const found = await collect(walk, signal);
+    list = found.candidates;
+    for (const [path, open] of found.companions) group.companions.set(path, open);
+  }
+  let first = true;
+  for (const candidate of list) {
+    if (signal.aborted) return;
+    let item = null;
+    try {
+      const file = await candidate.open();
+      const outcome = await classify(group, candidate, file, source.explicit);
+      if (signal.aborted) return;
+      item = outcome.item ?? null;
+      if (outcome.skipped) group.stats.skipped += 1;
+    } catch (error) {
+      if (signal.aborted) return;
+      if (source.explicit) {
+        // A picked file that cannot be examined is still listed, with why.
+        item = makeItem(group, candidate, 0);
+        item.identityError = pageError('web.read_failed', null, error?.message ?? error);
+      } else {
+        group.stats.probeErrors += 1;
+      }
+    }
+    if (item) {
+      item.fileKey = candidate.key ?? null;
+      group.items.push(item);
+      group.found += 1;
+      // Added files show the first of them, unless an input is already shown.
+      if (first && source.explicit && !find(state.selected)?.item) {
+        state.selected = item.id;
+        state.multi = [];
+      }
+      first = false;
+    }
+    invalidate();
+  }
+}
+
+function startScan(group, candidates, source) {
+  const scan = { group, controller: new AbortController() };
+  state.scans.push(scan);
+  group.scanning = true;
+  if (!source.explicit) {
+    // An added folder is shown at once, while its scan runs.
+    state.selected = group.id;
+    state.multi = [];
+  }
+  state.notice = null;
+  invalidate();
+  scanChain = scanChain
+    .then(() => runScan(scan, candidates, source))
+    .catch((error) => console.error(error))
+    .then(() => {
+      state.scans = state.scans.filter((other) => other !== scan);
+      group.scanning = state.scans.some((other) => other.group === group);
+      // The probe worker is not kept between scans.
+      if (state.scans.length === 0) prober.close();
+      if (isSpent(group)) dropGroup(group);
+      invalidate();
+    });
+}
+
+/** Look again at the companions of modules that were added before them. */
+async function repair(group, names) {
+  for (const item of group.items) {
+    if (item.kind !== 'pe' || !item.header || !names.has(`${item.relPath}._`)) continue;
+    item.companion = await companionOf(group, item.relPath, item.header);
+  }
+  invalidate();
+}
+
+function addFiles(files) {
+  if (files.length === 0) return;
+  const group = filesGroup();
+  const known = new Set(group.items.map((item) => item.fileKey));
+  const candidates = [];
+  const companions = new Set();
+  for (const file of files) {
+    const open = async () => file;
+    if (isCompanionName(file.name)) {
+      group.companions.set(file.name, open);
+      companions.add(file.name);
+    } else if (!known.has(fileKey(file))) {
+      known.add(fileKey(file));
+      candidates.push({ path: file.name, kind: candidateKind(file.name), open, key: fileKey(file) });
+    }
+  }
+  if (companions.size) repair(group, companions);
+  startScan(group, candidates, { explicit: true });
+}
+
+function addFolder(name, walk, handle = null) {
+  const group = makeGroup('folder', name || '/', handle);
+  state.groups.push(group);
+  startScan(group, null, { explicit: false, walk });
+}
+
+/** The group of a folder that was dropped before, when the browser can tell. */
+async function sameFolder(handle) {
+  for (const group of state.groups) {
+    if (group.handle && (await group.handle.isSameEntry(handle).catch(() => false))) return group;
+  }
+  return null;
+}
+
+/** What a drop holds. Called inside the drop handler, where the items are live. */
+function takeDrop(transfer) {
+  return [...(transfer?.items ?? [])]
+    .filter((item) => item.kind === 'file')
+    .map((item) => ({
+      handle: item.getAsFileSystemHandle ? item.getAsFileSystemHandle().catch(() => null) : null,
+      entry: item.webkitGetAsEntry?.() ?? null,
+      file: item.getAsFile(),
+    }));
+}
+
+async function addDropped(taken) {
+  const files = [];
+  for (const { handle, entry, file } of taken) {
+    if (entry?.isDirectory) {
+      // The entry lists the folder: see `scan.js`. The handle, where the
+      // browser gives one, only tells whether two folders are the same.
+      const dropped = handle ? await handle : null;
+      const directory = dropped?.kind === 'directory' ? dropped : null;
+      const again = directory ? await sameFolder(directory) : null;
+      if (again) select(again.id);
+      else addFolder(entry.name, (onError) => walkEntry(entry, onError), directory);
+    } else if (file) {
+      files.push(file);
+    }
+  }
+  addFiles(files);
+}
+
+// ---------- removing inputs ----------
+
+function dropGroup(group) {
+  for (const scan of state.scans) if (scan.group === group) scan.controller.abort();
+  state.groups = state.groups.filter((other) => other !== group);
+}
+
+/** Drop what the selection held of rows that are gone. */
+function forget() {
+  state.multi = state.multi.filter((id) => find(id));
+  if (state.selected && !find(state.selected)) {
+    state.selected = null;
+    state.showDetail = false;
+  }
+}
+
+/** Remove the group, or the input, with `id`. An entry stands for its package. */
+function remove(id) {
+  const current = id && find(id);
+  if (!current || outputBusy()) return;
+  if (current.group) {
+    dropGroup(current.group);
+  } else {
+    const item = current.item.parent ?? current.item;
+    const group = item.group;
+    group.items = group.items.filter((other) => other !== item);
+    if (isSpent(group)) dropGroup(group);
+  }
+  forget();
+  invalidate();
+}
+
+function clearAll() {
+  if (outputBusy()) return;
+  for (const group of [...state.groups]) dropGroup(group);
+  state.contexts.clear();
+  state.unfolded.clear();
+  state.selected = null;
+  state.multi = [];
+  state.showDetail = false;
+  state.filter = 'all';
+  state.search = '';
+  if (el.search) el.search.value = '';
+  state.tab = 'overview';
+  state.notice = null;
+  invalidate();
+}
+
+// ---------- handing results back ----------
+
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+async function downloadAll() {
+  const archive = await downloadArchive(allItems());
+  if (archive) download(archive.blob, archive.name);
+}
+
+/** The inputs an export covers and the name it goes by: the selection's. */
+function exportScope() {
+  const current = state.selected && find(state.selected);
+  const item = current?.item ? (current.item.parent ?? current.item) : null;
+  const items = item ? [item] : current?.group ? current.group.items : allItems();
+  const name = item ? item.name : current?.group?.kind === 'folder' ? current.group.name : null;
+  return { items, name };
+}
+
+function exportReport() {
+  const { items, name } = exportScope();
+  const generatedAt = new Date().toISOString();
+  const report = buildReport(items, { generatedAt, version: VERSION, limitBytes: state.limitBytes });
+  download(
+    new Blob([serializeReport(report)], { type: 'application/json' }),
+    reportFileName(name, generatedAt),
   );
 }
 
-exportBtn.addEventListener('click', () => {
-  const at = generatedAt();
-  downloadJson(
-    reportFileName(null, at),
-    serializeReport(buildReport(files, { generatedAt: at, limitBytes, includeNotes: true })),
+async function exportText() {
+  const { items, name } = exportScope();
+  const { reportText } = await import('./text.js');
+  download(
+    new Blob([reportText(items)], { type: 'text/plain;charset=utf-8' }),
+    reportFileName(name, new Date().toISOString(), 'txt'),
   );
+}
+
+/** Ask for the folder outputs are written to. Resolves to whether one was chosen. */
+async function chooseOutputFolder() {
+  if (outputBusy()) return false;
+  let dir;
+  try {
+    dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+  } catch {
+    return false;
+  }
+  if (outputBusy()) return false;
+  state.out = { mode: 'folder', dir };
+  invalidate();
+  // Results that are already here are written too, wherever they went before.
+  await saveAll(allItems(), true);
+  return true;
+}
+
+function setOutput(mode) {
+  if (outputBusy()) return;
+  state.out = { ...state.out, mode };
+  invalidate();
+  if (mode === 'folder') saveAll(allItems(), false);
+}
+
+async function copyText(text, button) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    return;
+  }
+  if (!button) return;
+  const label = button.textContent;
+  button.textContent = '✓';
+  setTimeout(() => {
+    if (button.isConnected) button.textContent = label;
+  }, 900);
+}
+
+// ---------- menus and dialogs ----------
+
+function closeMenu() {
+  el.menu.innerHTML = '';
+}
+
+function openMenu(html, x, y) {
+  el.menu.innerHTML = `<div class="ctx" role="menu">${html}</div>`;
+  const box = el.menu.firstElementChild;
+  const { width, height } = box.getBoundingClientRect();
+  box.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
+  box.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
+  box.querySelector('button:not(:disabled)')?.focus();
+}
+
+function showDialog(dialog) {
+  if (dialog.open) return;
+  dialog.classList.add('opening');
+  dialog.showModal();
+  // Commit the transparent starting state after the dialog enters the top
+  // layer. This also works in browsers without CSS @starting-style.
+  dialog.getBoundingClientRect();
+  dialog.classList.remove('opening');
+}
+
+function openLegal() {
+  el.legal.innerHTML = view.legal(accepted);
+  showDialog(el.legal);
+}
+
+function drawSettings() {
+  el.settings.innerHTML = view.settings(canPickFolder());
+}
+
+function openSettings() {
+  drawSettings();
+  showDialog(el.settings);
+}
+
+/** Keep the backdrop modal until its fade finishes, then let the browser restore focus. */
+async function closeDialog(dialog) {
+  if (!dialog.open || dialog.inert) return false;
+  dialog.inert = true;
+  const fade = dialog.getAnimations().find((animation) => animation.transitionProperty === 'opacity');
+  if (fade) await fade.finished.catch(() => {});
+  dialog.close();
+  dialog.inert = false;
+  return true;
+}
+
+async function setLanguage(tag, remember = true) {
+  await loadLanguage(tag);
+  if (remember) store(STORE.language, language());
+  document.title = 'Senbei';
+  if (el.legal.open) el.legal.innerHTML = view.legal(accepted);
+  if (el.settings.open) drawSettings();
+  closeMenu();
+  render();
+}
+
+/**
+ * Show the row with `id`. With `toggle`, as with Ctrl or Cmd held, the row
+ * joins or leaves the rows a run takes; a group is never one of those.
+ */
+function select(id, toggle = false) {
+  const current = find(id);
+  if (!current) return;
+  if (toggle && !current.group) {
+    const shownNow = state.selected;
+    if (shownNow && !state.multi.includes(shownNow) && find(shownNow)?.item) state.multi.push(shownNow);
+    const at = state.multi.indexOf(id);
+    if (at >= 0) state.multi.splice(at, 1);
+    else state.multi.push(id);
+  } else {
+    state.multi = [];
+  }
+  state.selected = id;
+  state.showDetail = true;
+  invalidate();
+}
+
+/** True while inputs cannot be run or removed. */
+const busy = () => outputBusy() || state.scans.length > 0;
+
+const actions = {
+  'add-files': () => el.pickFiles.click(),
+  'add-folder': () => el.pickFolder.click(),
+  run: () => startRun(targets()),
+  'run-item': (node) => {
+    closeMenu();
+    const item = find(node.dataset.id)?.item;
+    if (item) startRun([item.parent ?? item]);
+  },
+  cancel: cancelRun,
+  select: (node, event) => select(node.dataset.id, el.list.contains(node) && (event.ctrlKey || event.metaKey)),
+  toggle: (node) => {
+    const id = node.dataset.id;
+    if (!state.collapsed.delete(id)) state.collapsed.add(id);
+    invalidate();
+  },
+  'show-entries': (node) => {
+    state.multi = [];
+    state.selected = node.dataset.id;
+    state.tab = 'entries';
+    state.showNonTargets = true;
+    state.showDetail = true;
+    invalidate();
+  },
+  filter: (node) => {
+    state.filter = node.dataset.filter;
+    invalidate();
+  },
+  tab: (node) => {
+    state.tab = node.dataset.tab;
+    invalidate();
+  },
+  loglevel: (node) => {
+    state.logLevel = node.dataset.level;
+    invalidate();
+  },
+  back: () => {
+    state.showDetail = false;
+    invalidate();
+  },
+  copy: (node) => copyText(node.dataset.text, node),
+  'copy-log': (node) => copyText(view.logText(), node),
+  'copy-path': (node) => {
+    closeMenu();
+    const item = find(node.dataset.id)?.item;
+    if (item) copyText(shownPath(fullPath(item)));
+  },
+  download: (node) => {
+    const output = find(node.dataset.id)?.item?.result?.outputs[Number(node.dataset.n)];
+    if (output) download(output.blob, baseName(output.path));
+  },
+  'download-all': () => downloadAll(),
+  export: exportReport,
+  'export-text': () => exportText(),
+  remove: (node) => {
+    closeMenu();
+    remove(node.dataset.id);
+  },
+  clear: clearAll,
+  'out-menu': (node) => {
+    const box = node.getBoundingClientRect();
+    openMenu(view.outMenu(canPickFolder()), box.right - 330, box.bottom + 4);
+  },
+  'out-downloads': () => {
+    closeMenu();
+    setOutput('downloads');
+  },
+  'out-folder': () => {
+    closeMenu();
+    setOutput('folder');
+  },
+  'out-choose': () => {
+    closeMenu();
+    chooseOutputFolder();
+  },
+  settings: openSettings,
+  'settings-tab': (node) => {
+    state.settingsTab = node.dataset.tab;
+    drawSettings();
+  },
+  'close-settings': () => closeDialog(el.settings),
+  'show-legal': async () => {
+    if (await closeDialog(el.settings)) openLegal();
+  },
+  'close-legal': () => closeDialog(el.legal),
+  accept: () => {
+    accepted = true;
+    store(STORE.legal, '1');
+    closeDialog(el.legal);
+    warmUp();
+  },
+  reset: async () => {
+    if (outputBusy()) return;
+    store(STORE.language, null);
+    store(STORE.limit, null);
+    state.limitBytes = DEFAULT_LIMIT_MIB * 1024 * 1024;
+    state.out = { mode: 'downloads', dir: null };
+    await setLanguage(languageFor(navigator.languages), false);
+  },
+};
+
+const changes = {
+  language: (node) => setLanguage(node.value),
+  limit: (node) => {
+    state.limitBytes = parseLimitMiB(node.value, state.limitBytes);
+    store(STORE.limit, String(Math.round(state.limitBytes / (1024 * 1024))));
+    drawSettings();
+  },
+  output: async (node) => {
+    if (node.value === 'choose') await chooseOutputFolder();
+    else setOutput(node.value);
+    if (el.settings.open) drawSettings();
+  },
+  'non-targets': (node) => {
+    state.showNonTargets = node.checked;
+    invalidate();
+  },
+};
+
+// ---------- events ----------
+
+document.addEventListener('click', (event) => {
+  // A folded part stays as it was left when its view is drawn again: the
+  // click is about to open or close it.
+  const folded = event.target.closest?.('details[data-fold] > summary')?.parentElement;
+  if (folded?.open) state.unfolded.delete(folded.dataset.fold);
+  else if (folded) state.unfolded.add(folded.dataset.fold);
+  const node = event.target.closest?.('[data-act]');
+  if (!el.menu.contains(event.target) && node?.dataset.act !== 'out-menu') closeMenu();
+  if (!node || node.disabled) return;
+  actions[node.dataset.act]?.(node, event);
 });
 
-// Paint the initial state so the limit hint and the action row are consistent
-// before anything is staged.
-render();
+document.addEventListener('change', (event) => {
+  const node = event.target.closest?.('[data-change]');
+  if (node) changes[node.dataset.change]?.(node);
+});
+
+document.addEventListener('input', (event) => {
+  if (event.target.id !== 'search') return;
+  state.search = event.target.value;
+  invalidate();
+});
+
+const typing = (event) => Boolean(event.target.closest?.('input, select, textarea'));
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    closeMenu();
+    return;
+  }
+  if (!accepted || el.legal.open || el.settings.open) return;
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'o') {
+    event.preventDefault();
+    el.pickFiles.click();
+    return;
+  }
+  if (event.key === 'Delete' && !typing(event) && !busy()) {
+    // The key removes an input, never a whole group.
+    const item = state.selected && find(state.selected)?.item;
+    if (item && !item.isEntry) remove(item.id);
+    return;
+  }
+  const node = event.target.closest?.('[tabindex][data-act]');
+  if (!node) return;
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    node.click();
+  } else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && el.list?.contains(node)) {
+    event.preventDefault();
+    const rows = [...el.list.querySelectorAll('[data-act="select"]')];
+    const next = rows[rows.indexOf(node) + (event.key === 'ArrowDown' ? 1 : -1)];
+    if (next) {
+      next.focus();
+      // Moving through the list selects without leaving it on a narrow window.
+      state.selected = next.dataset.id;
+      state.multi = [];
+      invalidate();
+    }
+  }
+});
+
+document.addEventListener('contextmenu', (event) => {
+  const node = event.target.closest?.('#list [data-act="select"]');
+  if (!node) return;
+  event.preventDefault();
+  const id = node.dataset.id;
+  const current = find(id);
+  if (!current) return;
+  const item = current.item;
+  const options = {
+    kind: current.group ? 'group' : item.isEntry ? 'entry' : 'item',
+    runnable: Boolean(item) && (item.isEntry || !item.notProtected) && !isBusy(item.parent ?? item),
+    busy: busy(),
+  };
+  openMenu(view.rowMenu(id, options), event.clientX, event.clientY);
+});
+
+window.addEventListener('resize', closeMenu);
+
+el.pickFiles.addEventListener('change', () => {
+  const files = [...el.pickFiles.files];
+  el.pickFiles.value = '';
+  addFiles(files);
+});
+
+el.pickFolder.addEventListener('change', () => {
+  const files = [...el.pickFolder.files];
+  el.pickFolder.value = '';
+  if (files.length === 0) return;
+  // A browser that cannot pick a folder hands over plain files instead.
+  if (files.some((file) => file.webkitRelativePath)) addFolder(fileListRoot(files), () => walkFileList(files));
+  else addFiles(files);
+});
+
+// Route Escape through the fade; the first-use notice still requires acceptance.
+for (const dialog of [el.settings, el.legal]) {
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (dialog !== el.legal || accepted) closeDialog(dialog);
+  });
+}
+
+let dragDepth = 0;
+const hasFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes('Files');
+const canDrop = () => accepted && !el.settings.open && !el.legal.open;
+
+window.addEventListener('dragenter', (event) => {
+  if (!canDrop() || !hasFiles(event)) return;
+  event.preventDefault();
+  dragDepth += 1;
+  el.dragover.hidden = false;
+});
+window.addEventListener('dragover', (event) => {
+  if (canDrop() && hasFiles(event)) event.preventDefault();
+});
+window.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) el.dragover.hidden = true;
+});
+window.addEventListener('drop', (event) => {
+  dragDepth = 0;
+  el.dragover.hidden = true;
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  if (canDrop()) addDropped(takeDrop(event.dataTransfer));
+});
+
+window.addEventListener('beforeunload', (event) => {
+  // Results live in this tab only.
+  if (state.run || allOutputs().length) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+
+// ---------- start ----------
+
+/** Fetch and compile the engine while the page is idle, before it is needed. */
+function warmUp() {
+  const start = () => loadEngine().catch(() => {});
+  if (window.requestIdleCallback) requestIdleCallback(start, { timeout: 3000 });
+  else setTimeout(start, 300);
+}
+
+async function start() {
+  state.limitBytes = parseLimitMiB(stored(STORE.limit));
+  const wanted = stored(STORE.language);
+  const known = LANGUAGES.some(([code]) => code === wanted);
+  await setLanguage(known ? wanted : languageFor(navigator.languages), false);
+  if (accepted) warmUp();
+  else openLegal();
+}
+
+start();

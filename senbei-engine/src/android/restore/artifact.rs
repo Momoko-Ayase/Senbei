@@ -117,3 +117,82 @@ pub(crate) fn load_artifacts(index_path: &Path) -> Result<BTreeMap<u32, Artifact
     }
     Ok(result)
 }
+
+/// One stage-2 image resolved from an in-memory extraction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemoryArtifact<'a> {
+    pub data: &'a [u8],
+    pub entry_offset: Option<u32>,
+}
+
+/// [`load_artifacts`] for an extraction that wrote nothing.
+///
+/// The same precedence as the on-disk index: the module registry first, then
+/// every stream record in report order, a later record replacing an earlier
+/// one with the same command ID. `input` is the protected ELF the extraction
+/// was made from; direct records are slices of it.
+pub(crate) fn memory_artifacts<'a>(
+    extraction: &'a crate::android::extract::MemoryExtraction,
+    input: &'a [u8],
+) -> Result<BTreeMap<u32, MemoryArtifact<'a>>> {
+    let report = &extraction.report;
+    let mut result = BTreeMap::new();
+    let mut resolve =
+        |command_id: u32, direct: bool, name: &str, size: usize, entry_offset: u32| -> Result<()> {
+            if !wanted_id(command_id) {
+                return Ok(());
+            }
+            let data = extraction
+                .image(input, command_id, direct, name)
+                .filter(|data| data.len() == size)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "invalid artifact for module 0x{command_id:02X}: {name}"
+                    ))
+                })?;
+            result.insert(
+                command_id,
+                MemoryArtifact {
+                    data,
+                    entry_offset: Some(entry_offset),
+                },
+            );
+            Ok(())
+        };
+    for module in &report.module_registry {
+        resolve(
+            module.command_id,
+            false,
+            &module.image_path,
+            module.size,
+            module.entry_offset,
+        )?;
+    }
+    for stream in &report.streams {
+        for record in &stream.records {
+            let Some(image) = &record.image else {
+                continue;
+            };
+            resolve(
+                record.command_id,
+                record.direct,
+                &image.path,
+                image.size,
+                record.entry_offset,
+            )?;
+        }
+    }
+
+    let missing = REQUIRED_IDS
+        .iter()
+        .filter(|id| !result.contains_key(id))
+        .map(|id| format!("0x{id:02X}"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return invalid(format!(
+            "module index lacks required IDs: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(result)
+}

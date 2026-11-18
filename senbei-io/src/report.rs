@@ -829,6 +829,34 @@ pub(crate) fn metadata_unchanged_profile(
     profile
 }
 
+/// Profile for a metadata blob whose transform ran, validated, and needed no
+/// change.
+///
+/// The route was really taken and the bytes really validated, so the attempt is
+/// recorded — but a clean blob is no protection evidence, so recognition stays
+/// `not_recognized` and no protection verdict is claimed. Without this an
+/// inspection of an already-clean blob would say `not_attempted` while the
+/// research section next to it showed the route and its report.
+pub(crate) fn metadata_validated_unchanged_profile(
+    identity: Option<senbei_metadata::MetadataIdentity>,
+    route: LayoutKind,
+) -> ProtectionProfile {
+    let mut profile = ProtectionProfile::new(senbei_engine::ObservedTarget::metadata(
+        identity.map(|identity| identity.raw_version),
+    ));
+    profile.candidates = vec![senbei_engine::LayoutAttempt {
+        layout: route,
+        outcome: AttemptOutcome::Succeeded,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    }];
+    profile.selected = Some(route);
+    profile.recovery = RecoveryStatus::Succeeded;
+    profile.static_validation = ValidationStatus::NotRun;
+    profile.recognition = RecognitionStatus::NotRecognized;
+    profile
+}
+
 /// Profile for a metadata blob whose transform failed.
 pub(crate) fn metadata_failed_profile(
     identity: Option<senbei_metadata::MetadataIdentity>,

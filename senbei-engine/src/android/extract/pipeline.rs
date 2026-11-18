@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapOptions;
@@ -70,8 +71,26 @@ struct DecodeBudget {
     config: Module9bConfig,
 }
 
+/// Where decoded and direct stage-2 artifacts go.
+enum Sink {
+    /// Content-named files under one directory, indexed by `index.json`.
+    Disk(PathBuf),
+    /// Nothing is written. Decoded images stay in the module registry, and a
+    /// direct record is remembered as its byte range in the protected input.
+    Memory(BTreeMap<String, Range<usize>>),
+}
+
+/// How one artifact relates to the protected input.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// Decoded from a container into its own buffer.
+    Decoded,
+    /// A verbatim slice of the input that starts at this file offset.
+    Direct(usize),
+}
+
 struct Extractor {
-    output_dir: PathBuf,
+    sink: Sink,
     streams: Vec<StreamReport>,
     artifacts: Vec<ArtifactReport>,
     registry: BTreeMap<u32, LoadedModule>,
@@ -116,19 +135,123 @@ pub fn extract_stage2_with_limits(
     // lifetime, and extraction never mutates or truncates the source.
     let source = unsafe { MmapOptions::new().map(&file) }
         .map_err(|source| Error::io("map protected ELF", &input_path, source))?;
-    let stage1 = inspect(
+    let (stage1, extractor) = run_extraction(
         &source,
         &input_path,
         options.outer_size,
         options.cipher_constant,
+        limits,
+        Sink::Disk(output_dir.clone()),
+        |plaintext| match &options.stage2_output {
+            Some(stage2_output) => write_atomic(&absolute(stage2_output)?, plaintext),
+            None => Ok(()),
+        },
+    )?;
+    let (report, _) = extractor.into_report(
+        stage1,
+        input_path.display().to_string(),
+        output_dir.display().to_string(),
+    );
+    write_json_atomic(&output_dir.join("index.json"), &report)?;
+    Ok(report)
+}
+
+/// A complete Stage 2 extraction that wrote nothing.
+///
+/// Decoded module images are owned here. A direct record stays a byte range of
+/// the protected input, so the caller keeps that input alive for as long as it
+/// reads artifacts. The report has the same records as an on-disk extraction.
+/// Its artifact names identify entries and are not files. Streams and direct
+/// records have an empty `sha256`: their bytes are ranges of the input and are
+/// not hashed.
+#[derive(Debug)]
+pub struct MemoryExtraction {
+    pub report: ExtractionReport,
+    modules: BTreeMap<u32, Vec<u8>>,
+    direct: BTreeMap<String, Range<usize>>,
+}
+
+impl MemoryExtraction {
+    /// The decoded image of module `command_id`.
+    #[must_use]
+    pub fn module(&self, command_id: u32) -> Option<&[u8]> {
+        self.modules.get(&command_id).map(Vec::as_slice)
+    }
+
+    /// The bytes of one reported artifact image.
+    ///
+    /// `input` is the protected ELF this extraction was made from.
+    pub(crate) fn image<'a>(
+        &'a self,
+        input: &'a [u8],
+        command_id: u32,
+        direct: bool,
+        name: &str,
+    ) -> Option<&'a [u8]> {
+        if direct {
+            input.get(self.direct.get(name)?.clone())
+        } else {
+            self.module(command_id)
+        }
+    }
+}
+
+/// [`extract_stage2_with_limits`] over bytes, writing nothing.
+///
+/// The same decoding and the same budgets; the artifact files and
+/// `index.json` are absent. See [`MemoryExtraction`] for how its report
+/// differs.
+pub fn extract_stage2_in_memory(input: &[u8], limits: &ResourceLimits) -> Result<MemoryExtraction> {
+    let (stage1, extractor) = run_extraction(
+        input,
+        Path::new("<input>"),
+        DEFAULT_OUTER_SIZE,
+        DEFAULT_CIPHER_CONSTANT,
+        limits,
+        Sink::Memory(BTreeMap::new()),
+        |_| Ok(()),
+    )?;
+    let (report, extractor) =
+        extractor.into_report(stage1, "<input>".to_owned(), "<memory>".to_owned());
+    let direct = match extractor.sink {
+        Sink::Memory(direct) => direct,
+        Sink::Disk(_) => BTreeMap::new(),
+    };
+    Ok(MemoryExtraction {
+        report,
+        modules: extractor
+            .registry
+            .into_iter()
+            .map(|(command_id, module)| (command_id, module.image))
+            .collect(),
+        direct,
+    })
+}
+
+/// Decode Stage 1 and every Stage 2 stream of `source` into `sink`.
+///
+/// `stage2_plaintext` sees the decrypted Stage 1 payload before any stream is
+/// decoded, which is where the on-disk driver saves it when asked to.
+fn run_extraction(
+    source: &[u8],
+    input_path: &Path,
+    outer_size: usize,
+    cipher_constant: u32,
+    limits: &ResourceLimits,
+    sink: Sink,
+    stage2_plaintext: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<(Stage1Report, Extractor)> {
+    let stage1 = inspect(
+        source,
+        input_path,
+        outer_size,
+        cipher_constant,
         // Stage 1 plaintext is the first thing this task retains. Its copy
         // is capped by both the single-entry ceiling and whatever remains of
         // the task total, which is the whole total at this point.
         Some(limits.max_entry_bytes.min(limits.max_total_bytes)),
     )?;
-    if let Some(stage2_output) = &options.stage2_output {
-        write_atomic(&absolute(stage2_output)?, &stage1.plaintext)?;
-    }
+    stage2_plaintext(&stage1.plaintext)?;
 
     let core_config =
         Module9bConfig::parse_embedded(&stage1.plaintext).map_err(Error::EmbeddedConfig)?;
@@ -140,7 +263,7 @@ pub fn extract_stage2_with_limits(
         .get(stage1.remaining_file_offset..bootstrap_end)
         .ok_or_else(|| Error::Invalid("Stage 2 bootstrap range is outside the ELF".to_owned()))?;
     let mut extractor = Extractor {
-        output_dir: output_dir.clone(),
+        sink,
         streams: Vec::new(),
         artifacts: Vec::new(),
         registry: BTreeMap::new(),
@@ -157,60 +280,97 @@ pub fn extract_stage2_with_limits(
         .charge(u64::try_from(stage1.plaintext.len()).unwrap_or(u64::MAX))?;
     extractor.extract_stream(
         bootstrap,
-        0xe2,
-        0,
-        None,
-        Some(stage1.remaining_file_offset),
+        StreamPlace {
+            stream_id: 0xe2,
+            depth: 0,
+            parent: None,
+            source_file_offset: Some(stage1.remaining_file_offset),
+            base: stage1.remaining_file_offset,
+        },
         &mut budget,
     )?;
+    Ok((stage1_report(&stage1, outer_size), extractor))
+}
 
-    let module_registry = extractor
-        .registry
-        .values()
-        .map(|module| ModuleRegistryEntry {
-            command_id: module.command_id,
-            size: module.image.len(),
-            sha256: module.sha256.clone(),
-            depth: module.depth,
-            record_index: module.record_index,
-            image_path: module.image_path.clone(),
-            metadata_path: module.metadata_path.clone(),
-            init_offset: module.init_offset,
-            entry_offset: module.entry_offset,
-            classification: if module.metadata.is_some() {
-                "module_image".to_owned()
-            } else {
-                "decoded_data".to_owned()
-            },
-        })
-        .collect::<Vec<_>>();
-    let report = ExtractionReport {
-        format_version: 4,
-        protected_elf: input_path.display().to_string(),
-        output_dir: output_dir.display().to_string(),
-        stage1: stage1_report(&stage1, options.outer_size),
-        streams: extractor.streams,
-        artifacts: extractor.artifacts,
-        errors: Vec::new(),
-        module_registry,
-    };
-    write_json_atomic(&output_dir.join("index.json"), &report)?;
-    Ok(report)
+/// Where one record stream sits: its identity, its nesting, and the file
+/// offset of its first byte in the protected input.
+struct StreamPlace {
+    stream_id: u32,
+    depth: usize,
+    parent: Option<StreamParent>,
+    /// Reported for the bootstrap stream only.
+    source_file_offset: Option<usize>,
+    base: usize,
 }
 
 impl Extractor {
+    /// Close the extraction: the report, and the extractor with its registry.
+    fn into_report(
+        mut self,
+        stage1: Stage1Report,
+        protected_elf: String,
+        output_dir: String,
+    ) -> (ExtractionReport, Self) {
+        let module_registry = self
+            .registry
+            .values()
+            .map(|module| ModuleRegistryEntry {
+                command_id: module.command_id,
+                size: module.image.len(),
+                sha256: module.sha256.clone(),
+                depth: module.depth,
+                record_index: module.record_index,
+                image_path: module.image_path.clone(),
+                metadata_path: module.metadata_path.clone(),
+                init_offset: module.init_offset,
+                entry_offset: module.entry_offset,
+                classification: if module.metadata.is_some() {
+                    "module_image".to_owned()
+                } else {
+                    "decoded_data".to_owned()
+                },
+            })
+            .collect::<Vec<_>>();
+        let report = ExtractionReport {
+            format_version: 4,
+            protected_elf,
+            output_dir,
+            stage1,
+            streams: std::mem::take(&mut self.streams),
+            artifacts: std::mem::take(&mut self.artifacts),
+            errors: Vec::new(),
+            module_registry,
+        };
+        (report, self)
+    }
+
     fn extract_stream(
         &mut self,
         stream: &[u8],
-        stream_id: u32,
-        depth: usize,
-        parent: Option<StreamParent>,
-        source_file_offset: Option<usize>,
+        place: StreamPlace,
         budget: &mut DecodeBudget,
     ) -> Result<()> {
+        let StreamPlace {
+            stream_id,
+            depth,
+            parent,
+            source_file_offset,
+            base,
+        } = place;
         budget.limits.check_depth(depth)?;
-        let digest = sha256(stream);
-        if !self.seen_streams.insert((stream_id, digest.clone())) {
+        // A stream is extracted once. On disk it is identified by content, and
+        // the digest goes into the report. In memory every stream is a range
+        // of the one input, so its position identifies it: each nested stream
+        // spans most of the payload, and hashing them all would read a large
+        // library several times over.
+        let (digest, identity) = match &self.sink {
+            Sink::Disk(_) => {
+                let digest = sha256(stream);
+                (digest.clone(), digest)
+            }
+            Sink::Memory(_) => (String::new(), format!("@{base:x}+{:x}", stream.len())),
+        };
+        if !self.seen_streams.insert((stream_id, identity)) {
             return Ok(());
         }
         let (header, records, table_size) =
@@ -288,6 +448,7 @@ impl Extractor {
                         classification,
                     },
                     &image,
+                    Origin::Decoded,
                 )?;
                 result.image = Some(artifact.clone());
                 image_data = Some((image, artifact));
@@ -319,6 +480,7 @@ impl Extractor {
                         classification: "decoded_metadata",
                     },
                     &metadata,
+                    Origin::Decoded,
                 )?;
                 result.metadata = Some(artifact.clone());
                 metadata_data = Some((metadata, artifact));
@@ -368,6 +530,7 @@ impl Extractor {
                     classification: "direct_data",
                 },
                 direct_data,
+                Origin::Direct(direct_base(base, record.image_offset)?),
             )?;
             stream_report.records[report_index].image = Some(artifact);
         }
@@ -398,10 +561,13 @@ impl Extractor {
             let parent_config = std::mem::replace(&mut budget.config, interpreter_config);
             self.extract_stream(
                 child_data,
-                next_stream_id,
-                depth + 1,
-                Some(parent),
-                None,
+                StreamPlace {
+                    stream_id: next_stream_id,
+                    depth: depth + 1,
+                    parent: Some(parent),
+                    source_file_offset: None,
+                    base: direct_base(base, record.image_offset)?,
+                },
                 budget,
             )?;
             budget.config = parent_config;
@@ -430,24 +596,37 @@ impl Extractor {
         stream_id: u32,
         spec: ArtifactSpec<'_>,
         data: &[u8],
+        origin: Origin,
     ) -> Result<ArtifactReport> {
-        let digest = sha256(data);
+        // A direct record kept in memory is a range of the input, which the
+        // caller already holds. Hashing it would read the largest payload in
+        // the file a second time only to name it, so it gets a positional name
+        // and no digest.
+        let digest = match (&self.sink, origin) {
+            (Sink::Memory(_), Origin::Direct(_)) => String::new(),
+            _ => sha256(data),
+        };
         let filename = format!(
             "d{depth:02}_s{stream_id:02X}_r{:03}_id{:08X}_{}.{}",
             record.index,
             record.command_id,
-            &digest[..12],
+            digest.get(..12).unwrap_or("input"),
             spec.suffix
         );
-        let path = self.output_dir.join(filename);
-        write_atomic(&path, data)?;
+        match &mut self.sink {
+            Sink::Disk(output_dir) => write_atomic(&output_dir.join(&filename), data)?,
+            Sink::Memory(direct) => {
+                if let Origin::Direct(start) = origin {
+                    let end = start.checked_add(data.len()).ok_or_else(|| {
+                        Error::Invalid("direct artifact range overflows usize".to_owned())
+                    })?;
+                    direct.insert(filename.clone(), start..end);
+                }
+            }
+        }
         let artifact = ArtifactReport {
             kind: spec.kind.to_owned(),
-            path: path
-                .file_name()
-                .ok_or_else(|| Error::Invalid("artifact path has no file name".to_owned()))?
-                .to_string_lossy()
-                .into_owned(),
+            path: filename,
             size: data.len(),
             sha256: digest,
             depth,
@@ -511,6 +690,15 @@ fn record_slice(stream: &[u8], offset: u32, size: u32) -> Result<&[u8]> {
             stream.len()
         ))
     })
+}
+
+/// File offset of a direct payload that starts `offset` bytes into a stream
+/// whose first byte is at `base`.
+fn direct_base(base: usize, offset: u32) -> Result<usize> {
+    usize::try_from(offset)
+        .ok()
+        .and_then(|offset| base.checked_add(offset))
+        .ok_or_else(|| Error::Invalid("direct payload file offset overflows usize".to_owned()))
 }
 
 fn record_tail(stream: &[u8], offset: u32) -> Result<&[u8]> {
@@ -670,11 +858,21 @@ mod limit_tests {
 
     fn extractor() -> Extractor {
         Extractor {
-            output_dir: PathBuf::from("."),
+            sink: Sink::Memory(BTreeMap::new()),
             streams: Vec::new(),
             artifacts: Vec::new(),
             registry: BTreeMap::new(),
             seen_streams: HashSet::new(),
+        }
+    }
+
+    fn place(stream_id: u32, depth: usize) -> StreamPlace {
+        StreamPlace {
+            stream_id,
+            depth,
+            parent: None,
+            source_file_offset: None,
+            base: 0,
         }
     }
 
@@ -692,7 +890,7 @@ mod limit_tests {
     fn record_budget_rejects_one_past_the_ceiling_and_allows_the_boundary() {
         let stream = direct_stream(0xe2, &[0]);
         let error = extractor()
-            .extract_stream(&stream, 0xe2, 0, None, None, &mut budget(0, 32))
+            .extract_stream(&stream, place(0xe2, 0), &mut budget(0, 32))
             .expect_err("one record is already past a zero-record ceiling");
         assert!(
             matches!(
@@ -705,26 +903,22 @@ mod limit_tests {
             "unexpected error: {error}"
         );
 
-        let directory = tempfile::tempdir().expect("temporary output directory");
         let mut at_ceiling = extractor();
-        at_ceiling.output_dir = directory.path().to_path_buf();
         at_ceiling
-            .extract_stream(&stream, 0xe2, 0, None, None, &mut budget(1, 0))
+            .extract_stream(&stream, place(0xe2, 0), &mut budget(1, 0))
             .expect("one record at depth zero is the boundary");
     }
 
     #[test]
     fn nesting_one_past_the_ceiling_is_rejected_before_the_child_is_decoded() {
         let stream = direct_stream(0xe2, &[0]);
-        let directory = tempfile::tempdir().expect("temporary output directory");
         let mut at_ceiling = extractor();
-        at_ceiling.output_dir = directory.path().to_path_buf();
         at_ceiling
-            .extract_stream(&stream, 0xe2, 32, None, None, &mut budget(1, 32))
+            .extract_stream(&stream, place(0xe2, 32), &mut budget(1, 32))
             .expect("depth 32 is the nesting boundary");
 
         let error = extractor()
-            .extract_stream(&stream, 0xe2, 33, None, None, &mut budget(1, 32))
+            .extract_stream(&stream, place(0xe2, 33), &mut budget(1, 32))
             .expect_err("depth 33 is rejected before the stream is parsed");
         match &error {
             Error::Limit(limit) => assert_eq!(
@@ -741,7 +935,6 @@ mod limit_tests {
     #[test]
     fn decoded_payloads_share_one_task_budget() {
         let stream = direct_stream(0xe2, &[0]);
-        let directory = tempfile::tempdir().expect("temporary output directory");
         let mut budget = budget(1, 0);
         budget.limits.max_total_bytes = 1;
         budget.bytes = ByteBudget::new(&budget.limits);
@@ -750,11 +943,39 @@ mod limit_tests {
         // one the caller passed in and is not reset per stream.
         budget.bytes.charge(1).unwrap();
         let mut extractor = extractor();
-        extractor.output_dir = directory.path().to_path_buf();
         extractor
-            .extract_stream(&stream, 0xe2, 0, None, None, &mut budget)
+            .extract_stream(&stream, place(0xe2, 0), &mut budget)
             .unwrap();
         assert_eq!(budget.bytes.used(), 1);
         assert!(budget.bytes.charge(1024).is_err());
+    }
+
+    #[test]
+    fn a_direct_record_is_remembered_as_its_range_in_the_input() {
+        // The stream starts 0x40 bytes into the input, as a bootstrap stream
+        // starts after the Stage 1 payload.
+        let payload = b"direct payload bytes";
+        let stream = direct_stream(0xe2, payload);
+        let mut input = vec![0xaa_u8; 0x40];
+        input.extend_from_slice(&stream);
+
+        let mut extractor = extractor();
+        let mut place = place(0xe2, 0);
+        place.base = 0x40;
+        extractor
+            .extract_stream(&stream, place, &mut budget(1, 0))
+            .unwrap();
+
+        let Sink::Memory(direct) = &extractor.sink else {
+            panic!("the test extractor keeps artifacts in memory");
+        };
+        let artifact = &extractor.artifacts[0];
+        assert_eq!(artifact.kind, "direct");
+        let range = direct[&artifact.path].clone();
+        assert_eq!(&input[range], payload);
+        assert!(
+            extractor.registry.is_empty(),
+            "a direct record is not copied"
+        );
     }
 }

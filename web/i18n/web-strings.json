@@ -1,0 +1,121 @@
+{
+  "web.unpack_tip": {
+    "en": "Recover the selected inputs. Results are kept in this tab for download.",
+    "zh-CN": "恢复选中的输入项。结果保留在此标签页中，可随时下载。",
+    "zh-TW": "恢復所選輸入項。結果會保留在此分頁中，可隨時下載。",
+    "ja": "選択した入力を復元します。結果はこのタブに保持され、ダウンロードできます。",
+    "ko": "선택한 입력을 복원합니다. 결과는 이 탭에 보관되며 다운로드할 수 있습니다."
+  },
+  "web.unpack_desc": {
+    "en": "Recover it. The result is kept in this tab for download.",
+    "zh-CN": "恢复该项。结果保留在此标签页中，可随时下载。",
+    "zh-TW": "進行恢復。結果會保留在此分頁中，可隨時下載。",
+    "ja": "復元します。結果はこのタブに保持され、ダウンロードできます。",
+    "ko": "복원합니다. 결과는 이 탭에 보관되며 다운로드할 수 있습니다."
+  },
+  "web.download": {
+    "en": "Download",
+    "zh-CN": "下载",
+    "zh-TW": "下載",
+    "ja": "ダウンロード",
+    "ko": "다운로드"
+  },
+  "web.download_all": {
+    "en": "Download all (.zip)",
+    "zh-CN": "全部下载 (.zip)",
+    "zh-TW": "全部下載 (.zip)",
+    "ja": "すべてダウンロード (.zip)",
+    "ko": "모두 다운로드 (.zip)"
+  },
+  "web.out_downloads": {
+    "en": "Browser download",
+    "zh-CN": "浏览器下载",
+    "zh-TW": "瀏覽器下載",
+    "ja": "ブラウザーのダウンロード",
+    "ko": "브라우저 다운로드"
+  },
+  "web.out_tip": {
+    "en": "Where unpacked files are saved.",
+    "zh-CN": "解包后文件的保存位置。",
+    "zh-TW": "解包後檔案的儲存位置。",
+    "ja": "アンパック済みファイルの保存先です。",
+    "ko": "언패킹된 파일을 저장할 위치입니다."
+  },
+  "web.out_folder_help": {
+    "en": "When you choose a folder, Senbei saves to unpack/ inside it. Files the browser won’t save directly (such as .dll files) go into senbei-remaining.*.zip. Extract it into unpack/.",
+    "zh-CN": "Senbei 会将文件保存到所选文件夹下的 unpack/。如果浏览器不允许直接保存某些文件（如 .dll），这些文件会打包到 senbei-remaining.*.zip 中。请将压缩包解压到 unpack/。",
+    "zh-TW": "Senbei 會將檔案儲存到所選資料夾下的 unpack/。如果瀏覽器不允許直接儲存某些檔案（例如 .dll），這些檔案會打包成 senbei-remaining.*.zip。請將 ZIP 解壓縮到 unpack/。",
+    "ja": "復元したファイルは、選択したフォルダー内の unpack/ に保存されます。ブラウザーで直接保存できないファイル（.dll など）は senbei-remaining.*.zip にまとめられます。ZIP を unpack/ に展開してください。",
+    "ko": "복원된 파일은 선택한 폴더 안의 unpack/에 저장됩니다. 브라우저에서 직접 저장할 수 없는 파일(예: .dll)은 senbei-remaining.*.zip에 담깁니다. ZIP 파일을 unpack/에 풀어 주세요."
+  },
+  "web.out_unsupported": {
+    "en": "This browser cannot write to a folder, so recovered files are saved as downloads.",
+    "zh-CN": "此浏览器无法写入文件夹，恢复后的文件只能通过下载保存。",
+    "zh-TW": "此瀏覽器無法寫入資料夾，復原後的檔案只能透過下載儲存。",
+    "ja": "このブラウザーはフォルダーに書き込めないため、復元したファイルはダウンロードで保存します。",
+    "ko": "이 브라우저는 폴더에 기록할 수 없으므로 복원된 파일은 다운로드로 저장합니다."
+  },
+  "web.limit": {
+    "en": "Input size limit",
+    "zh-CN": "输入大小上限",
+    "zh-TW": "輸入大小上限",
+    "ja": "入力サイズの上限",
+    "ko": "입력 크기 제한"
+  },
+  "web.limit_help": {
+    "en": "Larger inputs are not read. Recovery keeps the input and the restored image in memory at the same time.",
+    "zh-CN": "超过上限的输入项不会被读取。恢复过程中，输入项与恢复后的映像会同时保留在内存中。",
+    "zh-TW": "超過上限的輸入項不會被讀取。恢復過程中，輸入項與復原後的映像會同時保留在記憶體中。",
+    "ja": "上限を超える入力は読み込みません。復元中は、入力と復元イメージの両方をメモリ内に保持します。",
+    "ko": "제한을 초과하는 입력은 읽지 않습니다. 복원 중에는 입력과 복원된 이미지를 함께 메모리에 유지합니다."
+  },
+  "web.over_limit": {
+    "en": "This input is {size}, over the {limit} input size limit. Raise the limit in Settings, then run it again.",
+    "zh-CN": "该输入项为 {size}，超出 {limit} 的输入大小上限。请在“设置”中调高上限后重新运行。",
+    "zh-TW": "此輸入項為 {size}，超過 {limit} 的輸入大小上限。請在「設定」中調高上限，然後重新執行。",
+    "ja": "この入力は{size}あり、入力サイズの上限{limit}を超えています。「設定」で上限を引き上げてから再実行してください。",
+    "ko": "이 입력은 {size}로 입력 크기 제한 {limit}을(를) 초과합니다. 설정에서 제한을 높인 후 다시 실행하십시오."
+  },
+  "web.engine_stopped": {
+    "en": "The recovery engine stopped before finishing. This input may need more memory than the browser can provide.",
+    "zh-CN": "恢复引擎在完成前意外停止。该输入项所需的内存可能超出了此浏览器的上限。",
+    "zh-TW": "恢復引擎在完成前意外停止。此輸入項所需的記憶體可能超出此瀏覽器的上限。",
+    "ja": "復元エンジンが完了前に停止しました。この入力には、ブラウザーが確保できる以上のメモリが必要な可能性があります。",
+    "ko": "복원 엔진이 완료 전에 중지되었습니다. 이 입력에는 브라우저가 제공할 수 있는 것보다 많은 메모리가 필요할 수 있습니다."
+  },
+  "web.embedded_metadata": {
+    "en": "Embedded metadata",
+    "zh-CN": "内嵌元数据",
+    "zh-TW": "內嵌中繼資料",
+    "ja": "埋め込みメタデータ",
+    "ko": "내장 메타데이터"
+  },
+  "web.saved": {
+    "en": "Saved to {path}",
+    "zh-CN": "已保存到 {path}",
+    "zh-TW": "已儲存至 {path}",
+    "ja": "{path}に保存しました",
+    "ko": "{path}에 저장됨"
+  },
+  "web.save_failed": {
+    "en": "Could not save {path}.",
+    "zh-CN": "无法保存 {path}。",
+    "zh-TW": "無法儲存 {path}。",
+    "ja": "{path}を保存できませんでした。",
+    "ko": "{path}을(를) 저장할 수 없습니다."
+  },
+  "web.save_refused": {
+    "en": "This browser does not allow saving {name} to a folder. It is kept in this tab for download.",
+    "zh-CN": "此浏览器不允许将 {name} 保存到文件夹。该文件已保留在此标签页中，可随时下载。",
+    "zh-TW": "此瀏覽器不允許將 {name} 儲存至資料夾。檔案已保留在此分頁中，可隨時下載。",
+    "ja": "このブラウザーでは{name}をフォルダーに保存できません。ファイルはこのタブに保持され、ダウンロードできます。",
+    "ko": "이 브라우저에서는 {name}을(를) 폴더에 저장할 수 없습니다. 파일은 이 탭에 보관되며 다운로드할 수 있습니다."
+  },
+  "web.read_failed": {
+    "en": "Could not read this input.",
+    "zh-CN": "无法读取该输入项。",
+    "zh-TW": "無法讀取此輸入項。",
+    "ja": "この入力を読み込めませんでした。",
+    "ko": "이 입력을 읽을 수 없습니다."
+  }
+}

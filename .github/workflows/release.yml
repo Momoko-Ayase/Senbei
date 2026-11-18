@@ -73,10 +73,7 @@ jobs:
       - run: wasm-pack build --target web --release --out-dir ../web/pkg -- --locked
         working-directory: senbei-wasm
       - name: Stage static site
-        run: |
-          mkdir dist
-          cp web/index.html web/app.js web/report.js web/worker.js web/style.css dist/
-          cp -r web/pkg dist/pkg
+        run: node web/tools/stage.mjs dist
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

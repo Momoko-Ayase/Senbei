@@ -12,8 +12,9 @@
 //! the blob is located by content and unwrapped
 //! ([`senbei_metadata::android::extract_embedded_metadata`]).
 //!
-//! All functions in this module are native filesystem orchestration; the web
-//! app (wasm) never touches them.
+//! The functions in this module are native filesystem orchestration. The
+//! browser binding has no filesystem and uses the byte-level entry points in
+//! [`memory`], re-exported here.
 
 #[cfg(test)]
 mod resource_tests;
@@ -23,6 +24,12 @@ mod tests;
 mod archive_limits;
 mod context;
 mod manifest;
+mod memory;
+
+pub use memory::{
+    ElfSummary, LibraryBytes, LibraryOutcome, MetadataOutcome, ModuleBinding, manifest_identity,
+    restore_library_bytes, restore_metadata_bytes_profiled,
+};
 
 use context::LibraryRestorer;
 

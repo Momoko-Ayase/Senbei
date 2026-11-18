@@ -1,397 +1,285 @@
-// Pure helpers for the browser frontend: input memory budgeting and JSON
-// report shaping. No DOM, no network, no clock reads — every function is a
-// pure transform so `web/tests/` can exercise it under Node.
-
-/** Practical default ceiling for one staged input set (base + companion). */
-export const DEFAULT_INPUT_LIMIT_BYTES = 256 * 1024 * 1024;
-
-/** The limit control accepts this range; outside it the field is ignored. */
-export const MIN_INPUT_LIMIT_MIB = 8;
-export const MAX_INPUT_LIMIT_MIB = 4096;
-
-/** Version of the browser report envelope this module emits. */
-export const REPORT_SCHEMA = 'senbei.browser-report';
-export const REPORT_SCHEMA_VERSION = 1;
-
-const MIB = 1024 * 1024;
-
-/**
- * Parse the limit input (MiB) into bytes.
- *
- * Empty, non-numeric, or out-of-range input falls back to `fallback` so a
- * half-typed value never changes the active budget mid-session.
- */
-export function parseLimitMiB(raw, fallback = DEFAULT_INPUT_LIMIT_BYTES) {
-  const text = String(raw ?? '').trim();
-  if (text === '') return fallback;
-  const mib = Number(text);
-  if (!Number.isFinite(mib)) return fallback;
-  if (mib < MIN_INPUT_LIMIT_MIB || mib > MAX_INPUT_LIMIT_MIB) return fallback;
-  return Math.round(mib) * MIB;
-}
-
-/** Human byte size with one decimal for MiB/GiB steps. */
-export function formatBytes(bytes) {
-  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < MIB) return `${(bytes / 1024).toFixed(1)} KiB`;
-  if (bytes < 1024 * MIB) return `${(bytes / MIB).toFixed(1)} MiB`;
-  return `${(bytes / (1024 * MIB)).toFixed(2)} GiB`;
-}
-
-/** True for the `<module>._` companion suffix. */
-export function isCompanionName(name) {
-  return typeof name === 'string' && name.endsWith('._');
-}
-
-/** Base module name for a companion, or the name itself. */
-export function baseName(name) {
-  return isCompanionName(name) ? name.slice(0, -2) : name;
-}
-
-/**
- * Group staged entries into one budget unit per base module.
- *
- * A companion (`X._`) and its base (`X`) are read together by the unpack
- * path, so they must be measured together; measuring them separately would
- * let a 200 MiB pair pass a 200 MiB limit and then read 400 MiB.
- *
- * `entries` accepts `{ name, size }` objects or `File`-like values with
- * `name` and `size`.
- */
-export function groupByModule(entries) {
-  const groups = new Map();
-  for (const entry of entries ?? []) {
-    const name = entry?.name;
-    if (typeof name !== 'string' || name === '') continue;
-    const size = Number(entry.size);
-    const base = baseName(name);
-    const group = groups.get(base) ?? { base, bytes: 0, names: [], companion: false };
-    group.bytes += Number.isFinite(size) && size > 0 ? size : 0;
-    group.names.push(name);
-    if (isCompanionName(name)) group.companion = true;
-    groups.set(base, group);
-  }
-  return [...groups.values()];
-}
-
-/**
- * Decide whether the staged set may be read into memory.
- *
- * This runs from `File.size` metadata BEFORE any `arrayBuffer()` call. It is a
- * best-effort guard, not a peak-RSS guarantee: unpacking holds the input, the
- * recovered image, and the pipeline's own scratch buffers at once, so the real
- * peak is a multiple of the bytes measured here.
- *
- * Returns the blocked modules, the modules that compile a warning, and the
- * combined-size guidance strings the UI shows verbatim.
- */
-export function planReadBudget(entries, limitBytes, options = {}) {
-  const limit = Number.isFinite(limitBytes) && limitBytes > 0
-    ? limitBytes
-    : DEFAULT_INPUT_LIMIT_BYTES;
-  const warnFactor = options.warnFactor ?? 0.5;
-  const groups = groupByModule(entries);
-  const totalBytes = groups.reduce((sum, group) => sum + group.bytes, 0);
-  const blocked = [];
-  const oversized = [];
-  for (const group of groups) {
-    if (group.bytes > limit) blocked.push(group);
-    else if (group.bytes >= limit * warnFactor) oversized.push(group);
-  }
-  const overLimit = groups.length > 0 && totalBytes > limit;
-  const blockedBases = blocked.map((group) => group.base);
-  const blockedNames = new Set(blocked.flatMap((group) => group.names));
-  const guidance = [];
-  if (blocked.length > 0) {
-    for (const group of blocked) {
-      guidance.push(
-        `Skipped ${group.base} (${formatBytes(group.bytes)} with companion)` +
-          ` — above the ${formatBytes(limit)} input limit.`,
-      );
-    }
-  } else if (overLimit) {
-    guidance.push(
-      `Staged inputs total ${formatBytes(totalBytes)}, above the ` +
-        `${formatBytes(limit)} limit. Unpack them one at a time, or raise the limit.`,
-    );
-  } else if (totalBytes > 0) {
-    guidance.push(
-      `Staged inputs total ${formatBytes(totalBytes)}. Unpacking holds the ` +
-        'input, the recovered image, and pipeline scratch buffers together, so ' +
-        'transient memory use is several times this figure.',
-    );
-    if (oversized.length > 0) {
-      const names = oversized.map((group) => group.base).join(', ');
-      guidance.push(`Near the ${formatBytes(limit)} limit: ${names}.`);
-    }
-  }
-  return {
-    limitBytes: limit,
-    totalBytes,
-    overLimit,
-    warnFactor,
-    groups,
-    /** Base module names that must not be read (their companion goes with them). */
-    blocked: blockedBases,
-    /** Base module names that fit but are at least `warnFactor` of the limit. */
-    nearLimit: oversized.map((group) => group.base),
-    guidance,
-    /** Base module names that may be read. */
-    allowed: groups
-      .filter((group) => !blockedNames.has(group.base))
-      .map((group) => group.base),
-  };
-}
-
-/** Sort findings fatal-first while keeping the checker's order within a class. */
-export function sortFindings(findings) {
-  const weight = (finding) => (finding?.severity === 'fatal' ? 0 : 1);
-  return (findings ?? [])
-    .filter((finding) => finding && typeof finding.message === 'string')
-    .map((finding, index) => ({ finding, index }))
-    .sort((a, b) => weight(a.finding) - weight(b.finding) || a.index - b.index)
-    .map(({ finding }) => ({
-      severity: finding.severity === 'fatal' ? 'fatal' : 'warning',
-      message: finding.message,
-    }));
-}
-
-/** `clean` / `warnings` / `failed` for a finding list. */
-export function integrityStatus(findings) {
-  const list = sortFindings(findings);
-  if (list.length === 0) return 'clean';
-  return list.some((finding) => finding.severity === 'fatal') ? 'failed' : 'warnings';
-}
-
-/** The profile's own final static-check verdict, or `null` when absent. */
-export function profileIntegrityStatus(profile) {
-  const value = profile?.static_validation;
-  return value === 'clean' || value === 'warnings' || value === 'failed' || value === 'not_run'
-    ? value
-    : null;
-}
-
-/**
- * Integrity verdict for a recovered row.
- *
- * The profile records the check that actually ran, so it wins whenever it has
- * a value. That matters for metadata: its transform is validated by the
- * metadata adapter and the PE static check does not apply, so the profile says
- * `not_run` — reporting `clean` there would invent a check that never
- * happened. Without a profile, metadata still falls back to `not_run`; a PE
- * row falls back to its findings, as before.
- */
-export function recoveredIntegrityStatus(entry, findings) {
-  const fromProfile = profileIntegrityStatus(entry?.profile);
-  if (fromProfile !== null) return fromProfile;
-  if (entry?.kind === 'metadata') return 'not_run';
-  return integrityStatus(findings);
-}
-
-/**
- * Per-file report entry.
- *
- * `entry` is the app's row state: `{ state, kind, outputName, inputBytes,
- * outputBytes, findings, profile, preRecoveryProfile, companionUsed, retried,
- * error, note }`. The full protection profile object (snake_case,
- * `format_version`) is embedded verbatim under `profile` and
- * `pre_recovery_profile`; only the browser envelope is versioned here.
- */
-export function buildFileReport(name, entry, options = {}) {
-  const state = entry?.state ?? 'staged';
-  const status = state === 'ok'
-    ? 'recovered'
-    : state === 'err'
-      ? 'failed'
-      : state === 'blocked'
-        ? 'blocked'
-        : 'pending';
-  const findings = sortFindings(entry?.findings);
-  const report = {
-    name,
-    output_name: entry?.outputName ?? null,
-    status,
-    kind: entry?.kind ?? null,
-    input_bytes: Number.isFinite(entry?.inputBytes) ? entry.inputBytes : null,
-    output_bytes: Number.isFinite(entry?.outputBytes) ? entry.outputBytes : null,
-    companion_used: entry?.companionUsed === true,
-    forced_exe_retry: entry?.retried === true,
-    profile: entry?.profile ?? null,
-    pre_recovery_profile: entry?.preRecoveryProfile ?? null,
-    integrity: {
-      status: status === 'recovered'
-        ? recoveredIntegrityStatus(entry, findings)
-        : 'not_run',
-      findings,
-    },
-    error: status === 'failed' || status === 'blocked' ? (entry?.error ?? null) : null,
-  };
-  if (options.includeNotes && entry?.note) report.note = entry.note;
-  return report;
-}
-
-/**
- * All-files report envelope. `generatedAt` is passed in so the helper stays
- * pure and the tests are deterministic.
- */
-export function buildReport(entries, options = {}) {
-  const files = [];
-  for (const [name, entry] of entries ?? []) {
-    if (isCompanionName(name)) continue;
-    files.push(buildFileReport(name, entry, options));
-  }
-  const recovered = files.filter((file) => file.status === 'recovered').length;
-  const failed = files.filter((file) => file.status === 'failed').length;
-  const blocked = files.filter((file) => file.status === 'blocked').length;
-  return {
-    schema: REPORT_SCHEMA,
-    schema_version: REPORT_SCHEMA_VERSION,
-    generated_at: options.generatedAt ?? null,
-    input_limit_bytes: Number.isFinite(options.limitBytes) ? options.limitBytes : null,
-    summary: { files: files.length, recovered, failed, blocked },
-    files,
-  };
-}
-
-/** Serialize a report deterministically (2-space indent, trailing newline). */
-export function serializeReport(report) {
-  return `${JSON.stringify(report, null, 2)}\n`;
-}
-
-/**
- * Download file name for a report.
- *
- * `generatedAt` is an ISO timestamp; only `YYYYMMDD-HHMMSS` survives, so the
- * name is filesystem-safe on Windows and stable across time zones.
- */
-export function reportFileName(name, generatedAt) {
-  const stamp = String(generatedAt ?? '')
-    .replace(/\D/g, '')
-    .slice(0, 14)
-    .replace(/^(\d{8})(\d{6})$/, '$1-$2');
-  if (!name) return stamp ? `senbei-${stamp}.report.json` : 'senbei-report.json';
-  const base = baseName(name).replace(/\.(exe|dll|dat)$/i, '');
-  // Windows/macOS-safe: no path separators, colons, or spaces.
-  const stem = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'senbei';
-  return stamp ? `${stem}.${stamp}.report.json` : `${stem}.report.json`;
-}
-
-// --- Profile presentation -------------------------------------------------
+// What the page says about a finished input: the messages it shows, its
+// stages, its log, and the JSON report. Pure transforms over the page's item
+// records, so `web/tests/` runs them under Node.
 //
-// The profile reports only observed facts. These helpers must never turn a
-// magic-byte match into a protection claim: `recognition` says whether the
-// header key table matched, `recovery` whether a route produced an image, and
-// `static_validation` whether that image passed the structural checks.
+// An item record is `{ name, relPath, kind, state, size, pre, result, error,
+// container, entries }`. `result` is `{ info, lang, durationMs, retried,
+// companionUsed, inputSha256, outputs }`, where `info` is the engine's report
+// for the job and each output is `{ path, size, sha256, embedded, saved,
+// saveFailed }`.
+//
+// A log line is `{ at, level, type, ... }`: `at` in milliseconds since the
+// epoch, `level` one of `info`, `step`, `detail`, `warn`, `error`, and the
+// rest by `type`. Lines stay structured so the log reads in whatever language
+// the page is in when it is shown.
 
-const FORMAT_LABEL = {
-  pe32: 'PE32',
-  pe32_plus: 'PE32+',
-  elf64_aarch64: 'ELF64 AArch64',
-  il2cpp_metadata: 'il2cpp metadata',
-};
+import { baseName } from './model.js';
 
-const KIND_LABEL = {
-  native_exe: 'native EXE',
-  managed_exe: 'managed EXE',
-  native_dll: 'native DLL',
-  managed_dll: 'managed DLL',
-};
+export const REPORT_SCHEMA = 'senbei.browser-report';
+export const REPORT_SCHEMA_VERSION = 2;
 
-const LAYOUT_LABEL = {
-  dll: 'DLL layout',
-  exe_style: 'EXE-style layout',
-  android_staged: 'Android staged',
-  metadata_structural: 'metadata structural',
-  metadata_seeded: 'metadata seeded',
-  metadata_method_indices: 'metadata method indices',
-};
+const messageText = (message) => message?.text ?? '';
 
-const EVIDENCE_LABEL = {
-  header_magic: 'header magic',
-  external_companion_declaration: 'external companion declared',
-  companion_spliced: 'companion spliced',
-  private_section: 'private loader section',
-  aes_schedule: 'AES schedule',
-  validated_metadata_transform: 'metadata transform validated',
-};
-
-function humanize(value) {
-  return String(value ?? '').replace(/_/g, ' ');
+/**
+ * Every message an input reports, each exactly once, where a reader looks.
+ *
+ * Returns `{ top, validation }`, both lists of `{ tone, message }` with `tone`
+ * one of `err`, `warn`, `info`. When the static check found something, the
+ * profile's messages are its findings and go to `validation`; everything else
+ * goes to `top`. A message is `{ text, local }`. Why an input needed nothing
+ * is not a message: its recovery stage says so.
+ */
+export function messagePlan(item) {
+  const info = item?.result?.info;
+  const validation = [];
+  const top = [];
+  const shown = new Set();
+  const push = (list, tone, message) => {
+    const text = messageText(message);
+    if (!text || shown.has(text)) return;
+    shown.add(text);
+    list.push({ tone, message });
+  };
+  if (item?.error) push(top, 'err', item.error);
+  if (!info) return { top, validation };
+  const verdict = info.profile?.static_validation;
+  const findings = verdict === 'warnings' || verdict === 'failed';
+  if (info.error) push(top, 'err', info.error);
+  for (const finding of info.findings ?? []) {
+    push(findings ? validation : top, finding.severity === 'fatal' ? 'err' : 'warn', {
+      text: finding.message,
+      local: null,
+    });
+  }
+  for (const message of info.errors ?? []) push(findings ? validation : top, 'err', message);
+  for (const message of info.warnings ?? []) push(findings ? validation : top, 'warn', message);
+  return { top, validation };
 }
 
 /**
- * One-line description of an observed target, used before recovery runs.
- *
- * For metadata the text says explicitly that the version identifies a format,
- * not a protection.
+ * True when an input's last run went through the Windows pipeline. That is
+ * every module, and every file that is no target at all: the pipeline is what
+ * tells such a file so.
  */
-export function describeObserved(profile, options = {}) {
-  if (!profile || typeof profile !== 'object') return '';
-  const observed = profile.observed ?? {};
-  if (observed.platform === 'il2cpp_metadata') {
-    // The format name is already the row's kind label, so repeat only the
-    // version. The disclaimer is mandatory: identify() matches a format
-    // header, and a format header is not evidence of protection.
-    const version = observed.metadata_version != null
-      ? `v${observed.metadata_version}`
-      : 'version unknown';
-    return `${version} · format only, not a protection verdict`;
-  }
-  const parts = [];
-  const format = FORMAT_LABEL[observed.format] ?? humanize(observed.format);
-  if (format) parts.push(format);
-  if (options.includeKind !== false) {
-    const kind = KIND_LABEL[observed.kind] ?? humanize(observed.kind);
-    if (kind) parts.push(kind);
-  }
-  if (observed.external_companion) parts.push('external companion');
-  const head = parts.join(' · ');
-  const evidence = (profile.evidence ?? [])
-    .map((value) => EVIDENCE_LABEL[value] ?? humanize(value))
-    .join(', ');
-  if (head && evidence) return `${head} · ${evidence}`;
-  return head || evidence;
-}
+export const ranAsModule = (item) =>
+  item?.result?.op ? item.result.op === 'pe' : !['so', 'metadata', 'package'].includes(item?.kind);
 
 /**
- * Route/validation lines for a finished (or failed) recovery.
+ * The stages of a finished input, as the workbench records them:
+ * `{ stage, status, durationMs, detail }` with `stage` one of `detection`,
+ * `recovery`, `static_validation`, `output_write` and `status` one of `ok`,
+ * `skipped`, `failed`. `detail` is a message or `null`.
  *
- * The PE static check does not apply to metadata output, so its
- * `static check not run` line is omitted for metadata profiles rather than
- * shown as a missing step.
+ * A Windows module records all of its stages; a library and a metadata blob
+ * record recovery and what followed it. A failure records the one stage that
+ * failed. An output that was kept for download was not written anywhere, so
+ * its `output_write` is `skipped`.
  */
-export function describeStages(profile) {
-  if (!profile || typeof profile !== 'object') return [];
-  const lines = [];
-  const selected = profile.selected ? (LAYOUT_LABEL[profile.selected] ?? humanize(profile.selected)) : null;
-  if (Array.isArray(profile.candidates)) {
-    for (const attempt of profile.candidates) {
-      if (!attempt || typeof attempt !== 'object') continue;
-      const layout = LAYOUT_LABEL[attempt.layout] ?? humanize(attempt.layout);
-      const outcome = humanize(attempt.outcome);
-      const suffix = selected && attempt.layout === profile.selected ? ' — selected' : '';
-      lines.push(`${layout}: ${outcome}${suffix}`);
+export function stagesOf(item) {
+  const result = item?.result;
+  const info = result?.info;
+  const stage = (name, status, extra) => ({ stage: name, status, durationMs: null, detail: null, ...extra });
+  if (!info) return item?.error ? [stage('recovery', 'failed', { detail: item.error })] : [];
+  if (item.kind === 'package') return [];
+  const windows = ranAsModule(item);
+  const spent = Math.round(result.durationMs ?? 0);
+  switch (info.status) {
+    case 'recovered': {
+      const stages = windows ? [stage('detection', 'ok')] : [];
+      stages.push(stage('recovery', 'ok', { durationMs: spent }));
+      if (item.kind !== 'metadata') {
+        stages.push(stage('static_validation', windows && info.suspect ? 'failed' : 'ok'));
+      }
+      const outputs = result.outputs ?? [];
+      const saved = outputs.find((output) => output.saved);
+      if (outputs.some((output) => output.saveFailed)) stages.push(stage('output_write', 'failed'));
+      else if (saved) stages.push(stage('output_write', 'ok', { detail: { text: saved.saved, path: true } }));
+      // A refused name is queued for the folder ZIP; that write logs its
+      // outcome separately once the archive is complete.
+      else if (outputs.some((output) => !output.refused)) stages.push(stage('output_write', 'skipped'));
+      return stages;
     }
+    case 'unchanged':
+      // A file run on its own records how long the look took; one of a folder
+      // records why it needed nothing.
+      return [
+        stage('recovery', 'skipped', item.group?.kind === 'folder' ? { detail: info.note ?? null } : { durationMs: spent }),
+      ];
+    case 'unsupported':
+    case 'not_protected':
+      return [stage('recovery', 'skipped', { detail: info.note ?? null })];
+    default:
+      return [stage('recovery', 'failed', { detail: windows ? (info.error ?? null) : null })];
   }
-  // Only a run of the static check is worth a line. `not_run` covers both the
-  // failed recovery (no image to check) and metadata output (the PE check does
-  // not apply), and in both cases the row's status already says so.
-  const validation = profile.static_validation;
-  if (validation && validation !== 'not_run') {
-    const label = validation === 'clean'
-      ? 'static check clean'
-      : validation === 'warnings'
-        ? 'static check with warnings'
-        : 'static check failed';
-    lines.push(label);
+}
+
+const LEVEL_OF = { err: 'error', warn: 'warn' };
+
+/**
+ * The engine's own lines of one job: its steps and their details.
+ *
+ * `began` is when the job started, as milliseconds since the epoch; every
+ * line's `at` is counted from it. `lang` is the language the job ran in, which
+ * a step title without a catalog name is written in.
+ */
+export function engineLines(info, began, lang) {
+  const lines = [];
+  let last = 0;
+  for (const line of info?.log ?? []) {
+    last = line.ms ?? last;
+    const at = began + last;
+    if (line.step !== undefined) {
+      lines.push({
+        at,
+        level: 'step',
+        type: 'step',
+        i: line.i ?? null,
+        of: line.of ?? null,
+        key: line.key ?? null,
+        title: line.step,
+        lang,
+      });
+    } else if (line.detail !== undefined) {
+      lines.push({ at, level: 'detail', type: 'detail', text: line.detail });
+    } else if (line.truncated) {
+      lines.push({ at, level: 'detail', type: 'detail', text: '…' });
+    }
   }
   return lines;
 }
 
-/** Severity-labelled integrity lines: fatal first, then warnings. */
-export function describeFindings(findings) {
-  return sortFindings(findings).map(
-    (finding) => `${finding.severity === 'fatal' ? 'fatal' : 'warning'}: ${finding.message}`,
-  );
+/**
+ * The lines that close an input's log at `at`: its stages, its messages, the
+ * entries of a package, and the outcome.
+ *
+ * `outcome` is `{ key, tone }` for the input, and `entries` lists the package
+ * entries a run acted on as `{ path, key, tone }`.
+ */
+export function closingLines(item, at, outcome, entries = []) {
+  const lang = item.result?.lang;
+  const lines = [];
+  for (const stage of stagesOf(item)) {
+    lines.push({ at, level: stage.status === 'failed' ? 'error' : 'info', type: 'stage', lang, ...stage });
+  }
+  const plan = messagePlan(item);
+  for (const { tone, message } of [...plan.top, ...plan.validation]) {
+    lines.push({ at, level: LEVEL_OF[tone] ?? 'info', type: 'message', message, lang });
+  }
+  for (const entry of entries) {
+    lines.push({
+      at,
+      level: entry.tone === 'err' ? 'error' : 'info',
+      type: 'entry',
+      path: entry.path,
+      outcome: entry.key,
+    });
+  }
+  lines.push(finishedLine(item, at, outcome));
+  return lines;
+}
+
+/** The line that says how an input ended and how long it took. */
+export function finishedLine(item, at, outcome) {
+  return {
+    at,
+    level: LEVEL_OF[outcome.tone] ?? 'info',
+    type: 'finished',
+    outcome: outcome.key,
+    durationMs: item.durationMs ?? item.result?.durationMs ?? 0,
+  };
+}
+
+/** The line that names the companion a module was paired with. */
+export function companionLine(item, at) {
+  return { at, level: 'info', type: 'companion', name: `${baseName(item.relPath)}._` };
+}
+
+/** One input's entry in the JSON report. */
+export function fileReport(item) {
+  const result = item.result ?? null;
+  const info = result?.info ?? null;
+  // A package has no job of its own; its time is that of its entries.
+  const duration = item.durationMs ?? result?.durationMs;
+  const report = {
+    name: item.name,
+    path: item.relPath,
+    kind: item.kind,
+    status: item.state,
+    input: { size: item.size ?? null, sha256: result?.inputSha256 ?? null },
+    companion_used: result?.companionUsed === true,
+    forced_exe_retry: result?.retried === true,
+    duration_ms: Number.isFinite(duration) ? Math.round(duration) : null,
+    outputs: (result?.outputs ?? []).map((output) => ({
+      path: output.path,
+      size: output.size,
+      sha256: output.sha256 ?? null,
+      embedded_metadata: output.embedded === true,
+    })),
+    // The engine's profile, verbatim. Before a run it is the pre-recovery one.
+    profile: info?.profile ?? item.pre ?? null,
+    findings: info?.findings ?? [],
+    metadata: info?.metadata ?? null,
+    restored_elf: info?.elf ?? null,
+    error: messageText(item.error) || messageText(item.identityError) || messageText(info?.error) || null,
+  };
+  if (item.container) {
+    report.container = {
+      kind: item.container.kind,
+      archives: item.container.archives.map((archive) => ({
+        path: archive.label || null,
+        entries: archive.entryCount,
+        candidates: archive.targets.length,
+        package: archive.identity?.[0] ?? null,
+        version: archive.identity?.[1] ?? null,
+      })),
+    };
+    report.entries = (item.entries ?? []).map(fileReport);
+  }
+  return report;
+}
+
+/** The report for `items`. `generatedAt` is passed in so this stays pure. */
+export function buildReport(items, options = {}) {
+  const files = items.map(fileReport);
+  const count = (state) => files.filter((file) => file.status === state).length;
+  return {
+    schema: REPORT_SCHEMA,
+    schema_version: REPORT_SCHEMA_VERSION,
+    tool: { name: 'senbei-web', version: options.version ?? null },
+    generated_at: options.generatedAt ?? null,
+    input_limit_bytes: Number.isFinite(options.limitBytes) ? options.limitBytes : null,
+    summary: {
+      inputs: files.length,
+      recovered: count('ok'),
+      suspect: count('suspect'),
+      failed: count('failed'),
+      skipped: count('skipped'),
+    },
+    files,
+  };
+}
+
+/** Two-space JSON with a trailing newline. */
+export function serializeReport(report) {
+  return `${JSON.stringify(report, null, 2)}\n`;
+}
+
+/** `YYYYMMDD-HHMMSS` from an ISO timestamp, for file names. */
+export function fileStamp(generatedAt) {
+  return String(generatedAt ?? '')
+    .replace(/\D/g, '')
+    .slice(0, 14)
+    .replace(/^(\d{8})(\d{6})$/, '$1-$2');
+}
+
+/**
+ * A report's file name: safe on every filesystem, stable across time zones.
+ * `extension` is `json` for the report and `txt` for its text form.
+ */
+export function reportFileName(name, generatedAt, extension = 'json') {
+  const stamp = fileStamp(generatedAt);
+  const stem = name
+    ? baseName(name).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[_.]+|[_.]+$/g, '') || 'senbei'
+    : 'senbei';
+  return stamp ? `${stem}.${stamp}.report.${extension}` : `${stem}.report.${extension}`;
 }

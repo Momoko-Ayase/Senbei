@@ -13,11 +13,32 @@ crate-type = ["cdylib"]
 senbei-io = { path = "../senbei-io" }
 senbei-metadata = { path = "../senbei-metadata" }
 senbei-engine = { path = "../senbei-engine" }
+senbei-i18n = { path = "../senbei-i18n" }
 serde_json = "1"
 wasm-bindgen = "0.2"
+js-sys = "0.3"
 console_error_panic_hook = "0.1"
 
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
+
+# The whole module is built for size. The crates below hold the loops a
+# recovery spends its time in (ciphers, decompression, hashing, table scans);
+# built for size they lose inlining and run about a third slower, so they are
+# built for speed.
+[profile.release.package.senbei-crypto]
+opt-level = 3
+
+[profile.release.package.senbei-elf]
+opt-level = 3
+
+[profile.release.package.senbei-engine]
+opt-level = 3
+
+[profile.release.package.aes]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3

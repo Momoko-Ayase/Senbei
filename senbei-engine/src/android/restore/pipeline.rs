@@ -14,9 +14,10 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::super::common;
-use super::artifact::load_artifacts;
+use super::artifact::{load_artifacts, memory_artifacts};
 use super::error::{Error, Result, invalid};
-use crate::android::{ByteBudget, ResourceLimits};
+use crate::android::extract::MemoryExtraction;
+use crate::android::{ByteBudget, EntryBudget, ResourceLimits};
 use senbei_elf::{
     DT_GNU_HASH, DT_HASH, DT_JMPREL, DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELASZ, DT_STRSZ,
     DT_STRTAB, DT_SYMTAB, DT_VERNEED, DT_VERSYM, ELF64_RELA_SIZE, ELF64_SYMBOL_SIZE, ElfLayout,
@@ -2326,7 +2327,7 @@ fn materialize_static_elf_tables(
     ))
 }
 
-fn write_padding(file: &mut File, size: u64, path: &Path) -> Result<()> {
+fn write_padding(file: &mut impl Write, size: u64, path: &Path) -> Result<()> {
     const ZEROES: [u8; 4096] = [0; 4096];
     let mut remaining = size;
     while remaining != 0 {
@@ -2339,13 +2340,19 @@ fn write_padding(file: &mut File, size: u64, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn finalize_clean_elf(
-    stream: &mut File,
+/// Append the retained non-loaded sections and a section-header table after
+/// `data_start`, then point the ELF header at them.
+///
+/// `sync` makes the finished stream durable; an in-memory image has nothing
+/// to do there.
+fn finalize_clean_elf<S: Read + Write + Seek>(
+    stream: &mut S,
     temporary_path: &Path,
     source: &[u8],
     layout: &ElfLayout,
     data_start: u64,
     preserve_entrypoint: bool,
+    sync: impl FnOnce(&mut S) -> std::io::Result<()>,
 ) -> Result<CleaningReport> {
     let private = layout.private_section()?;
     if data_start < private.offset {
@@ -2413,7 +2420,7 @@ fn finalize_clean_elf(
         .map_err(|error| Error::io("patch ELF header", temporary_path, error))?;
     stream
         .flush()
-        .and_then(|_| stream.sync_all())
+        .and_then(|_| sync(stream))
         .map_err(|error| Error::io("flush temporary output", temporary_path, error))?;
     Ok(CleaningReport {
         private_section_index: layout.private_section_index,
@@ -2514,6 +2521,582 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     common::write_atomic(path, data).map_err(|error| Error::io("write temporary file", path, error))
 }
 
+/// The restored image while it is being built, on disk or in memory.
+///
+/// Both drivers run the same restoration over it, so their bytes are the same.
+trait OutputImage {
+    /// Begin the image as a copy of `prefix`: the input up to its private
+    /// section. `reserve` estimates the bytes appended later.
+    fn start(&mut self, prefix: &[u8], reserve: u64) -> Result<()>;
+
+    /// Extend with zeroes, or truncate, to `length` bytes.
+    fn set_len(&mut self, length: u64, action: &'static str) -> Result<()>;
+
+    /// Run `edit` over the first `length` bytes.
+    fn edit<R>(&mut self, length: usize, edit: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R>;
+
+    /// Append the retained sections and the section-header table.
+    fn finalize(
+        &mut self,
+        source: &[u8],
+        layout: &ElfLayout,
+        data_start: u64,
+        preserve_entrypoint: bool,
+    ) -> Result<CleaningReport>;
+
+    /// Run `read` over the finished image.
+    fn view<R>(&mut self, read: impl FnOnce(&[u8]) -> Result<R>) -> Result<R>;
+}
+
+/// A private temporary file beside the destination, renamed over it at the end.
+struct DiskOutput {
+    parent: PathBuf,
+    temporary: Option<(NamedTempFile, PathBuf)>,
+}
+
+impl DiskOutput {
+    fn opened(&mut self) -> Result<(&mut NamedTempFile, &Path)> {
+        match &mut self.temporary {
+            Some((temporary, path)) => Ok((temporary, path.as_path())),
+            None => invalid("temporary output was not created"),
+        }
+    }
+
+    fn persist(self, output_path: &Path) -> Result<()> {
+        let Some((temporary, _)) = self.temporary else {
+            return invalid("temporary output was not created");
+        };
+        temporary
+            .persist(output_path)
+            .map_err(|error| Error::io("replace restored output", output_path, error.error))?;
+        Ok(())
+    }
+}
+
+impl OutputImage for DiskOutput {
+    fn start(&mut self, prefix: &[u8], _reserve: u64) -> Result<()> {
+        std::fs::create_dir_all(&self.parent)
+            .map_err(|error| Error::io("create output directory", &self.parent, error))?;
+        let mut temporary = NamedTempFile::new_in(&self.parent)
+            .map_err(|error| Error::io("create temporary output", &self.parent, error))?;
+        let temporary_path = temporary.path().to_path_buf();
+        copy_range(
+            prefix,
+            temporary.as_file_mut(),
+            prefix.len(),
+            &temporary_path,
+        )?;
+        temporary
+            .as_file_mut()
+            .flush()
+            .map_err(|error| Error::io("flush initial output", &temporary_path, error))?;
+        self.temporary = Some((temporary, temporary_path));
+        Ok(())
+    }
+
+    fn set_len(&mut self, length: u64, action: &'static str) -> Result<()> {
+        let (temporary, path) = self.opened()?;
+        temporary
+            .as_file()
+            .set_len(length)
+            .map_err(|error| Error::io(action, path, error))
+    }
+
+    fn edit<R>(&mut self, length: usize, edit: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
+        let (temporary, path) = self.opened()?;
+        let mut output = map_mut(temporary.as_file(), length, path)?;
+        let result = edit(&mut output)?;
+        output
+            .flush()
+            .map_err(|error| Error::io("flush restored image", path, error))?;
+        Ok(result)
+    }
+
+    fn finalize(
+        &mut self,
+        source: &[u8],
+        layout: &ElfLayout,
+        data_start: u64,
+        preserve_entrypoint: bool,
+    ) -> Result<CleaningReport> {
+        let (temporary, path) = self.opened()?;
+        finalize_clean_elf(
+            temporary.as_file_mut(),
+            path,
+            source,
+            layout,
+            data_start,
+            preserve_entrypoint,
+            |file| file.sync_all(),
+        )
+    }
+
+    fn view<R>(&mut self, read: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        let (temporary, path) = self.opened()?;
+        let restored = map_read_only(temporary.as_file(), path)?;
+        read(&restored)
+    }
+}
+
+/// One growable buffer. Used where there is no filesystem to map.
+#[derive(Default)]
+struct MemoryOutput {
+    bytes: Vec<u8>,
+}
+
+impl MemoryOutput {
+    fn label() -> &'static Path {
+        Path::new("<output>")
+    }
+
+    fn reserve(&mut self, additional: usize) -> Result<()> {
+        self.bytes
+            .try_reserve_exact(additional)
+            .map_err(|_| Error::Invalid("restored image reservation failed".to_owned()))
+    }
+}
+
+impl OutputImage for MemoryOutput {
+    fn start(&mut self, prefix: &[u8], reserve: u64) -> Result<()> {
+        // One reservation for the whole image keeps a later growth from
+        // copying it. The estimate is a hint: when it cannot be met, the
+        // prefix alone is reserved and later steps grow the buffer.
+        let wanted = usize::try_from(reserve)
+            .ok()
+            .and_then(|reserve| prefix.len().checked_add(reserve));
+        if wanted.is_none_or(|wanted| self.bytes.try_reserve_exact(wanted).is_err()) {
+            self.reserve(prefix.len())?;
+        }
+        self.bytes.extend_from_slice(prefix);
+        Ok(())
+    }
+
+    fn set_len(&mut self, length: u64, _action: &'static str) -> Result<()> {
+        let length = usize_from_u64(length, "restored image length")?;
+        if let Some(additional) = length.checked_sub(self.bytes.len()) {
+            self.reserve(additional)?;
+        }
+        self.bytes.resize(length, 0);
+        Ok(())
+    }
+
+    fn edit<R>(&mut self, length: usize, edit: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
+        let image = self.bytes.get_mut(..length).ok_or_else(|| {
+            Error::Invalid("restored image is shorter than its mapping".to_owned())
+        })?;
+        edit(image)
+    }
+
+    fn finalize(
+        &mut self,
+        source: &[u8],
+        layout: &ElfLayout,
+        data_start: u64,
+        preserve_entrypoint: bool,
+    ) -> Result<CleaningReport> {
+        // Everything appended below fits in this bound, which the caller has
+        // already held to the output ceiling. Reserving it here means the
+        // appends cannot grow the buffer, so a failed allocation is reported
+        // instead of aborting.
+        let tail = usize_from_u64(appended_tail_bound(layout), "retained section tail")?;
+        self.reserve(tail)?;
+        let mut stream = std::io::Cursor::new(&mut self.bytes);
+        finalize_clean_elf(
+            &mut stream,
+            Self::label(),
+            source,
+            layout,
+            data_start,
+            preserve_entrypoint,
+            |_| Ok(()),
+        )
+    }
+
+    fn view<R>(&mut self, read: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        read(&self.bytes)
+    }
+}
+
+/// Upper bound for what [`finalize_clean_elf`] appends: every retained
+/// non-loaded section with its alignment padding, plus the header table.
+fn appended_tail_bound(layout: &ElfLayout) -> u64 {
+    let retained = layout
+        .section_headers
+        .get(..layout.private_section_index)
+        .unwrap_or(&[]);
+    let sections = retained
+        .iter()
+        .filter(|section| {
+            section.section_type != SHT_NOBITS
+                && section.flags & SHF_ALLOC == 0
+                && section.size != 0
+        })
+        .fold(0_u64, |total, section| {
+            total
+                .saturating_add(section.size)
+                .saturating_add(section.alignment.max(1))
+        });
+    sections
+        .saturating_add(8)
+        .saturating_add(0x40_u64.saturating_mul(retained.len() as u64))
+}
+
+/// The largest restored image the limits allow: one entry, within the task
+/// total.
+fn output_ceiling(limits: &ResourceLimits) -> u64 {
+    limits.max_entry_bytes.min(limits.max_total_bytes)
+}
+
+/// Estimate of the bytes a restoration appends after the private-section
+/// offset: the rebuilt dynamic tables and the retained tail.
+///
+/// The rebuilt tables hold the input's own tables plus what the auxiliary
+/// image contributes, so the input table sizes and a multiple of the auxiliary
+/// size cover them. This sizes one reservation and nothing else; a low
+/// estimate costs a reallocation, never correctness.
+fn appended_reserve_hint(source: &[u8], layout: &ElfLayout, auxiliary_size: u32) -> u64 {
+    const TABLES: [&str; 8] = [
+        ".dynsym",
+        ".gnu.version",
+        ".gnu.version_r",
+        ".gnu.hash",
+        ".hash",
+        ".dynstr",
+        ".rela.dyn",
+        ".rela.plt",
+    ];
+    let Ok(names) = layout.section_names(source) else {
+        return 0;
+    };
+    let tables = layout
+        .section_headers
+        .iter()
+        .zip(&names)
+        .filter(|(_, name)| TABLES.contains(&name.as_str()))
+        .fold(0_u64, |total, (section, _)| {
+            total.saturating_add(section.size)
+        });
+    let alignment = layout.load_alignment().unwrap_or(0x1_0000);
+    tables
+        .saturating_add(u64::from(auxiliary_size).saturating_mul(3))
+        .saturating_add(alignment.saturating_mul(2))
+        .saturating_add(appended_tail_bound(layout))
+}
+
+/// The decoded stage-2 inputs one restoration reads.
+struct RestoreInputs<'a> {
+    /// The protected ELF.
+    source: &'a [u8],
+    /// The `0x9D` payload: descriptor, primary and auxiliary containers.
+    payload: &'a [u8],
+    config: &'a Module9bConfig,
+    symbol_patch_data: &'a [u8],
+    auxiliary_symbol_seed: Option<u32>,
+    constructor_module: Option<(&'a [u8], u32)>,
+}
+
+struct RestoreFlags<'a> {
+    dump_auxiliary: Option<&'a Path>,
+    outer_only: bool,
+    preserve_entrypoint: bool,
+    verbose: bool,
+}
+
+/// What a restoration observed, apart from where its bytes went.
+struct RestoreParts {
+    descriptor: DescriptorReport,
+    primary: DecodeStatistics,
+    auxiliary: Option<DecodeStatistics>,
+    materialization: Option<ElfMaterializationReport>,
+    cleaning: CleaningReport,
+    validation: ValidationReport,
+}
+
+fn static_config_report(config: &Module9bConfig) -> StaticConfigReport {
+    StaticConfigReport {
+        header_seed: format!("0x{:08X}", config.header_seed),
+        container_seed: format!("0x{:08X}", config.container_seed),
+        aes_key_sha256: sha256_bytes(&config.aes_key),
+        schedule_offset: format!("0x{:X}", config.schedule_offset),
+    }
+}
+
+/// Charge one stage-2 image the restoration retains, on the same rule as an
+/// artifact read from disk.
+fn charge_artifact(data: &[u8], limits: &ResourceLimits, bytes: &mut ByteBudget) -> Result<()> {
+    let length = u64::try_from(data.len())
+        .map_err(|_| Error::Invalid("artifact length exceeds u64".to_owned()))?;
+    limits.check_entry_bytes(length)?;
+    bytes.charge(length)?;
+    Ok(())
+}
+
+/// Rebuild the static image from `inputs` into `output`.
+fn restore_image<O: OutputImage>(
+    inputs: &RestoreInputs<'_>,
+    flags: &RestoreFlags<'_>,
+    limits: &ResourceLimits,
+    bytes: &mut ByteBudget,
+    records: &mut EntryBudget,
+    output: &mut O,
+) -> Result<RestoreParts> {
+    let RestoreInputs {
+        source,
+        payload,
+        config,
+        symbol_patch_data,
+        auxiliary_symbol_seed,
+        constructor_module,
+    } = *inputs;
+    let layout = ElfLayout::parse(source, true)?;
+    let private = layout.private_section()?;
+    let file_load_end = layout.file_load_end()?;
+    let aligned_load_end = align_up(file_load_end, 0x10)?;
+    if private.offset != aligned_load_end {
+        return invalid(format!(
+            "SHT_LOUSER offset 0x{:x} != aligned file-backed PT_LOAD end 0x{aligned_load_end:x} (raw 0x{file_load_end:x})",
+            private.offset
+        ));
+    }
+    let load_padding = slice_u64(source, file_load_end, private.offset - file_load_end)?;
+    if load_padding.iter().any(|&byte| byte != 0) {
+        return invalid(format!(
+            "nonzero padding between PT_LOAD end 0x{file_load_end:x} and SHT_LOUSER 0x{:x}",
+            private.offset
+        ));
+    }
+    let descriptor = ProtectedDescriptor::decrypt(payload, config.header_seed)?;
+    let load_end = layout.load_end()?;
+    if u64::from(descriptor.outer_expected_size) != load_end {
+        return invalid(format!(
+            "0x9D target size 0x{:x} != ELF load size 0x{load_end:x}",
+            descriptor.outer_expected_size
+        ));
+    }
+    let outer = ContainerHeader::parse(
+        payload,
+        descriptor.outer_offset as usize,
+        config.container_seed,
+    )?;
+    if u64::from(outer.output_size) != load_end {
+        return invalid(format!(
+            "primary container output 0x{:x} != ELF load size 0x{load_end:x}",
+            outer.output_size
+        ));
+    }
+    let auxiliary_header = ContainerHeader::parse(
+        payload,
+        descriptor.auxiliary_offset as usize,
+        config.container_seed,
+    )?;
+    if auxiliary_header.output_size != descriptor.auxiliary_expected_size {
+        return invalid("auxiliary container output size does not match the 0x9D descriptor");
+    }
+    // The auxiliary image is one flat allocation. Reject its declared size
+    // before that buffer is reserved, even when outer-only mode will not
+    // decode it: a hostile size must not depend on a later branch to be safe.
+    // The same check repeats inside `allocate_auxiliary`, which is also what
+    // charges the buffer; this one only guards the outer-only path.
+    limits.check_entry_bytes(u64::from(auxiliary_header.output_size))?;
+    if outer.encoded_end()? != descriptor.auxiliary_offset as usize {
+        return invalid("primary and auxiliary 0x9D containers are not contiguous");
+    }
+
+    let private_size = usize_from_u64(private.offset, "private section offset")?;
+    // The output is one image. It is capped by the smaller of the
+    // single-entry ceiling and the task total, but it is not added to the
+    // decoder byte budget: that budget counts retained decoded bytes, and the
+    // output is the image those bytes are written into.
+    limits.check_entry_bytes(private.offset.min(limits.max_total_bytes))?;
+    if private.offset > limits.max_total_bytes {
+        return Err(crate::android::LimitExceeded::Total {
+            requested: private.offset,
+            adding: private.offset,
+            limit: limits.max_total_bytes,
+        }
+        .into());
+    }
+    let prefix = source
+        .get(..private_size)
+        .ok_or_else(|| Error::Invalid("private section offset is outside the input".to_owned()))?;
+    let reserve = if flags.outer_only {
+        appended_tail_bound(&layout)
+    } else {
+        appended_reserve_hint(source, &layout, auxiliary_header.output_size)
+    };
+    // The hint is computed from section sizes the input declares. Whatever it
+    // says, the reservation stays inside the ceiling the image itself is held
+    // to, so a hostile size cannot turn into a large allocation here.
+    let reserve = reserve.min(output_ceiling(limits).saturating_sub(private.offset));
+    output.start(prefix, reserve)?;
+    output.set_len(private.offset, "size temporary output")?;
+
+    let mut restored_layout = layout.clone();
+    let mut auxiliary_stats = None;
+    let mut materialization = None;
+    let mut temporary_end = private.offset;
+    let primary_stats = output.edit(private_size, |image| {
+        if flags.verbose {
+            crate::progress::stage(Step::AndroidPrimary);
+        }
+        let mut writer = FileLayoutWriter {
+            output: image,
+            layout: &layout,
+            load_end,
+        };
+        let mut context = DecodeContext {
+            limits,
+            bytes: &mut *bytes,
+            records: &mut *records,
+            validate: |address: u64, length: usize| {
+                let data_len = u64::try_from(length)
+                    .map_err(|_| Error::Invalid("decoded write length exceeds u64".to_owned()))?;
+                let end = address
+                    .checked_add(data_len)
+                    .ok_or_else(|| Error::Invalid("decoded write range overflow".to_owned()))?;
+                if end > load_end {
+                    return invalid(format!(
+                        "decoded write 0x{address:x}..0x{end:x} exceeds target load image"
+                    ));
+                }
+                Ok(())
+            },
+        };
+        decode_container(
+            payload,
+            &outer,
+            config,
+            flags.verbose,
+            &mut context,
+            |address, data| writer.write(address, data),
+        )
+    })?;
+
+    if !flags.outer_only {
+        if flags.verbose {
+            crate::progress::stage(Step::AndroidAuxiliary);
+        }
+        let mut decoded = allocate_auxiliary(auxiliary_header.output_size, limits, bytes)?;
+        let auxiliary_len = decoded.len();
+        let mut context = DecodeContext {
+            limits,
+            bytes: &mut *bytes,
+            records: &mut *records,
+            validate: |offset: u64, length: usize| {
+                let start = usize_from_u64(offset, "auxiliary write offset")?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
+                if end > auxiliary_len {
+                    return invalid("auxiliary decoded write is out of range".to_owned());
+                }
+                Ok(())
+            },
+        };
+        let stats = decode_container(
+            payload,
+            &auxiliary_header,
+            config,
+            flags.verbose,
+            &mut context,
+            |offset, data| {
+                let start = usize_from_u64(offset, "auxiliary write offset")?;
+                let end = start
+                    .checked_add(data.len())
+                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
+                let destination = decoded.get_mut(start..end).ok_or_else(|| {
+                    Error::Invalid("auxiliary decoded write is out of range".to_owned())
+                })?;
+                destination.copy_from_slice(data);
+                Ok(data.len())
+            },
+        )?;
+        if let Some(path) = flags.dump_auxiliary {
+            write_atomic(&absolute(path)?, &decoded)?;
+        }
+        let mapping_length = metadata_mapping_length(source, &layout, &decoded)?;
+        if mapping_length < private_size {
+            return invalid("dynamic-table mapping is shorter than the ELF image");
+        }
+        let mapping_bytes = u64::try_from(mapping_length)
+            .map_err(|_| Error::Invalid("dynamic-table mapping length exceeds u64".to_owned()))?;
+        limits.check_entry_bytes(mapping_bytes.min(limits.max_total_bytes))?;
+        if mapping_bytes > limits.max_total_bytes {
+            return Err(crate::android::LimitExceeded::Total {
+                requested: mapping_bytes,
+                adding: mapping_bytes,
+                limit: limits.max_total_bytes,
+            }
+            .into());
+        }
+        output.set_len(mapping_bytes, "extend temporary output")?;
+        if flags.verbose {
+            crate::progress::stage(Step::AndroidTables);
+        }
+        let (new_layout, report, data_end) = output.edit(mapping_length, |image| {
+            materialize_static_elf_tables(
+                image,
+                source,
+                &layout,
+                symbol_patch_data,
+                &decoded,
+                MaterializeInput {
+                    auxiliary_symbol_seed,
+                    constructor_module,
+                    limits,
+                },
+            )
+        })?;
+        restored_layout = new_layout;
+        materialization = Some(report);
+        auxiliary_stats = Some(stats);
+        temporary_end = data_end;
+        output.set_len(temporary_end, "trim temporary output")?;
+    }
+
+    // The retained sections are slices of the input, and a section table may
+    // declare them overlapping. Their sum is bounded before any is appended.
+    let finished_bound = temporary_end.saturating_add(appended_tail_bound(&restored_layout));
+    limits.check_entry_bytes(finished_bound.min(limits.max_total_bytes))?;
+    if finished_bound > limits.max_total_bytes {
+        return Err(crate::android::LimitExceeded::Total {
+            requested: finished_bound,
+            adding: finished_bound,
+            limit: limits.max_total_bytes,
+        }
+        .into());
+    }
+    let cleaning = output.finalize(
+        source,
+        &restored_layout,
+        temporary_end,
+        flags.preserve_entrypoint,
+    )?;
+    let validation = output.view(|restored| {
+        validate_restored_binary(
+            restored,
+            flags.preserve_entrypoint,
+            materialization.as_ref(),
+        )
+    })?;
+
+    Ok(RestoreParts {
+        descriptor: DescriptorReport {
+            command_id: format!("0x{:X}", descriptor.command_id),
+            flags: format!("0x{:X}", descriptor.flags),
+            outer_offset: format!("0x{:X}", descriptor.outer_offset),
+            outer_expected_size: format!("0x{:X}", descriptor.outer_expected_size),
+            auxiliary_offset: format!("0x{:X}", descriptor.auxiliary_offset),
+            auxiliary_expected_size: format!("0x{:X}", descriptor.auxiliary_expected_size),
+        },
+        primary: primary_stats,
+        auxiliary: auxiliary_stats,
+        materialization,
+        cleaning,
+        validation,
+    })
+}
+
 /// Restore the current protected `libil2cpp.so` without executing protector code.
 pub fn restore_libil2cpp(options: &RestoreOptions) -> Result<RestoreReport> {
     restore_libil2cpp_with_limits(options, &ResourceLimits::default())
@@ -2542,7 +3125,7 @@ pub fn restore_libil2cpp_with_limits(
     }
     let artifacts = load_artifacts(&index_path)?;
     let mut bytes = ByteBudget::new(limits);
-    let mut records = crate::android::EntryBudget::new(limits);
+    let mut records = EntryBudget::new(limits);
     let module = read_artifact(&artifacts[&0x9b].path, limits, &mut bytes)?;
     let symbol_patch_data = read_artifact(&artifacts[&0x9e].path, limits, &mut bytes)?;
     let auxiliary_symbol_seed = artifacts
@@ -2555,14 +3138,7 @@ pub fn restore_libil2cpp_with_limits(
     let constructor_module = artifacts
         .get(&0x98)
         .map(|artifact| -> Result<_> {
-            let entry = artifact
-                .entry_offset
-                .filter(|entry| *entry != 0)
-                .ok_or_else(|| {
-                    Error::Invalid(
-                        "constructor module 0x98 lacks its descriptor entry offset".to_owned(),
-                    )
-                })?;
+            let entry = constructor_entry(artifact.entry_offset)?;
             Ok((read_artifact(&artifact.path, limits, &mut bytes)?, entry))
         })
         .transpose()?;
@@ -2575,254 +3151,37 @@ pub fn restore_libil2cpp_with_limits(
     let payload_file = File::open(payload_path)
         .map_err(|error| Error::io("open 0x9D artifact", payload_path, error))?;
     let payload = map_read_only(&payload_file, payload_path)?;
-    let layout = ElfLayout::parse(&source, true)?;
-    let private = layout.private_section()?;
-    let file_load_end = layout.file_load_end()?;
-    let aligned_load_end = align_up(file_load_end, 0x10)?;
-    if private.offset != aligned_load_end {
-        return invalid(format!(
-            "SHT_LOUSER offset 0x{:x} != aligned file-backed PT_LOAD end 0x{aligned_load_end:x} (raw 0x{file_load_end:x})",
-            private.offset
-        ));
-    }
-    let load_padding = slice_u64(&source, file_load_end, private.offset - file_load_end)?;
-    if load_padding.iter().any(|&byte| byte != 0) {
-        return invalid(format!(
-            "nonzero padding between PT_LOAD end 0x{file_load_end:x} and SHT_LOUSER 0x{:x}",
-            private.offset
-        ));
-    }
-    let descriptor = ProtectedDescriptor::decrypt(&payload, config.header_seed)?;
-    let load_end = layout.load_end()?;
-    if u64::from(descriptor.outer_expected_size) != load_end {
-        return invalid(format!(
-            "0x9D target size 0x{:x} != ELF load size 0x{load_end:x}",
-            descriptor.outer_expected_size
-        ));
-    }
-    let outer = ContainerHeader::parse(
-        &payload,
-        descriptor.outer_offset as usize,
-        config.container_seed,
-    )?;
-    if u64::from(outer.output_size) != load_end {
-        return invalid(format!(
-            "primary container output 0x{:x} != ELF load size 0x{load_end:x}",
-            outer.output_size
-        ));
-    }
-    let auxiliary_header = ContainerHeader::parse(
-        &payload,
-        descriptor.auxiliary_offset as usize,
-        config.container_seed,
-    )?;
-    if auxiliary_header.output_size != descriptor.auxiliary_expected_size {
-        return invalid("auxiliary container output size does not match the 0x9D descriptor");
-    }
-    // The auxiliary image is one flat allocation. Reject its declared size
-    // before that buffer is reserved, even when outer-only mode will not
-    // decode it: a hostile size must not depend on a later branch to be safe.
-    // The same check repeats inside `allocate_auxiliary`, which is also what
-    // charges the buffer; this one only guards the outer-only path.
-    limits.check_entry_bytes(u64::from(auxiliary_header.output_size))?;
-    if outer.encoded_end()? != descriptor.auxiliary_offset as usize {
-        return invalid("primary and auxiliary 0x9D containers are not contiguous");
-    }
 
-    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| Error::io("create output directory", parent, error))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| Error::io("create temporary output", parent, error))?;
-    let temporary_path = temporary.path().to_path_buf();
-    let private_size = usize_from_u64(private.offset, "private section offset")?;
-    // The temporary output is one file. It is capped by the smaller of the
-    // single-entry ceiling and the task total, but it is not added to the
-    // decoder byte budget: that budget counts retained decoded bytes, and the
-    // output file is the image those bytes are written into.
-    limits.check_entry_bytes(private.offset.min(limits.max_total_bytes))?;
-    if private.offset > limits.max_total_bytes {
-        return Err(crate::android::LimitExceeded::Total {
-            requested: private.offset,
-            adding: private.offset,
-            limit: limits.max_total_bytes,
-        }
-        .into());
-    }
-    copy_range(
-        &source,
-        temporary.as_file_mut(),
-        private_size,
-        &temporary_path,
-    )?;
-    temporary
-        .as_file_mut()
-        .flush()
-        .map_err(|error| Error::io("flush initial output", &temporary_path, error))?;
-    temporary
-        .as_file()
-        .set_len(private.offset)
-        .map_err(|error| Error::io("size temporary output", &temporary_path, error))?;
-
-    let mut restored_layout = layout.clone();
-    let mut auxiliary_stats = None;
-    let mut materialization = None;
-    let mut temporary_end = private.offset;
-    let primary_stats;
-    {
-        let mut output = map_mut(temporary.as_file(), private_size, &temporary_path)?;
-        if options.verbose {
-            crate::progress::stage(Step::AndroidPrimary);
-        }
-        let mut writer = FileLayoutWriter {
-            output: &mut output,
-            layout: &layout,
-            load_end,
-        };
-        let mut context = DecodeContext {
-            limits,
-            bytes: &mut bytes,
-            records: &mut records,
-            validate: |address: u64, length: usize| {
-                let data_len = u64::try_from(length)
-                    .map_err(|_| Error::Invalid("decoded write length exceeds u64".to_owned()))?;
-                let end = address
-                    .checked_add(data_len)
-                    .ok_or_else(|| Error::Invalid("decoded write range overflow".to_owned()))?;
-                if end > load_end {
-                    return invalid(format!(
-                        "decoded write 0x{address:x}..0x{end:x} exceeds target load image"
-                    ));
-                }
-                Ok(())
-            },
-        };
-        primary_stats = decode_container(
-            &payload,
-            &outer,
-            &config,
-            options.verbose,
-            &mut context,
-            |address, data| writer.write(address, data),
-        )?;
-        output
-            .flush()
-            .map_err(|error| Error::io("flush restored image", &temporary_path, error))?;
-    }
-
-    if !options.outer_only {
-        if options.verbose {
-            crate::progress::stage(Step::AndroidAuxiliary);
-        }
-        let mut decoded = allocate_auxiliary(auxiliary_header.output_size, limits, &mut bytes)?;
-        let auxiliary_len = decoded.len();
-        let mut context = DecodeContext {
-            limits,
-            bytes: &mut bytes,
-            records: &mut records,
-            validate: |offset: u64, length: usize| {
-                let start = usize_from_u64(offset, "auxiliary write offset")?;
-                let end = start
-                    .checked_add(length)
-                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
-                if end > auxiliary_len {
-                    return invalid("auxiliary decoded write is out of range".to_owned());
-                }
-                Ok(())
-            },
-        };
-        let stats = decode_container(
-            &payload,
-            &auxiliary_header,
-            &config,
-            options.verbose,
-            &mut context,
-            |offset, data| {
-                let start = usize_from_u64(offset, "auxiliary write offset")?;
-                let end = start
-                    .checked_add(data.len())
-                    .ok_or_else(|| Error::Invalid("auxiliary decoded write overflow".to_owned()))?;
-                let destination = decoded.get_mut(start..end).ok_or_else(|| {
-                    Error::Invalid("auxiliary decoded write is out of range".to_owned())
-                })?;
-                destination.copy_from_slice(data);
-                Ok(data.len())
-            },
-        )?;
-        if let Some(path) = &options.dump_auxiliary {
-            write_atomic(&absolute(path)?, &decoded)?;
-        }
-        let mapping_length = metadata_mapping_length(&source, &layout, &decoded)?;
-        if mapping_length < private_size {
-            return invalid("dynamic-table mapping is shorter than the ELF image");
-        }
-        let mapping_bytes = u64::try_from(mapping_length)
-            .map_err(|_| Error::Invalid("dynamic-table mapping length exceeds u64".to_owned()))?;
-        limits.check_entry_bytes(mapping_bytes.min(limits.max_total_bytes))?;
-        if mapping_bytes > limits.max_total_bytes {
-            return Err(crate::android::LimitExceeded::Total {
-                requested: mapping_bytes,
-                adding: mapping_bytes,
-                limit: limits.max_total_bytes,
-            }
-            .into());
-        }
-        temporary
-            .as_file()
-            .set_len(mapping_bytes)
-            .map_err(|error| Error::io("extend temporary output", &temporary_path, error))?;
-        if options.verbose {
-            crate::progress::stage(Step::AndroidTables);
-        }
-        {
-            let mut output = map_mut(temporary.as_file(), mapping_length, &temporary_path)?;
-            let (new_layout, report, data_end) = materialize_static_elf_tables(
-                &mut output,
-                &source,
-                &layout,
-                &symbol_patch_data,
-                &decoded,
-                MaterializeInput {
-                    auxiliary_symbol_seed,
-                    constructor_module: constructor_module
-                        .as_ref()
-                        .map(|(image, entry)| (image.as_slice(), *entry)),
-                    limits,
-                },
-            )?;
-            restored_layout = new_layout;
-            materialization = Some(report);
-            auxiliary_stats = Some(stats);
-            temporary_end = data_end;
-            output
-                .flush()
-                .map_err(|error| Error::io("flush restored image", &temporary_path, error))?;
-        }
-        temporary
-            .as_file()
-            .set_len(temporary_end)
-            .map_err(|error| Error::io("trim temporary output", &temporary_path, error))?;
-    }
-
-    let cleaning = finalize_clean_elf(
-        temporary.as_file_mut(),
-        &temporary_path,
-        &source,
-        &restored_layout,
-        temporary_end,
-        options.preserve_entrypoint,
-    )?;
-    let validation = {
-        let restored = map_read_only(temporary.as_file(), &temporary_path)?;
-        validate_restored_binary(
-            &restored,
-            options.preserve_entrypoint,
-            materialization.as_ref(),
-        )?
+    let mut output = DiskOutput {
+        parent: output_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        temporary: None,
     };
-    temporary
-        .persist(&output_path)
-        .map_err(|error| Error::io("replace restored output", &output_path, error.error))?;
+    let parts = restore_image(
+        &RestoreInputs {
+            source: &source,
+            payload: &payload,
+            config: &config,
+            symbol_patch_data: &symbol_patch_data,
+            auxiliary_symbol_seed,
+            constructor_module: constructor_module
+                .as_ref()
+                .map(|(image, entry)| (image.as_slice(), *entry)),
+        },
+        &RestoreFlags {
+            dump_auxiliary: options.dump_auxiliary.as_deref(),
+            outer_only: options.outer_only,
+            preserve_entrypoint: options.preserve_entrypoint,
+            verbose: options.verbose,
+        },
+        limits,
+        &mut bytes,
+        &mut records,
+        &mut output,
+    )?;
+    output.persist(&output_path)?;
 
     Ok(RestoreReport {
         input: input_path.display().to_string(),
@@ -2833,31 +3192,142 @@ pub fn restore_libil2cpp_with_limits(
             .map_err(|error| Error::io("inspect restored output", &output_path, error))?
             .len(),
         module_index: index_path.display().to_string(),
-        static_config: StaticConfigReport {
-            header_seed: format!("0x{:08X}", config.header_seed),
-            container_seed: format!("0x{:08X}", config.container_seed),
-            aes_key_sha256: sha256_bytes(&config.aes_key),
-            schedule_offset: format!("0x{:X}", config.schedule_offset),
-        },
-        descriptor: DescriptorReport {
-            command_id: format!("0x{:X}", descriptor.command_id),
-            flags: format!("0x{:X}", descriptor.flags),
-            outer_offset: format!("0x{:X}", descriptor.outer_offset),
-            outer_expected_size: format!("0x{:X}", descriptor.outer_expected_size),
-            auxiliary_offset: format!("0x{:X}", descriptor.auxiliary_offset),
-            auxiliary_expected_size: format!("0x{:X}", descriptor.auxiliary_expected_size),
-        },
-        primary: primary_stats,
-        auxiliary: auxiliary_stats,
-        elf_materialization: materialization,
-        cleaning,
-        validation,
+        static_config: static_config_report(&config),
+        descriptor: parts.descriptor,
+        primary: parts.primary,
+        auxiliary: parts.auxiliary,
+        elf_materialization: parts.materialization,
+        cleaning: parts.cleaning,
+        validation: parts.validation,
         elapsed_seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+fn constructor_entry(entry_offset: Option<u32>) -> Result<u32> {
+    entry_offset.filter(|entry| *entry != 0).ok_or_else(|| {
+        Error::Invalid("constructor module 0x98 lacks its descriptor entry offset".to_owned())
+    })
+}
+
+/// A restored image held in memory, with what the restoration observed.
+///
+/// The fields other than `bytes` are the ones [`RestoreReport`] carries for an
+/// on-disk restore. Paths, file digests and the elapsed time are left to the
+/// caller, which is the one that knows where the bytes came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredImage {
+    pub bytes: Vec<u8>,
+    pub static_config: StaticConfigReport,
+    pub descriptor: DescriptorReport,
+    pub primary: DecodeStatistics,
+    pub auxiliary: Option<DecodeStatistics>,
+    pub elf_materialization: Option<ElfMaterializationReport>,
+    pub cleaning: CleaningReport,
+    pub validation: ValidationReport,
+}
+
+/// [`restore_libil2cpp_with_limits`] over bytes, writing nothing.
+///
+/// `input` is the protected ELF and `extraction` its in-memory Stage 2
+/// extraction. The restored bytes are identical to the file the on-disk driver
+/// writes for the same input: both run the same restoration, and differ only in
+/// where the image is held while it is built.
+pub fn restore_libil2cpp_in_memory(
+    input: &[u8],
+    extraction: &MemoryExtraction,
+    verbose: bool,
+    limits: &ResourceLimits,
+) -> Result<RestoredImage> {
+    let artifacts = memory_artifacts(extraction, input)?;
+    let mut bytes = ByteBudget::new(limits);
+    let mut records = EntryBudget::new(limits);
+    let module = artifacts[&0x9b].data;
+    charge_artifact(module, limits, &mut bytes)?;
+    let symbol_patch_data = artifacts[&0x9e].data;
+    charge_artifact(symbol_patch_data, limits, &mut bytes)?;
+    let auxiliary_symbol_seed = artifacts
+        .get(&0x96)
+        .map(|artifact| -> Result<_> {
+            charge_artifact(artifact.data, limits, &mut bytes)?;
+            discover_auxiliary_symbol_seed(artifact.data)
+        })
+        .transpose()?;
+    let constructor_module = artifacts
+        .get(&0x98)
+        .map(|artifact| -> Result<_> {
+            let entry = constructor_entry(artifact.entry_offset)?;
+            charge_artifact(artifact.data, limits, &mut bytes)?;
+            Ok((artifact.data, entry))
+        })
+        .transpose()?;
+    let config = Module9bConfig::parse(module)?;
+
+    let mut output = MemoryOutput::default();
+    let parts = restore_image(
+        &RestoreInputs {
+            source: input,
+            payload: artifacts[&0x9d].data,
+            config: &config,
+            symbol_patch_data,
+            auxiliary_symbol_seed,
+            constructor_module,
+        },
+        &RestoreFlags {
+            dump_auxiliary: None,
+            outer_only: false,
+            preserve_entrypoint: false,
+            verbose,
+        },
+        limits,
+        &mut bytes,
+        &mut records,
+        &mut output,
+    )?;
+    Ok(RestoredImage {
+        bytes: output.bytes,
+        static_config: static_config_report(&config),
+        descriptor: parts.descriptor,
+        primary: parts.primary,
+        auxiliary: parts.auxiliary,
+        elf_materialization: parts.materialization,
+        cleaning: parts.cleaning,
+        validation: parts.validation,
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reserve_hint_that_cannot_be_met_does_not_fail_the_image() {
+        let mut output = MemoryOutput::default();
+        output
+            .start(b"prefix", u64::MAX)
+            .expect("the hint is only a hint");
+        assert_eq!(output.bytes, b"prefix");
+    }
+
+    #[test]
+    fn a_memory_image_grows_with_zeroes_truncates_and_bounds_its_edits() {
+        let mut output = MemoryOutput::default();
+        output.start(&[1, 2, 3], 0).unwrap();
+        output.set_len(5, "grow").unwrap();
+        assert_eq!(output.bytes, [1, 2, 3, 0, 0]);
+        output
+            .edit(5, |image| {
+                image[4] = 9;
+                Ok(())
+            })
+            .unwrap();
+        output.set_len(2, "truncate").unwrap();
+        assert_eq!(output.bytes, [1, 2]);
+        let error = output
+            .edit(3, |_| Ok(()))
+            .expect_err("an edit past the image is refused");
+        assert!(error.to_string().contains("shorter"), "{error}");
+        let seen = output.view(|image| Ok(image.to_vec())).unwrap();
+        assert_eq!(seen, [1, 2]);
+    }
 
     /// `decode_container` rejects a writer whose declared length fits the entry
     /// ceiling but whose target ends past the destination. The writer closure

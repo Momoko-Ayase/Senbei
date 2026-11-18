@@ -1,13 +1,17 @@
 // Native/WASM parity driver. Reads a JSON job list on stdin and prints one
 // JSON result per job on stdout. The Rust test starts `node` with this file.
 //
-// Job:   { "op": "detect" | "unpack" | "unpack_force_exe" | "metadata",
+// Job:   { "op": "detect" | "unpack" | "unpack_force_exe" | "metadata" | "library",
 //          "input": "<path>", "companion": "<path>|null" }
-// Result: { "ok": true, "kind": ..., "bytes": <n>, "sha256": ...,
-//           "suspect": ..., "issues": [...], "remapped": ... }
-//      or { "ok": false, "error": "..." }
+// Result: { "ok": true, ... } with the fields of the job's kind (see `runJob`),
+//      or { "ok": false, "error": "...", "profile": {...} }
 //
 // The wasm package directory is argv[2] (wasm-pack --target nodejs output).
+//
+// The driver calls the binding the way `web/worker.js` does: the input is
+// appended to an `InputBuffer` in slices, the recovered bytes are read through
+// the views the outcome hands out, and the digests the binding computes are
+// checked against digests of those bytes.
 //
 // Isolation: every job runs in a *fresh Node Worker thread* and that worker is
 // terminated before the next job starts. This matches the browser binding's
@@ -21,7 +25,7 @@
 // hung call; on expiry the worker is terminated and the job reports an error.
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -32,55 +36,112 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+const SLICE = 8 * 1024 * 1024;
+
+// Fill an `InputBuffer` from a file in slices, as the page does from a Blob.
+function load(wasm, file) {
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const buffer = new wasm.InputBuffer(size);
+    const slice = Buffer.allocUnsafe(Math.min(SLICE, Math.max(size, 1)));
+    for (;;) {
+      const read = readSync(fd, slice, 0, slice.length, null);
+      if (read === 0) break;
+      buffer.append(slice.subarray(0, read));
+    }
+    if (buffer.length !== size) throw new Error("short read");
+    return buffer;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// The digest of a view, which must agree with the digest the binding reports.
+// The view is hashed first: it is valid only until the next call into the
+// module, and `report` is such a call.
+function digestOf(view, report) {
+  if (!view || view.length === 0) return null;
+  const digest = sha256(view);
+  const reported = report();
+  if (reported !== digest) throw new Error(`binding digest ${reported} is not the bytes' ${digest}`);
+  return digest;
+}
+
 // Runs in a worker: one job, one freshly instantiated module.
 function runJob(pkgDir, job) {
   const require = createRequire(import.meta.url);
   const wasm = require(path.join(pkgDir, "senbei_wasm.js"));
-  let handle;
+  if (job.op === "detect") {
+    return { ok: true, kind: wasm.detect(readFileSync(job.input)) ?? null };
+  }
+
+  const input = load(wasm, job.input);
+  let outcome;
   try {
-    if (job.op === "detect") {
-      const bytes = readFileSync(job.input);
-      return { ok: true, kind: wasm.detect(bytes) ?? null };
-    }
     if (job.op === "unpack" || job.op === "unpack_force_exe") {
-      const input = readFileSync(job.input);
-      const companion = job.companion ? readFileSync(job.companion) : undefined;
-      handle =
-        job.op === "unpack"
-          ? wasm.unpack_file(input, companion)
-          : wasm.unpack_file_force_exe(input, companion);
-      const bytes = handle.bytes;
-      return {
-        ok: true,
-        kind: handle.kind,
-        bytes: bytes.length,
-        sha256: sha256(bytes),
-        suspect: handle.suspect,
-        issues: handle.issues,
-        companion: handle.companion,
-      };
+      // `unpack_pe` takes the companion buffer over.
+      const companion = job.companion ? load(wasm, job.companion) : undefined;
+      outcome = wasm.unpack_pe(input, companion, job.op === "unpack_force_exe", "en", undefined);
+    } else if (job.op === "metadata") {
+      outcome = wasm.restore_metadata(input, undefined, 0, "en");
+    } else if (job.op === "library") {
+      outcome = wasm.restore_library(input, "en", undefined);
+    } else {
+      return { ok: false, error: `unknown op ${job.op}` };
     }
+    const info = JSON.parse(outcome.info);
+    const profile = info.profile;
+    if (info.status === "failed") return { ok: false, error: info.error?.text ?? null, profile };
+
+    // Each view is used before the next call into the module.
+    const image = outcome.image();
+    const bytes = image.length;
+    const digest = digestOf(image, () => outcome.image_sha256());
     if (job.op === "metadata") {
-      const data = readFileSync(job.input);
-      handle = wasm.deobfuscate_metadata(data);
-      const bytes = handle.bytes;
       return {
         ok: true,
-        bytes: bytes.length,
-        sha256: sha256(bytes),
-        version: handle.version,
-        methods: handle.methods,
-        remapped: handle.remapped,
-        modules: handle.modules,
+        status: info.status,
+        bytes,
+        sha256: digest,
+        version: info.metadata?.version ?? null,
+        methods: info.metadata?.methods ?? null,
+        remapped: info.metadata?.remapped ?? null,
+        modules: info.metadata?.modules ?? null,
+        layout: info.metadata?.layout ?? null,
+        profile,
       };
     }
-    return { ok: false, error: `unknown op ${job.op}` };
+    if (job.op === "library") {
+      const embedded = digestOf(outcome.embedded_metadata(), () => outcome.embedded_metadata_sha256());
+      const module = outcome.take_module();
+      return {
+        ok: true,
+        status: info.status,
+        bytes,
+        sha256: digest,
+        embedded,
+        module: module ? sha256(module) : null,
+        elf: info.elf,
+        profile,
+      };
+    }
+    return {
+      ok: true,
+      kind: info.kind,
+      bytes,
+      sha256: digest,
+      suspect: info.suspect,
+      issues: info.findings.map((finding) => finding.message),
+      companion: info.companion,
+      profile,
+    };
   } finally {
     // The worker is terminated immediately after this, so this is belt and
-    // braces: release the Rust-side allocation without waiting for GC.
-    if (handle && typeof handle.free === "function") {
+    // braces: release the Rust-side allocations without waiting for GC.
+    for (const handle of [outcome, input]) {
       try {
-        handle.free();
+        handle?.free();
       } catch {
         // A poisoned instance after a trap can refuse; the worker dies anyway.
       }
