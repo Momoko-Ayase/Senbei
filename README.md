@@ -21,7 +21,9 @@ Launch the native desktop app:
 cargo run --release -p senbei-gui
 ```
 
-The native release workflow packages the CLI and desktop app together for Windows and Linux. The desktop app supports files and folders, Android libraries and app packages, inspection, hex views, and report export.
+The native release workflow packages the CLI and desktop app together for Windows, Linux, and macOS. The desktop app supports files and folders, Android libraries and app packages, inspection, hex views, and report export.
+
+On macOS, choose the `aarch64-apple-darwin` archive for Apple Silicon or `x86_64-apple-darwin` for Intel. Extract it and open `Senbei.app` from Finder, or run `./senbei` from the extracted directory in Terminal. The app is ad hoc signed and may require approval in System Settings under Privacy & Security because it is distributed without Apple notarization. [Apple’s guide to opening downloaded apps](https://support.apple.com/en-us/102445)
 
 Full documentation: <https://xn--ri8h.gitbook.io/crackproof-research/senbei>
 

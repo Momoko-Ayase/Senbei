@@ -26,7 +26,7 @@ license = "AGPL-3.0-only"
 [workspace.dependencies]
 aes = "0.9"
 anyhow = "1"
-# The GUI renders with wgpu (Direct3D 12 or Vulkan); no OpenGL dependency.
+# The GUI renders with wgpu (Direct3D 12, Vulkan, or Metal).
 eframe = { version = "0.37", default-features = false, features = [
     "accesskit",
     "clipboard",

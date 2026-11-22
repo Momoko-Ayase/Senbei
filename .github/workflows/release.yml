@@ -1,8 +1,8 @@
 name: Release
 
 # Publishing a GitHub release:
-#  - cli-assets builds the Windows and Linux CLI and desktop GUI and attaches
-#    senbei-<version>-<target>.zip (both binaries, README, LICENSE, the Asul
+#  - cli-assets builds the Windows, Linux, and macOS CLI and desktop GUI and
+#    attaches senbei-<version>-<target>.zip (CLI, GUI, README, LICENSE, the Asul
 #    font license, and the legal notice extracted from README.md).
 #  - deploy-web rebuilds the browser app and pushes it to Cloudflare Pages
 #    (https://senbei.pages.dev). Requires two repository secrets:
@@ -32,6 +32,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: senbei
             gui_bin: senbei-gui
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bin: senbei
+            gui_bin: senbei-gui
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: senbei
+            gui_bin: senbei-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,26 +48,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          name="senbei-$version-${{ matrix.target }}"
-          mkdir -p "stage/$name"
-          cp "target/release/${{ matrix.bin }}" "stage/$name/"
-          cp "target/release/${{ matrix.gui_bin }}" "stage/$name/"
-          cp LICENSE README.md "stage/$name/"
-          cp senbei-gui/assets/fonts/OFL.txt "stage/$name/ASUL-OFL.txt"
-          awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
-            README.md > "stage/$name/LEGAL-NOTICE.md"
-          # Release assets are served as-is (unlike CI artifacts, which the
-          # upload action always re-zips), so the archive is created here.
-          # Zip on every OS, matching the CI artifacts; 7z is preinstalled on
-          # both windows-latest and ubuntu-latest.
-          (cd stage && 7z a "$name.zip" "$name" > /dev/null)
-          echo "package=$name" >> "$GITHUB_ENV"
+          package=$(bash scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.bin }}" "${{ matrix.gui_bin }}")
+          if [[ "$RUNNER_OS" != macOS ]]; then
+            (cd stage && 7z a "$package.zip" "$package" > /dev/null)
+          fi
+          echo "SENBEI_PACKAGE=$package" >> "$GITHUB_ENV"
       - name: Attach to release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "stage/${{ env.package }}".* --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "stage/$SENBEI_PACKAGE.zip" --clobber
 
   deploy-web:
     runs-on: ubuntu-latest

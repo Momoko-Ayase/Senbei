@@ -591,7 +591,20 @@ fn reveal(path: &Path) -> std::io::Result<()> {
             .arg(select)
             .spawn()?;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/open")
+            .args(["-R", "--"])
+            .arg(path)
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "could not reveal {} in Finder ({status})",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let folder = path.parent().unwrap_or(path);
         std::process::Command::new("xdg-open").arg(folder).spawn()?;
@@ -667,17 +680,29 @@ impl SystemFonts {
     /// font first (so shared punctuation takes its shape), the other CJK
     /// fonts after it for names in other scripts.
     pub fn set_for(&mut self, lang: Lang) -> FontSet {
-        const LATIN: [&str; 3] = ["Segoe UI", "Noto Sans", "DejaVu Sans"];
+        const LATIN: [&str; 4] = ["Segoe UI", "Noto Sans", "DejaVu Sans", "Helvetica Neue"];
         let own: &[&str] = match lang {
             Lang::En => &[],
-            Lang::ZhCn => &["Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC"],
+            Lang::ZhCn => &[
+                "Microsoft YaHei UI",
+                "Microsoft YaHei",
+                "Noto Sans CJK SC",
+                "PingFang SC",
+            ],
             Lang::ZhTw => &[
                 "Microsoft JhengHei UI",
                 "Microsoft JhengHei",
                 "Noto Sans CJK TC",
+                "PingFang TC",
             ],
-            Lang::Ja => &["Yu Gothic UI", "Meiryo UI", "Meiryo", "Noto Sans CJK JP"],
-            Lang::Ko => &["Malgun Gothic", "Noto Sans CJK KR"],
+            Lang::Ja => &[
+                "Yu Gothic UI",
+                "Meiryo UI",
+                "Meiryo",
+                "Noto Sans CJK JP",
+                "Hiragino Sans",
+            ],
+            Lang::Ko => &["Malgun Gothic", "Noto Sans CJK KR", "Apple SD Gothic Neo"],
         };
         let others = [
             "Yu Gothic UI",
@@ -686,6 +711,10 @@ impl SystemFonts {
             "Malgun Gothic",
             "Noto Sans CJK JP",
             "Noto Sans CJK SC",
+            "Hiragino Sans",
+            "PingFang SC",
+            "PingFang TC",
+            "Apple SD Gothic Neo",
         ];
         // Symbols the window draws itself: ⚙ ▶ ✓ ✕ ● ★ → and the like.
         const SYMBOLS: [&str; 3] = [

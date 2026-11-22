@@ -64,6 +64,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: senbei
             gui_bin: senbei-gui
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bin: senbei
+            gui_bin: senbei-gui
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: senbei
+            gui_bin: senbei-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -72,23 +80,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          name="senbei-$version-${{ matrix.target }}"
-          mkdir -p "stage/$name"
-          cp "target/release/${{ matrix.bin }}" "stage/$name/"
-          cp "target/release/${{ matrix.gui_bin }}" "stage/$name/"
-          cp LICENSE README.md "stage/$name/"
-          cp senbei-gui/assets/fonts/OFL.txt "stage/$name/ASUL-OFL.txt"
-          awk '/^## Legal notice and intended use/{f=1} f && /^## / && !/Legal notice/{exit} f' \
-            README.md > "stage/$name/LEGAL-NOTICE.md"
-          echo "package=$name" >> "$GITHUB_ENV"
-      # upload-artifact always wraps the upload in its own zip, so the staged
-      # directory is uploaded loose — pre-compressing here would nest archives.
-      # The download is already <package>.zip with the folder inside.
+          package=$(bash scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.bin }}" "${{ matrix.gui_bin }}")
+          echo "SENBEI_PACKAGE=$package" >> "$GITHUB_ENV"
+      - name: Verify macOS package
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          ditto -x -k "stage/$SENBEI_PACKAGE.zip" "$RUNNER_TEMP/senbei-package"
+          extracted="$RUNNER_TEMP/senbei-package/$SENBEI_PACKAGE"
+          test -x "$extracted/Senbei.app/Contents/MacOS/senbei-gui"
+          codesign --verify --strict "$extracted/Senbei.app"
+          "$extracted/senbei" --help
       - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS'
         with:
-          name: ${{ env.package }}
+          name: ${{ env.SENBEI_PACKAGE }}
           path: stage/
+          if-no-files-found: error
+          retention-days: 14
+      # The prebuilt zip preserves executable permissions in the app bundle.
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'macOS'
+        with:
+          path: stage/${{ env.SENBEI_PACKAGE }}.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
